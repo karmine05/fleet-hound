@@ -1,0 +1,50 @@
+services:
+  # Memgraph Database
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: fleet-memgraph
+    ports:
+      - "7687:7687" # Bolt protocol
+      - "7444:7444" # Monitoring
+    volumes:
+      - memgraph-data:/var/lib/memgraph
+      - memgraph-log:/var/log/memgraph
+      - ./config/memgraph.conf:/etc/memgraph/memgraph.conf:ro
+    # command: handled by config file
+    networks:
+      - fleet-network
+    healthcheck:
+      test: [ "CMD-SHELL", "echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Fleet-Bloodhound Web Dashboard
+  webviz:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fleet-webviz
+    ports:
+      - "8080:8080"
+    environment:
+      - MEMGRAPH_URI=bolt://memgraph:7687
+      - PORT=8080
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    networks:
+      - fleet-network
+    restart: unless-stopped
+
+networks:
+  fleet-network:
+    driver: bridge
+
+volumes:
+  memgraph-data:
+  memgraph-log:
+
+

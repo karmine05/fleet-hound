@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fleet Security Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0f0f0f;
+            --bg-secondary: #1a1a1a;
+            --bg-tertiary: #2d2d2d;
+            --text-primary: #ffffff;
+            --text-secondary: #cccccc;
+            --border-color: #555555;
+            --accent-color: #007acc;
+            --accent-hover: #005999;
+            --gradient-start: #1a1a1a;
+            --gradient-end: #0f0f0f;
+            --status-bg: rgba(0, 0, 0, 0.8);
+            --input-bg: #2d2d2d;
+        }
+
+        [data-theme="light"] {
+            --bg-primary: #f5f5f5;
+            --bg-secondary: #ffffff;
+            --bg-tertiary: #e8e8e8;
+            --text-primary: #1a1a1a;
+            --text-secondary: #4a4a4a;
+            --border-color: #cccccc;
+            --accent-color: #0078d4;
+            --accent-hover: #106ebe;
+            --gradient-start: #ffffff;
+            --gradient-end: #f0f0f0;
+            --status-bg: rgba(255, 255, 255, 0.95);
+            --input-bg: #ffffff;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            overflow: hidden;
+            transition: background 0.3s ease, color 0.3s ease;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+            padding: 15px 30px;
+            border-bottom: 2px solid var(--accent-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .title {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--accent-color);
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        button {
+            background: var(--accent-color);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        button:hover {
+            background: var(--accent-hover);
+            transform: translateY(-2px);
+        }
+
+        .theme-toggle {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 18px;
+            transition: all 0.3s ease;
+        }
+
+        .theme-toggle:hover {
+            background: var(--accent-color);
+            color: white;
+            transform: translateY(-2px);
+        }
+
+        input,
+        select {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-primary);
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        input:focus,
+        select:focus {
+            outline: 2px solid var(--accent-color);
+            outline-offset: 2px;
+        }
+
+        #graph {
+            width: 100vw;
+            height: calc(100vh - 80px);
+            background: radial-gradient(circle at center, var(--gradient-start) 0%, var(--gradient-end) 100%);
+            transition: background 0.3s ease;
+        }
+
+        .node text {
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 10px;
+            font-weight: bold;
+            pointer-events: none;
+            fill: var(--text-primary);
+        }
+
+        [data-theme="light"] .node text {
+            fill: #1a1a1a;
+        }
+
+        .status {
+            position: absolute;
+            top: 100px;
+            left: 30px;
+            background: var(--status-bg);
+            padding: 10px 15px;
+            border-radius: 5px;
+            border-left: 4px solid var(--accent-color);
+            font-size: 14px;
+            color: var(--text-primary);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .node.highlight-node circle {
+            stroke: #ffd700 !important;
+            stroke-width: 4px !important;
+        }
+
+        .link.highlight-link {
+            stroke: #ffd700 !important;
+            stroke-width: 4px !important;
+            stroke-opacity: 1 !important;
+        }
+
+        .node circle {
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .node circle:hover {
+            stroke-width: 4px;
+            filter: brightness(1.2);
+        }
+
+        [data-theme="light"] .link {
+            stroke-opacity: 0.4 !important;
+        }
+
+        [data-theme="light"] .node circle {
+            stroke: #333 !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <div class="title">🩸 Fleet Security Graph</div>
+        <div class="controls">
+            <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">🌓</button>
+            <input type="text" id="search-input" placeholder="Search nodes...">
+            <select id="node-type-filter">
+                <option value="all">All Types</option>
+                <option value="host">Hosts</option>
+                <option value="user">Users</option>
+                <option value="software">Software</option>
+            </select>
+            <select id="platform-filter">
+                <option value="all">All Platforms</option>
+            </select>
+            <select id="team-filter">
+                <option value="all">All Teams</option>
+            </select>
+            <button onclick="searchNodes()">🔍 Search</button>
+            <button onclick="clearSearch()">❌ Clear</button>
+            <button onclick="resetToOverview()">🔙 Overview</button>
+            <button onclick="centerGraph()">🎯 Center</button>
+            <button onclick="resetPositions()">📍 Reset Positions</button>
+            <button onclick="loadGraph()">🔄 Refresh</button>
+            <button onclick="exportAsJSON()" title="Export current view as JSON">📥 JSON</button>
+            <button onclick="exportAsCSV()" title="Export current view as CSV">📥 CSV</button>
+        </div>
+    </div>
+
+    <div id="graph"></div>
+    <div id="status" class="status" style="display: none;"></div>
+
+    <script>
+        let currentData = { nodes: [], links: [] };
+        let allGraphData = { nodes: [], links: [] };
+        let simulation;
+
+        // Theme Management
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+
+            // Re-render graph to update colors
+            if (currentData.nodes.length > 0) {
+                renderGraph(currentData);
+            }
+
+            showStatus(`Switched to ${newTheme} mode`);
+        }
+
+        // Load saved theme preference
+        function loadThemePreference() {
+            const savedTheme = localStorage.getItem('theme') || 'dark';
+            document.documentElement.setAttribute('data-theme', savedTheme);
+        }
+
+        // Load available platforms from backend
+        function loadPlatforms() {
+            fetch('/api/platforms')
+                .then(response => response.json())
+                .then(platforms => {
+                    const select = document.getElementById('platform-filter');
+                    platforms.forEach(platform => {
+                        const option = document.createElement('option');
+                        option.value = platform;
+                        // Capitalize first letter for display
+                        option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+                        select.appendChild(option);
+                    });
+                })
+                .catch(err => console.error('Error loading platforms:', err));
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadThemePreference();
+            loadPlatforms();
+            // Load teams (existing logic assumed elsewhere or could be added here similar to platforms)
+            // For now just platforms as requested.
+        });
+
+        function loadGraph() {
+            console.log('loadGraph() called');
+            showStatus('Loading data...');
+
+            // Always load full data so we can search everything
+            fetch('/api/graph/full')
+                .then(response => {
+                    console.log('Fetch response status:', response.status);
+                    if (!response.ok) {
+                        // Try to parse error message from response
+                        return response.json().then(errorData => {
+                            throw new Error(errorData.message || errorData.error || `HTTP ${response.status}`);
+                        }).catch(() => {
+                            throw new Error(`HTTP ${response.status}`);
+                        });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // Check if response contains an error
+                    if (data.error) {
+                        throw new Error(data.message || data.error);
+                    }
+                    console.log('Data received:', data);
+                    console.log(`Loaded ${data.nodes.length} nodes, ${data.links.length} links`);
+                    currentData = data;
+                    allGraphData = data; // Store for filtering
+                    showStatus(`Loaded ${data.nodes.length} nodes, ${data.links.length} relationships`);
+                    renderGraph(data);
+                })
+                .catch(error => {
+                    console.error('Error loading graph:', error);
+                    let errorMsg = error.message;
+
+                    // Provide helpful message for memory errors
+                    if (errorMsg.includes('Memory limit exceeded') || errorMsg.includes('too large')) {
+                        errorMsg = 'Dataset too large: ' + errorMsg + ' Please increase Memgraph memory limit in docker-compose.yml';
+                    }
+
+                    showStatus('Error loading data: ' + errorMsg, true);
+                });
+        }
+
+        function renderGraph(data) {
+            const container = d3.select("#graph");
+            container.selectAll("*").remove(); // Clear previous graph
+
+            const width = container.node().clientWidth;
+            const height = container.node().clientHeight;
+
+            // Filter out disconnected nodes (nodes with no links)
+            const connectedNodeIds = new Set();
+            data.links.forEach(link => {
+                connectedNodeIds.add(typeof link.source === 'object' ? link.source.id : link.source);
+                connectedNodeIds.add(typeof link.target === 'object' ? link.target.id : link.target);
+            });
+
+            const connectedNodes = data.nodes.filter(node => connectedNodeIds.has(node.id));
+            const disconnectedNodes = data.nodes.filter(node => !connectedNodeIds.has(node.id));
+
+            // Log disconnected nodes for debugging
+            if (disconnectedNodes.length > 0) {
+                console.log(`Filtered out ${disconnectedNodes.length} disconnected nodes:`,
+                    disconnectedNodes.map(n => n.name).slice(0, 10));
+            }
+
+            // Use only connected nodes for visualization
+            const nodesToRender = connectedNodes;
+
+            const svg = container.append("svg")
+                .attr("width", width)
+                .attr("height", height);
+
+            // Create force simulation with gentler forces
+            simulation = d3.forceSimulation(nodesToRender)
+                .force("link", d3.forceLink(data.links).id(d => d.id).distance(120).strength(0.3))
+                .force("charge", d3.forceManyBody().strength(-400))
+                .force("center", d3.forceCenter(width / 2, height / 2))
+                .force("collision", d3.forceCollide().radius(35))
+                .alphaDecay(0.05)  // Slower decay so it settles better
+                .velocityDecay(0.8); // Higher friction to stop movement faster
+
+            // Create links
+            const link = svg.append("g")
+                .attr("class", "links")
+                .selectAll("line")
+                .data(data.links)
+                .enter().append("line")
+                .attr("class", "link")
+                .attr("stroke", d => d.type === 'uses' ? "#007acc" : "#888")
+                .attr("stroke-width", 2)
+                .attr("stroke-opacity", 0.6);
+
+            // Create nodes (only connected nodes)
+            const node = svg.append("g")
+                .attr("class", "nodes")
+                .selectAll("g")
+                .data(nodesToRender)
+                .enter().append("g")
+                .attr("class", "node")
+                .on("click", (event, d) => expandNodeConnections(d))
+                .call(d3.drag()
+                    .on("start", dragstarted)
+                    .on("drag", dragged)
+                    .on("end", dragended));
+
+            // Add node circles
+            node.append("circle")
+                .attr("r", d => d.type === 'host' ? 20 : d.type === 'user' ? 15 : 10)
+                .attr("fill", d => {
+                    if (d.type === 'host') return "#e74c3c";
+                    if (d.type === 'user') return "#3498db";
+                    return "#27ae60";
+                })
+                .attr("stroke", "#fff")
+                .attr("stroke-width", 2);
+
+            // Add node labels
+            node.append("text")
+                .text(d => d.name)
+                .attr("text-anchor", "middle")
+                .attr("dy", "0.35em")
+                .attr("font-size", "10px")
+                .attr("font-weight", "bold")
+                .attr("fill", "#fff");
+
+            // Add tooltips
+            node.append("title")
+                .text(d => `${d.name}\n${d.type}\n${d.details || ''}`);
+
+            // Update positions on tick
+            simulation.on("tick", () => {
+                link
+                    .attr("x1", d => d.source.x)
+                    .attr("y1", d => d.source.y)
+                    .attr("x2", d => d.target.x)
+                    .attr("y2", d => d.target.y);
+
+                node
+                    .attr("transform", d => `translate(${d.x},${d.y})`);
+            });
+
+            // Drag functions - keep nodes where user puts them
+            function dragstarted(event, d) {
+                if (!event.active) simulation.alphaTarget(0.1).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+
+            function dragended(event, d) {
+                if (!event.active) simulation.alphaTarget(0);
+                // Keep the node fixed where user dropped it
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+        }
+
+        function expandNodeConnections(clickedNode) {
+            console.log(`Clicked on ${clickedNode.name} (${clickedNode.type})`);
+
+            // Clear previous highlights
+            d3.selectAll('.node').classed('highlight-node', false);
+            d3.selectAll('.link').classed('highlight-link', false);
+
+            if (clickedNode.type === 'host') {
+                // For host nodes, get ALL software on that specific host
+                const hostname = clickedNode.name;
+                showStatus(`Loading ALL software for ${hostname}...`);
+
+                fetch(`/api/host/${hostname}/software`)
+                    .then(response => response.json())
+                    .then(hostData => {
+                        console.log(`Host ${hostname}: Got ${hostData.nodes.length} nodes and ${hostData.links.length} links`);
+
+                        currentData = hostData;
+                        renderGraph(hostData);
+
+                        // Highlight the clicked host
+                        setTimeout(() => {
+                            d3.selectAll('.node')
+                                .classed('highlight-node', d => d.id === clickedNode.id);
+                        }, 100);
+
+                        showStatus(`Showing ALL ${hostData.nodes.length} nodes for ${hostname} (${hostData.nodes.filter(n => n.type === 'software').length} software packages)`);
+                    })
+                    .catch(error => {
+                        console.error('Error loading host data:', error);
+                        showStatus('Error loading host details', true);
+                        // Fallback to current data
+                        findAndShowConnections(clickedNode, allGraphData);
+                    });
+
+            } else if (clickedNode.type === 'software') {
+                // For software nodes, get ALL hosts that have this software
+                const softwareName = clickedNode.name;
+                showStatus(`Loading ALL hosts with ${softwareName}...`);
+
+                fetch(`/api/software/${encodeURIComponent(softwareName)}/hosts`)
+                    .then(response => response.json())
+                    .then(softwareData => {
+                        console.log(`Software ${softwareName}: Got ${softwareData.nodes.length} nodes and ${softwareData.links.length} links`);
+
+                        currentData = softwareData;
+                        renderGraph(softwareData);
+
+                        // Highlight the clicked software
+                        setTimeout(() => {
+                            d3.selectAll('.node')
+                                .classed('highlight-node', d => d.id === clickedNode.id);
+                        }, 100);
+
+                        const hostCount = softwareData.nodes.filter(n => n.type === 'host').length;
+                        showStatus(`Showing ${softwareName} on ${hostCount} hosts (${softwareData.nodes.length} total nodes)`);
+                    })
+                    .catch(error => {
+                        console.error('Error loading software data:', error);
+                        showStatus('Error loading software details', true);
+                        // Fallback to current data
+                        findAndShowConnections(clickedNode, allGraphData);
+                    });
+
+            } else {
+                // For user nodes, use existing data
+                findAndShowConnections(clickedNode, allGraphData);
+            }
+        }
+
+        function findAndShowConnections(clickedNode, dataSource) {
+            // Find ALL links connected to this node (both directions)
+            const connectedLinks = dataSource.links.filter(link => {
+                const sourceId = (typeof link.source === 'object') ? link.source.id : link.source;
+                const targetId = (typeof link.target === 'object') ? link.target.id : link.target;
+                return sourceId === clickedNode.id || targetId === clickedNode.id;
+            });
+
+            console.log(`Found ${connectedLinks.length} links for ${clickedNode.name}`);
+
+            // Find ALL connected nodes
+            const connectedNodeIds = new Set([clickedNode.id]);
+            connectedLinks.forEach(link => {
+                const sourceId = (typeof link.source === 'object') ? link.source.id : link.source;
+                const targetId = (typeof link.target === 'object') ? link.target.id : link.target;
+                connectedNodeIds.add(sourceId);
+                connectedNodeIds.add(targetId);
+            });
+
+            // Get all connected nodes
+            const connectedNodes = dataSource.nodes.filter(node =>
+                connectedNodeIds.has(node.id)
+            );
+
+            console.log(`Found ${connectedNodes.length} connected nodes for ${clickedNode.name}`);
+            console.log('Connected nodes:', connectedNodes.map(n => `${n.name} (${n.type})`));
+
+            if (connectedNodes.length > 1 && connectedLinks.length > 0) {
+                // Show only the clicked node and its connections
+                const expandedData = {
+                    nodes: connectedNodes,
+                    links: connectedLinks
+                };
+
+                currentData = expandedData;
+                renderGraph(expandedData);
+
+                // Highlight the clicked node
+                setTimeout(() => {
+                    d3.selectAll('.node')
+                        .classed('highlight-node', d => d.id === clickedNode.id);
+                }, 100);
+
+                showStatus(`Showing ${connectedNodes.length} nodes and ${connectedLinks.length} relationships for ${clickedNode.name}`);
+            } else {
+                // Just highlight if no connections
+                highlightNode(clickedNode);
+                showStatus(`${clickedNode.name} has no connections in current data`);
+            }
+        }
+
+        function highlightNode(targetNode) {
+            // Clear previous highlights
+            d3.selectAll('.node').classed('highlight-node', false);
+            d3.selectAll('.link').classed('highlight-link', false);
+
+            // Find connected links
+            const connectedLinks = currentData.links.filter(link =>
+                (link.source.id || link.source) === targetNode.id ||
+                (link.target.id || link.target) === targetNode.id
+            );
+
+            // Find connected nodes
+            const connectedNodeIds = new Set([targetNode.id]);
+            connectedLinks.forEach(link => {
+                connectedNodeIds.add(link.source.id || link.source);
+                connectedNodeIds.add(link.target.id || link.target);
+            });
+
+            console.log(`Highlighting ${connectedNodeIds.size} nodes and ${connectedLinks.length} links for ${targetNode.name}`);
+
+            // Highlight connected nodes and links
+            d3.selectAll('.node')
+                .classed('highlight-node', d => connectedNodeIds.has(d.id));
+            d3.selectAll('.link')
+                .classed('highlight-link', d =>
+                    (d.source.id || d.source) === targetNode.id ||
+                    (d.target.id || d.target) === targetNode.id
+                );
+
+            showStatus(`Highlighted ${connectedNodeIds.size} nodes connected to ${targetNode.name}`);
+        }
+
+        function searchNodes() {
+            const searchTerm = document.getElementById('search-input').value.trim();
+            const searchTermLower = searchTerm.toLowerCase();
+            const nodeTypeFilter = document.getElementById('node-type-filter').value;
+            const platformFilter = document.getElementById('platform-filter').value;
+            const teamFilter = document.getElementById('team-filter').value;
+
+            if (!searchTerm && nodeTypeFilter === 'all' && platformFilter === 'all' && teamFilter === 'all') {
+                clearSearch();
+                return;
+            }
+
+            // Use backend search for ANY type filter (not just software)
+            // This allows users to search/browse ALL nodes of any type, not just pre-loaded data
+            // Backend search is triggered when:
+            // 1. User selects a specific type filter (host, user, software), OR
+            // 2. User enters a search term with 'all' types
+            if (nodeTypeFilter !== 'all' || searchTerm || teamFilter !== 'all') {
+                const searchParam = searchTerm ? `q=${encodeURIComponent(searchTerm)}` : 'q=';
+                const typeParam = `&type=${encodeURIComponent(nodeTypeFilter)}`;
+                const platformParam = platformFilter !== 'all' ? `&platform=${encodeURIComponent(platformFilter)}` : '';
+                const teamParam = teamFilter !== 'all' ? `&team=${encodeURIComponent(teamFilter)}` : '';
+
+                let statusMsg;
+                if (searchTerm) {
+                    statusMsg = `Searching for "${searchTerm}"`;
+                    if (nodeTypeFilter !== 'all') statusMsg += ` in ${nodeTypeFilter}s`;
+                    if (platformFilter !== 'all') statusMsg += ` on ${platformFilter}`;
+                    if (teamFilter !== 'all') statusMsg += ` in team`;
+                    statusMsg += '...';
+                } else {
+                    statusMsg = `Loading ALL ${nodeTypeFilter}s`;
+                    if (platformFilter !== 'all') statusMsg += ` on ${platformFilter}`;
+                    if (teamFilter !== 'all') statusMsg += ` in team`;
+                    statusMsg += '...';
+                }
+                showStatus(statusMsg);
+
+                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log(`Search results (term: "${searchTerm}", type: ${nodeTypeFilter}, platform: ${platformFilter}, team: ${teamFilter}):`, data);
+
+                        if (data.nodes && data.nodes.length > 0) {
+                            // Backend returned results - use them directly
+                            currentData = { nodes: data.nodes, links: data.links };
+                            renderGraph(currentData);
+
+                            // Build status message
+                            let statusMsg = `Found ${data.node_count} nodes`;
+                            if (searchTerm) {
+                                statusMsg += ` matching "${searchTerm}"`;
+                            }
+                            if (nodeTypeFilter !== 'all') {
+                                const typeCount = data.nodes.filter(n => n.type === nodeTypeFilter).length;
+                                statusMsg += ` (${typeCount} ${nodeTypeFilter}${typeCount !== 1 ? 's' : ''})`;
+                            }
+                            statusMsg += ` with ${data.link_count} connections`;
+                            showStatus(statusMsg);
+                        } else {
+                            // No results found
+                            currentData = { nodes: [], links: [] };
+                            renderGraph(currentData);
+
+                            let statusMsg = 'No results found';
+                            if (searchTerm) {
+                                statusMsg += ` for "${searchTerm}"`;
+                            }
+                            if (nodeTypeFilter !== 'all') {
+                                statusMsg += ` in ${nodeTypeFilter}s`;
+                            }
+                            if (platformFilter !== 'all') {
+                                statusMsg += ` on ${platformFilter}`;
+                            }
+                            showStatus(statusMsg);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error searching:', error);
+                        showStatus('Error performing search, using local data', true);
+                        // Fall back to local filtering on error
+                        performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter);
+                    });
+            } else {
+                // No search term, or filtering by non-software types only - use local filtering
+                performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter);
+            }
+        }
+
+        function performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter) {
+            // Step 1: Filter hosts by platform (platform only applies to hosts)
+            let platformFilteredHosts = allGraphData.nodes.filter(node => {
+                if (node.type !== 'host') return false;
+
+                const matchesPlatform = platformFilter === 'all' ||
+                    (node.details && node.details.toLowerCase().includes(platformFilter));
+
+                return matchesPlatform;
+            });
+
+            console.log(`Platform filter: ${platformFilter}, Found ${platformFilteredHosts.length} hosts`);
+            if (platformFilter !== 'all' && platformFilteredHosts.length === 0) {
+                console.warn(`No hosts found for platform: ${platformFilter}`);
+                console.log('Sample host details:', allGraphData.nodes.filter(n => n.type === 'host').slice(0, 3).map(h => h.details));
+            }
+
+            const platformFilteredHostIds = new Set(platformFilteredHosts.map(h => h.id));
+
+            // Step 2: Get all nodes connected to platform-filtered hosts
+            let connectedNodeIds = new Set(platformFilteredHostIds);
+
+            console.log(`Connected node IDs before adding software/users: ${connectedNodeIds.size}`);
+
+            // Add users connected to these hosts
+            allGraphData.links.forEach(link => {
+                const sourceId = link.source.id || link.source;
+                const targetId = link.target.id || link.target;
+
+                if (link.type === 'uses') {
+                    // User -> Host link
+                    if (platformFilteredHostIds.has(targetId)) {
+                        connectedNodeIds.add(sourceId); // Add user
+                    }
+                }
+
+                if (link.type === 'installed') {
+                    // Software -> Host link
+                    if (platformFilteredHostIds.has(targetId)) {
+                        connectedNodeIds.add(sourceId); // Add software
+                    }
+                }
+            });
+
+            // Step 3: Filter nodes by search term and connection to platform-filtered hosts
+            let matchingNodes = allGraphData.nodes.filter(node => {
+                // Must be connected to a platform-filtered host (or be one)
+                if (platformFilter !== 'all' && !connectedNodeIds.has(node.id)) {
+                    return false;
+                }
+
+                // Must match search term
+                const matchesSearch = !searchTermLower ||
+                    node.name.toLowerCase().includes(searchTermLower) ||
+                    (node.details && node.details.toLowerCase().includes(searchTermLower));
+
+                return matchesSearch;
+            });
+
+            console.log(`Matching nodes after platform+search filter: ${matchingNodes.length} (${matchingNodes.filter(n => n.type === 'host').length} hosts, ${matchingNodes.filter(n => n.type === 'software').length} software, ${matchingNodes.filter(n => n.type === 'user').length} users)`);
+
+            // Step 4: Apply type filter logic: show selected type + direct connections
+            let filteredNodes;
+            if (nodeTypeFilter === 'all') {
+                // Show all matching nodes
+                filteredNodes = matchingNodes;
+            } else if (nodeTypeFilter === 'host') {
+                // Host filter: show hosts + users + software
+                filteredNodes = matchingNodes.filter(node =>
+                    node.type === 'host' || node.type === 'user' || node.type === 'software'
+                );
+            } else if (nodeTypeFilter === 'user') {
+                // User filter: show users + ONLY platform-filtered hosts
+                // Step 1: Get platform-filtered host IDs
+                const platformHostIds = new Set(platformFilteredHosts.map(h => h.id));
+                console.log(`User filter: ${platformFilteredHosts.length} platform hosts`);
+
+                // Step 2: Find users connected to these platform hosts
+                const connectedUserIds = new Set();
+                allGraphData.links.forEach(link => {
+                    const sourceId = link.source.id || link.source;
+                    const targetId = link.target.id || link.target;
+
+                    if (link.type === 'uses' && platformHostIds.has(targetId)) {
+                        connectedUserIds.add(sourceId);
+                    }
+                });
+                console.log(`Found ${connectedUserIds.size} users connected to platform hosts`);
+
+                // Step 3: Filter users by search term if provided
+                let matchingUsers;
+                if (searchTermLower) {
+                    matchingUsers = allGraphData.nodes.filter(node =>
+                        node.type === 'user' &&
+                        connectedUserIds.has(node.id) &&
+                        (node.name.toLowerCase().includes(searchTermLower) ||
+                            (node.details && node.details.toLowerCase().includes(searchTermLower)))
+                    );
+                } else {
+                    // No search term: use all users connected to platform hosts
+                    matchingUsers = allGraphData.nodes.filter(node =>
+                        node.type === 'user' && connectedUserIds.has(node.id)
+                    );
+                }
+                console.log(`Matching users after search filter: ${matchingUsers.length}`);
+
+                const userIds = new Set(matchingUsers.map(u => u.id));
+
+                // Step 4: Find ONLY platform-filtered hosts connected to these users
+                const hostsConnectedToUsers = new Set();
+                allGraphData.links.forEach(link => {
+                    const sourceId = link.source.id || link.source;
+                    const targetId = link.target.id || link.target;
+
+                    // Only include hosts that are in platformHostIds AND connected to the users
+                    if (link.type === 'uses' && userIds.has(sourceId) && platformHostIds.has(targetId)) {
+                        hostsConnectedToUsers.add(targetId);
+                    }
+                });
+                console.log(`Found ${hostsConnectedToUsers.size} platform hosts connected to users`);
+
+                // Step 5: Include matching users + ONLY platform-filtered hosts
+                filteredNodes = allGraphData.nodes.filter(node =>
+                    userIds.has(node.id) || hostsConnectedToUsers.has(node.id)
+                );
+                console.log(`Final filtered nodes: ${filteredNodes.length} (${filteredNodes.filter(n => n.type === 'host').length} hosts, ${filteredNodes.filter(n => n.type === 'user').length} users)`);
+            } else if (nodeTypeFilter === 'software') {
+                // Software filter: show software + ONLY platform-filtered hosts
+                // Step 1: Start with platform-filtered hosts
+                const platformHosts = platformFilteredHosts;
+                const platformHostIds = new Set(platformHosts.map(h => h.id));
+                console.log(`Software filter: ${platformHosts.length} platform hosts`, platformHosts.map(h => h.name).slice(0, 10));
+
+                // Step 2: Find software connected to these platform hosts
+                const connectedSoftwareIds = new Set();
+                allGraphData.links.forEach(link => {
+                    const sourceId = link.source.id || link.source;
+                    const targetId = link.target.id || link.target;
+
+                    if (link.type === 'installed' && platformHostIds.has(targetId)) {
+                        connectedSoftwareIds.add(sourceId);
+                    }
+                });
+                console.log(`Found ${connectedSoftwareIds.size} software connected to platform hosts`);
+
+                // Step 3: Filter software by search term if provided
+                let matchingSoftware;
+                if (searchTermLower) {
+                    matchingSoftware = allGraphData.nodes.filter(node =>
+                        node.type === 'software' &&
+                        connectedSoftwareIds.has(node.id) &&
+                        (node.name.toLowerCase().includes(searchTermLower) ||
+                            (node.details && node.details.toLowerCase().includes(searchTermLower)))
+                    );
+                } else {
+                    // No search term: use all software connected to platform hosts
+                    matchingSoftware = allGraphData.nodes.filter(node =>
+                        node.type === 'software' && connectedSoftwareIds.has(node.id)
+                    );
+                }
+                console.log(`Matching software after search filter: ${matchingSoftware.length}`);
+
+                const softwareIds = new Set(matchingSoftware.map(s => s.id));
+
+                // Step 4: Find ONLY platform-filtered hosts that have this software
+                // This is the key difference from user filter - we only show platform hosts
+                const hostsConnectedToSoftware = new Set();
+                allGraphData.links.forEach(link => {
+                    const sourceId = link.source.id || link.source;
+                    const targetId = link.target.id || link.target;
+
+                    // Only include hosts that are in platformHostIds AND connected to the software
+                    if (link.type === 'installed' && softwareIds.has(sourceId) && platformHostIds.has(targetId)) {
+                        hostsConnectedToSoftware.add(targetId);
+                    }
+                });
+                console.log(`Found ${hostsConnectedToSoftware.size} platform hosts connected to software`);
+
+                // Step 5: Include matching software + ONLY platform-filtered hosts
+                filteredNodes = allGraphData.nodes.filter(node =>
+                    softwareIds.has(node.id) || hostsConnectedToSoftware.has(node.id)
+                );
+                console.log(`Final filtered nodes: ${filteredNodes.length} (${filteredNodes.filter(n => n.type === 'host').length} hosts, ${filteredNodes.filter(n => n.type === 'software').length} software)`);
+            } else {
+                // Fallback: exact type match
+                filteredNodes = matchingNodes.filter(node => node.type === nodeTypeFilter);
+            }
+
+            // Get node IDs for filtering links
+            const nodeIds = new Set(filteredNodes.map(n => n.id));
+
+            // Filter links to only include those between filtered nodes
+            let filteredLinks = allGraphData.links.filter(link =>
+                nodeIds.has(link.source.id || link.source) &&
+                nodeIds.has(link.target.id || link.target)
+            );
+
+            const filteredData = {
+                nodes: filteredNodes,
+                links: filteredLinks
+            };
+
+            currentData = filteredData;
+            renderGraph(filteredData);
+            showStatus(`Found ${filteredNodes.length} nodes, ${filteredLinks.length} connections`);
+        }
+
+        function clearSearch() {
+            document.getElementById('search-input').value = '';
+            document.getElementById('node-type-filter').value = 'all';
+            document.getElementById('platform-filter').value = 'all';
+            document.getElementById('team-filter').value = 'all';
+
+            // Clear highlights
+            d3.selectAll('.node').classed('highlight-node', false);
+            d3.selectAll('.link').classed('highlight-link', false);
+
+            currentData = allGraphData;
+            renderGraph(allGraphData);
+            showStatus(`Showing all data: ${allGraphData.nodes.length} nodes, ${allGraphData.links.length} connections`);
+        }
+
+        function centerGraph() {
+            if (simulation) {
+                // Only reset positions for nodes that aren't manually fixed
+                simulation.nodes().forEach(node => {
+                    if (!node.fx && !node.fy) { // Only move unfixed nodes
+                        node.x = 400 + (Math.random() - 0.5) * 200;
+                        node.y = 300 + (Math.random() - 0.5) * 200;
+                        node.vx = 0;
+                        node.vy = 0;
+                    }
+                });
+                simulation.alpha(0.3).restart();
+                showStatus('Graph centered (keeping manually positioned nodes)');
+            }
+        }
+
+        function resetToOverview() {
+            // Clear all highlights and filters
+            clearSearch();
+            // Reload the full data
+            loadGraph();
+            showStatus('Returned to full overview');
+        }
+
+        function resetPositions() {
+            if (simulation) {
+                // Reset ALL positions and remove fixed constraints
+                simulation.nodes().forEach(node => {
+                    node.x = 400 + (Math.random() - 0.5) * 400;
+                    node.y = 300 + (Math.random() - 0.5) * 400;
+                    node.vx = 0;
+                    node.vy = 0;
+                    node.fx = null; // Remove fixed position
+                    node.fy = null; // Remove fixed position
+                });
+                simulation.alpha(0.5).restart();
+                showStatus('All node positions reset');
+            }
+        }
+
+        function showStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.style.display = 'block';
+            status.style.borderLeftColor = isError ? '#e74c3c' : '#007acc';
+
+            if (!isError) {
+                setTimeout(() => {
+                    status.style.display = 'none';
+                }, 3000);
+            }
+        }
+
+        // Load teams from backend and populate dropdown
+        function loadTeams() {
+            fetch('/api/teams')
+                .then(response => response.json())
+                .then(teams => {
+                    const teamFilter = document.getElementById('team-filter');
+                    // Clear existing options except "All Teams"
+                    teamFilter.innerHTML = '<option value="all">All Teams</option>';
+
+                    // Add team options
+                    teams.forEach(team => {
+                        const option = document.createElement('option');
+                        option.value = team.id;
+                        option.textContent = team.name;
+                        teamFilter.appendChild(option);
+                    });
+
+                    console.log(`Loaded ${teams.length} teams`);
+                })
+                .catch(error => {
+                    console.error('Error loading teams:', error);
+                });
+        }
+
+        // Export current graph data as JSON
+        function exportAsJSON() {
+            if (!currentData || currentData.nodes.length === 0) {
+                showStatus('No data to export', true);
+                return;
+            }
+
+            const dataStr = JSON.stringify(currentData, null, 2);
+            const dataBlob = new Blob([dataStr], { type: 'application/json' });
+            const url = URL.createObjectURL(dataBlob);
+
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `fleet-bloodhound-export-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            showStatus(`Exported ${currentData.nodes.length} nodes and ${currentData.links.length} links as JSON`);
+        }
+
+        // Export current graph data as CSV
+        function exportAsCSV() {
+            if (!currentData || currentData.nodes.length === 0) {
+                showStatus('No data to export', true);
+                return;
+            }
+
+            // Create CSV content
+            let csv = '# NODES\n';
+            csv += 'id,name,type,details\n';
+
+            currentData.nodes.forEach(node => {
+                const details = (node.details || '').replace(/"/g, '""'); // Escape quotes
+                csv += `"${node.id}","${node.name}","${node.type}","${details}"\n`;
+            });
+
+            csv += '\n# RELATIONSHIPS\n';
+            csv += 'source,target,type\n';
+
+            currentData.links.forEach(link => {
+                const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+                const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+                csv += `"${sourceId}","${targetId}","${link.type || 'CONNECTED'}"\n`;
+            });
+
+            const dataBlob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(dataBlob);
+
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `fleet-bloodhound-export-${new Date().toISOString().split('T')[0]}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            showStatus(`Exported ${currentData.nodes.length} nodes and ${currentData.links.length} links as CSV`);
+        }
+
+        // Add Enter key support for search
+        document.addEventListener('DOMContentLoaded', function () {
+            // Load theme preference first
+            loadThemePreference();
+
+            document.getElementById('search-input').addEventListener('keypress', function (e) {
+                if (e.key === 'Enter') {
+                    searchNodes();
+                }
+            });
+
+            // Filter change handlers
+            document.getElementById('node-type-filter').addEventListener('change', searchNodes);
+            document.getElementById('platform-filter').addEventListener('change', searchNodes);
+            document.getElementById('team-filter').addEventListener('change', searchNodes);
+
+            // Load teams and initial data
+            loadTeams();
+            loadGraph();
+        });
+    </script>
+</body>
+
+</html>
