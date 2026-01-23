@@ -32,6 +32,8 @@ services:
     environment:
       - MEMGRAPH_URI=bolt://memgraph:7687
       - PORT=8080
+    volumes:
+      - ./config:/app/config
     depends_on:
       memgraph:
         condition: service_healthy

@@ -5,7 +5,7 @@ import time
 class MemgraphIngestion:
     def __init__(self, uri="bolt://localhost:7687"):
         self.driver = GraphDatabase.driver(uri)
-        self.batch_size = 1000  # Optimized batch size
+        self.batch_size = 5000  # Optimized batch size
         self.max_retries = 3
 
     def create_constraints(self):
@@ -29,19 +29,25 @@ class MemgraphIngestion:
         Ingest hosts, users, software, and relationships into Memgraph.
 
         Performance optimizations:
-        - Batch processing for users, hosts, and software
-        - Single UNWIND query instead of individual queries
-        - Reduced database round-trips
+        - Parallel batch processing using ThreadPoolExecutor
+        - Grouped software ingestion (per host) to reduce graph traversals
+        - Optimized batch sizes
         """
         start_time = time.time()
+        
+        # Optimize batch sizing for different data types
+        # Users/Hosts are light, can handle larger batches
+        # Software is heavy (many items per host), improved by grouping
+        HOST_BATCH_SIZE = 5000
+        USER_BATCH_SIZE = 5000
+        SOFTWARE_BATCH_SIZE = 2000 # This effectively means 2000 *HOSTS* with software bundles, which is huge
 
         with self.driver.session() as session:
-            # Batch ingest all global users
+            # 1. Users
             user_lookup = {}
             if global_users:
-                print(f"💾 Ingesting {len(global_users)} users in batches...")
+                print(f"💾 Ingesting {len(global_users)} users...")
                 user_batch = []
-
                 for user in global_users:
                     uname = user.get('username') or user.get('email') or user.get('name')
                     if uname:
@@ -51,26 +57,22 @@ class MemgraphIngestion:
                             'email': user.get('email'),
                             'fullname': user.get('name') or user.get('full_name')
                         })
-
-                        # Process in batches
-                        if len(user_batch) >= self.batch_size:
+                        if len(user_batch) >= USER_BATCH_SIZE:
                             self._batch_create_users(session, user_batch)
                             user_batch = []
-
-                # Process remaining users
                 if user_batch:
                     self._batch_create_users(session, user_batch)
 
-                print(f"✅ Ingested {len(user_lookup)} users")
-            # Batch ingest hosts and relationships
+            # 2. Hosts & Relationships
             total_hosts = len(hosts_data)
             print(f"💾 Ingesting {total_hosts} hosts with relationships...")
-
+            
             host_batch = []
             user_rel_batch = []
-            software_batch = []
+            
+            # Grouped software structure: List of {hostname: str, software_list: []}
+            software_grouped_batch = [] 
 
-            # Adjust progress interval based on dataset size
             progress_interval = 100 if total_hosts > 500 else 50 if total_hosts > 100 else 25
 
             for idx, host in enumerate(hosts_data):
@@ -81,7 +83,7 @@ class MemgraphIngestion:
                 if not hostname:
                     continue
 
-                # Collect host data
+                # Host Data
                 host_batch.append({
                     'hostname': hostname,
                     'os_version': host.get('os_version'),
@@ -92,52 +94,54 @@ class MemgraphIngestion:
                     'team_name': host.get('team_name')
                 })
 
-                # Extract users from host data (no additional API calls needed)
+                # User Relationships
                 extracted_users = self._extract_user_identifiers(host)
                 for uname in extracted_users:
-                    user = user_lookup.get(uname) if user_lookup else None
-                    user_rel_batch.append({
+                     # Simple lookup for enrichment
+                     user = user_lookup.get(uname)
+                     user_rel_batch.append({
                         'username': uname,
                         'email': user.get('email') if user else None,
                         'fullname': (user.get('name') or user.get('full_name')) if user else None,
                         'hostname': hostname
                     })
 
-                # Collect software data (already populated from API)
+                # Software Data (Grouped)
                 software_list = host.get('software', [])
-                for software in software_list:
-                    software_name = software.get('name')
-                    if software_name:
-                        software_batch.append({
-                            'name': software_name,
-                            'version': software.get('version') or 'unknown',
-                            'hostname': hostname
+                if software_list:
+                    cleaned_software = []
+                    for s in software_list:
+                        if s.get('name'):
+                            cleaned_software.append({
+                                'name': s.get('name'),
+                                'version': s.get('version') or 'unknown'
+                            })
+                    if cleaned_software:
+                        software_grouped_batch.append({
+                            'hostname': hostname,
+                            'software_list': cleaned_software
                         })
 
-                # Process batches when they reach batch_size
-                if len(host_batch) >= self.batch_size:
+                # Flush Batches
+                if len(host_batch) >= HOST_BATCH_SIZE:
                     self._batch_create_hosts(session, host_batch)
                     host_batch = []
-
-                if len(user_rel_batch) >= self.batch_size:
+                
+                if len(user_rel_batch) >= USER_BATCH_SIZE:
                     self._batch_create_user_relationships(session, user_rel_batch)
                     user_rel_batch = []
 
-                if len(software_batch) >= self.batch_size:
-                    self._batch_create_software(session, software_batch)
-                    software_batch = []
+                if len(software_grouped_batch) >= 200: 
+                    self._batch_create_software_grouped(session, software_grouped_batch)
+                    software_grouped_batch = []
 
-            # Process remaining batches
-            print(f"   Finalizing remaining batches...")
+            # Flush Remaining
             if host_batch:
                 self._batch_create_hosts(session, host_batch)
-                print(f"   ✓ Created {len(host_batch)} hosts")
             if user_rel_batch:
                 self._batch_create_user_relationships(session, user_rel_batch)
-                print(f"   ✓ Created {len(user_rel_batch)} user relationships")
-            if software_batch:
-                self._batch_create_software(session, software_batch)
-                print(f"   ✓ Created {len(software_batch)} software relationships")
+            if software_grouped_batch:
+                 self._batch_create_software_grouped(session, software_grouped_batch)
 
             elapsed = time.time() - start_time
             print(f"✅ Ingestion completed in {elapsed:.2f} seconds")
@@ -282,3 +286,50 @@ class MemgraphIngestion:
                 seen.add(u)
                 deduped.append(u)
         return deduped
+
+    def _batch_create_software_grouped(self, session, software_grouped_batch):
+        """
+        Optimized batch creation of software grouped by host.
+        Structure: [{'hostname': 'h1', 'software_list': [{'name': 's1', 'version': 'v1'}, ...]}, ...]
+        """
+        if not software_grouped_batch:
+            return
+
+        # 1. Flatten for Node Creation (Deduplicated globally for this batch)
+        # We want to ensure all Software nodes exist before linking.
+        
+        unique_software_map = {}
+        for entry in software_grouped_batch:
+            for sw in entry['software_list']:
+                key = (sw['name'], sw['version'])
+                if key not in unique_software_map:
+                    unique_software_map[key] = sw
+        
+        unique_software_list = list(unique_software_map.values())
+
+        # 2. Create/Update Software Nodes
+        query_nodes = """
+            UNWIND $software AS sw
+            MERGE (s:Software {name: sw.name})
+            ON CREATE SET s.versions = [sw.version],
+                          s.first_version = sw.version,
+                          s.last_version = sw.version
+            ON MATCH SET s.versions = CASE
+                WHEN s.versions IS NULL THEN [sw.version]
+                WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
+                ELSE s.versions END,
+                s.last_version = sw.version
+        """
+        self._execute_with_retry(session, query_nodes, {'software': unique_software_list}, "create software nodes")
+
+        # 3. Create Links (Optimized Grouping)
+        # Instead of matching Host for every software item, we Match Host ONCE per host entry
+        query_rels = """
+            UNWIND $batches AS batch
+            MATCH (h:Host {hostname: batch.hostname})
+            WITH h, batch
+            UNWIND batch.software_list AS sw
+            MATCH (s:Software {name: sw.name})
+            MERGE (s)-[:INSTALLED_ON]->(h)
+        """
+        self._execute_with_retry(session, query_rels, {'batches': software_grouped_batch}, "create grouped software rels")

@@ -126,8 +126,9 @@
 
         #graph {
             width: 100vw;
-            height: calc(100vh - 80px);
-            background: radial-gradient(circle at center, var(--gradient-start) 0%, var(--gradient-end) 100%);
+            width: 100vw;
+            height: 100%;
+            /* background moved to #graph-view */
             transition: background 0.3s ease;
         }
 
@@ -185,45 +186,1082 @@
         [data-theme="light"] .node circle {
             stroke: #333 !important;
         }
+
+        /* Advanced Search Styles */
+        .search-container {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 2px 4px;
+        }
+
+        .search-container input {
+            border: none;
+            background: transparent;
+            padding: 6px 8px;
+            min-width: 150px;
+        }
+
+        .search-container input:focus {
+            outline: none;
+        }
+
+        .search-container:focus-within {
+            outline: 2px solid var(--accent-color);
+            outline-offset: 1px;
+        }
+
+        .search-toggles {
+            display: flex;
+            gap: 2px;
+            border-left: 1px solid var(--border-color);
+            padding-left: 4px;
+            margin-left: 4px;
+        }
+
+        .search-toggle {
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+            padding: 4px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            transition: all 0.2s ease;
+            min-width: 24px;
+            text-align: center;
+        }
+
+        .search-toggle:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            transform: none;
+        }
+
+        .search-toggle.active {
+            background: var(--accent-color);
+            color: white;
+            border-color: var(--accent-color);
+        }
+
+        .search-toggle[title]:hover::after {
+            content: attr(title);
+        }
+
+        .search-mode-group {
+            display: flex;
+            gap: 1px;
+            background: var(--border-color);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .search-mode-group .search-toggle {
+            border-radius: 0;
+            border: none;
+        }
+
+        .search-mode-group .search-toggle:first-child {
+            border-radius: 3px 0 0 3px;
+        }
+
+        .search-mode-group .search-toggle:last-child {
+            border-radius: 0 3px 3px 0;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            background: var(--bg-tertiary);
+            padding: 0 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .tab-btn {
+            background: transparent;
+            color: var(--text-secondary);
+            border: none;
+            padding: 12px 24px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .tab-btn.active {
+            color: var(--accent-color);
+        }
+
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: var(--accent-color);
+        }
+
+        /* View Containers */
+        .view-container {
+            display: none;
+            width: 100vw;
+            height: calc(100vh - 125px);
+            /* Adjusted for header + tabs */
+            overflow: hidden;
+            position: relative;
+        }
+
+        .view-container.active {
+            display: block;
+        }
+
+        #graph-view {
+            background: radial-gradient(circle at center, var(--gradient-start) 0%, var(--gradient-end) 100%);
+        }
+
+        /* Blast Radius View Styles */
+        #blast-radius-view {
+            padding: 20px;
+            overflow-y: auto;
+            background: var(--bg-primary);
+        }
+
+        .blast-dashboard {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 20px;
+            height: 100%;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .blast-sidebar {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .blast-main {
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 20px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+        }
+
+        .metric-card {
+            background: var(--bg-secondary);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            text-align: center;
+            transition: transform 0.3s ease;
+        }
+
+        .metric-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--accent-color);
+        }
+
+        .metric-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: var(--accent-color);
+            margin: 10px 0;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            letter-spacing: 1px;
+        }
+
+        .chart-container {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            /* Align to top */
+            min-height: 400px;
+            position: relative;
+        }
+
+        #radar-chart {
+            width: 100%;
+            height: 100%;
+            min-height: 400px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding-top: 50px;
+        }
+
+        .entity-selector {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .entity-list {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            margin-top: 10px;
+            border-top: 1px solid var(--border-color);
+            padding-top: 10px;
+        }
+
+        .entity-item {
+            padding: 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid transparent;
+        }
+
+        .entity-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .entity-item.active {
+            background: rgba(0, 122, 204, 0.1);
+            border-color: var(--accent-color);
+        }
+
+        .blast-details-container {
+            position: absolute;
+            right: 20px;
+            top: 20px;
+            width: 300px;
+            max-height: 360px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+            border: 1px solid var(--border-color);
+        }
+
+        .detail-section {
+            margin-bottom: 15px;
+        }
+
+        .detail-section h4 {
+            color: var(--accent-color);
+            margin-bottom: 8px;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .count-badge {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 11px;
+            color: #fff;
+        }
+
+        .detail-list {
+            font-size: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .detail-item {
+            color: var(--text-primary);
+            padding: 2px 5px;
+            border-radius: 3px;
+        }
+
+        .detail-item:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .entity-name {
+            font-weight: bold;
+        }
+
+        .entity-meta {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        /* Toggle Switch Styles */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 40px;
+            height: 20px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #3e3e3e;
+            -webkit-transition: .4s;
+            transition: .4s;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            -webkit-transition: .4s;
+            transition: .4s;
+        }
+
+        input:checked+.slider {
+            background-color: var(--accent-color);
+        }
+
+        input:focus+.slider {
+            box-shadow: 0 0 1px var(--accent-color);
+        }
+
+        input:checked+.slider:before {
+            -webkit-transform: translateX(20px);
+            -ms-transform: translateX(20px);
+            transform: translateX(20px);
+        }
+
+        .slider.round {
+            border-radius: 20px;
+        }
+
+        .slider.round:before {
+            border-radius: 50%;
+        }
+
+        /* Radar Chart SVG Styles */
+        .radar-chart .level {
+            stroke: var(--border-color);
+            stroke-width: 0.5px;
+        }
+
+        .radar-chart .axis line {
+            stroke: var(--border-color);
+            stroke-width: 0.5px;
+        }
+
+        .radar-chart .axis text {
+            font-size: 10px;
+            fill: var(--text-primary);
+        }
+
+        .radar-area {
+            fill: var(--accent-color);
+            fill-opacity: 0.2;
+            stroke: var(--accent-color);
+            stroke-width: 2px;
+        }
+
+        .radar-point {
+            fill: var(--accent-color);
+            stroke: #fff;
+            stroke-width: 1.5px;
+        }
+
+        /* Shadow IT Styles */
+        #shadow-it-view {
+            padding: 20px;
+            overflow-y: auto;
+            background: var(--bg-primary);
+        }
+
+        .shadow-it-dashboard {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+            height: 100%;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .shadow-it-sidebar {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            height: fit-content;
+        }
+
+        .shadow-it-main {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .shadow-it-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+        }
+
+        .shadow-metric-card {
+            background: var(--bg-secondary);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            text-align: center;
+            transition: transform 0.3s ease, border-color 0.3s ease;
+        }
+
+        .shadow-metric-card:hover {
+            transform: translateY(-3px);
+            border-color: var(--accent-color);
+        }
+
+        .shadow-metric-card.risk-high {
+            border-left: 4px solid #ff4444;
+        }
+
+        .shadow-metric-card.risk-medium {
+            border-left: 4px solid #ff9944;
+        }
+
+        .shadow-metric-card.risk-low {
+            border-left: 4px solid #ffcc44;
+        }
+
+        .detections-container {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+
+        .detections-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .detections-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .detections-table thead {
+            background: var(--bg-tertiary);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .detections-table th {
+            padding: 12px 15px;
+            text-align: left;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .detections-table td {
+            padding: 15px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+        }
+
+        .detections-table tbody tr {
+            transition: background 0.2s ease;
+            cursor: pointer;
+        }
+
+        .detections-table tbody tr:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .risk-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .risk-badge.high {
+            background: rgba(255, 68, 68, 0.2);
+            color: #ff4444;
+            border: 1px solid #ff4444;
+        }
+
+        .risk-badge.medium {
+            background: rgba(255, 153, 68, 0.2);
+            color: #ff9944;
+            border: 1px solid #ff9944;
+        }
+
+        .risk-badge.low {
+            background: rgba(255, 204, 68, 0.2);
+            color: #ffcc44;
+            border: 1px solid #ffcc44;
+        }
+
+        .detection-category {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .detection-details-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .detection-details-content {
+            background: var(--bg-secondary);
+            padding: 30px;
+            border-radius: 12px;
+            width: 600px;
+            max-width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .detail-row {
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .detail-row:last-child {
+            border-bottom: none;
+        }
+
+        .detail-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+
+        .detail-value {
+            font-size: 14px;
+            color: var(--text-primary);
+        }
+
+        .recommendation-box {
+            background: rgba(0, 122, 204, 0.1);
+            border-left: 4px solid var(--accent-color);
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 15px;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .control-group label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        .table-filter-input {
+            width: 100%;
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 11px;
+            margin-top: 5px;
+        }
+
+        .table-filter-input:focus {
+            border-color: var(--accent-color);
+            outline: none;
+        }
+
+        .filter-header-cell {
+            padding: 5px 15px 10px 15px !important;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-color);
+        }
     </style>
+
 </head>
 
 <body>
     <div class="header">
         <div class="title">🩸 Fleet Security Graph</div>
         <div class="controls">
+            <!-- Controls will be contextual based on view -->
             <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">🌓</button>
-            <input type="text" id="search-input" placeholder="Search nodes...">
-            <select id="node-type-filter">
-                <option value="all">All Types</option>
-                <option value="host">Hosts</option>
-                <option value="user">Users</option>
-                <option value="software">Software</option>
-            </select>
-            <select id="platform-filter">
-                <option value="all">All Platforms</option>
-            </select>
-            <select id="team-filter">
-                <option value="all">All Teams</option>
-            </select>
-            <button onclick="searchNodes()">🔍 Search</button>
-            <button onclick="clearSearch()">❌ Clear</button>
-            <button onclick="resetToOverview()">🔙 Overview</button>
-            <button onclick="centerGraph()">🎯 Center</button>
-            <button onclick="resetPositions()">📍 Reset Positions</button>
-            <button onclick="loadGraph()">🔄 Refresh</button>
-            <button onclick="exportAsJSON()" title="Export current view as JSON">📥 JSON</button>
-            <button onclick="exportAsCSV()" title="Export current view as CSV">📥 CSV</button>
+            <div id="graph-controls" style="display: flex; gap: 15px; align-items: center;">
+                <div class="search-container">
+                    <input type="text" id="search-input" placeholder="Find (↑↓ for history)">
+                    <div class="search-toggles">
+                        <button id="toggle-case" class="search-toggle" onclick="toggleCaseSensitive()"
+                            title="Match Case">Aa</button>
+                        <div class="search-mode-group">
+                            <button id="mode-wildcard" class="search-toggle active" onclick="setSearchMode('wildcard')"
+                                title="Wildcard (*)">*</button>
+                            <button id="mode-exact" class="search-toggle" onclick="setSearchMode('exact')"
+                                title="Exact Match">""</button>
+                        </div>
+                    </div>
+                </div>
+                <select id="node-type-filter">
+                    <option value="all">All Types</option>
+                    <option value="host">Hosts</option>
+                    <option value="user">Users</option>
+                    <option value="software">Software</option>
+                </select>
+                <select id="platform-filter">
+                    <option value="all">All Platforms</option>
+                </select>
+                <select id="team-filter">
+                    <option value="all">All Teams</option>
+                </select>
+                <button onclick="searchNodes()">🔍 Search</button>
+                <button onclick="clearSearch()">❌ Clear</button>
+                <button onclick="resetToOverview()">🔙 Overview</button>
+                <button onclick="centerGraph()">🎯 Center</button>
+                <button onclick="resetPositions()">📍 Reset Positions</button>
+                <button onclick="loadGraph()">🔄 Refresh</button>
+                <button onclick="exportAsJSON()" title="Export current view as JSON">📥 JSON</button>
+                <button onclick="exportAsCSV()" title="Export current view as CSV">📥 CSV</button>
+            </div>
         </div>
     </div>
 
-    <div id="graph"></div>
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchView('graph')">🕸️ Graph View</button>
+        <button class="tab-btn" onclick="switchView('blast-radius')">💥 Blast Radius</button>
+        <button class="tab-btn" onclick="switchView('shadow-it')">🔍 Shadow IT</button>
+    </div>
+
+    <!-- Graph View -->
+    <div id="graph-view" class="view-container active">
+        <div id="graph" style="width: 100%; height: 100%;"></div>
+    </div>
+
+    <!-- Blast Radius View -->
+    <div id="blast-radius-view" class="view-container">
+        <div class="blast-dashboard">
+            <div class="blast-sidebar">
+                <h3>Entity Analysis</h3>
+
+                <div class="control-group">
+                    <label>Select Team</label>
+                    <select id="blast-team-filter" onchange="calculateBlastRadius()">
+                        <option value="all">All Teams</option>
+                        <!-- Populated by JS -->
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Select Entity Type</label>
+                    <select id="blast-type-selector" onchange="loadBlastEntities()">
+                        <option value="software">Software</option>
+                        <option value="user">User</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Search Entity</label>
+                    <input type="text" id="blast-search" placeholder="Search..." onkeyup="filterBlastEntities()">
+                </div>
+
+                <div class="control-group" style="display: flex; align-items: center; justify-content: space-between;">
+                    <div style="display: flex; align-items: center; gap: 5px;">
+                        <label style="margin:0; font-size: 13px; cursor: pointer;" for="ignore-defaults-toggle">Exclude
+                            Accounts</label>
+                        <button onclick="openExclusionSettings()" title="Configure Excluded Accounts"
+                            style="background:none; border:none; color:var(--text-secondary); cursor:pointer; padding:0; font-size:14px;">⚙️</button>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="ignore-defaults-toggle" onchange="calculateBlastRadius()">
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+
+                <div id="blast-entity-list" class="entity-list">
+                    <!-- Populated by JS -->
+                    <div style="padding: 20px; text-align: center; color: var(--text-secondary);">Loading...</div>
+                </div>
+            </div>
+
+            <div class="blast-main">
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Host Reach</div>
+                        <div class="metric-value" id="metric-host-reach">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Hosts impacted</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">User Impact</div>
+                        <div class="metric-value" id="metric-user-impact">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Users affected</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Lateral Movement</div>
+                        <div class="metric-value" id="metric-lateral-movement">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">2nd-degree hosts</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Platform Spread</div>
+                        <div class="metric-value" id="metric-platform-diversity">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">OS Platforms</div>
+                    </div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="radar-chart"></div>
+                    <div id="blast-details-panel" class="blast-details-container">
+                        <div id="blast-details-content">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Shadow IT View -->
+    <div id="shadow-it-view" class="view-container">
+        <div class="shadow-it-dashboard">
+            <div class="shadow-it-sidebar">
+                <h3>🔍 Shadow IT Detection</h3>
+
+                <div class="control-group">
+                    <label>Select Team</label>
+                    <select id="shadow-team-filter-new">
+                        <option value="" disabled selected>Select Team</option>
+                        <option value="all">All Teams</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Select Platform</label>
+                    <select id="shadow-platform-filter-new">
+                        <option value="all">All Platforms</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Risk Level</label>
+                    <select id="shadow-risk-filter">
+                        <option value="all">All Risk Levels</option>
+                        <option value="high">High Risk</option>
+                        <option value="medium">Medium Risk</option>
+                        <option value="low">Low Risk</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Detection Type</label>
+                    <select id="shadow-detection-type-filter">
+                        <option value="all">All Types</option>
+                        <option value="outlier">Outlier Software</option>
+                        <option value="high_risk">High-Risk Categories</option>
+                        <option value="version_sprawl">Version Sprawl</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Software Type</label>
+                    <select id="shadow-software-type-filter">
+                        <option value="all">All Software Types</option>
+                        <option value="Browser Extension">Browser Extension</option>
+                        <option value="VSCode Extension">VSCode Extension</option>
+                        <option value="npm Package">npm Package</option>
+                        <option value="Python Package">Python Package</option>
+                        <option value="Ruby Gem">Ruby Gem</option>
+                        <option value="OS Component">OS Component</option>
+                        <option value="Developer Tool">Developer Tool</option>
+                        <option value="Application">Application</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Host Count</label>
+                    <select id="shadow-host-count-filter">
+                        <option value="all">All Host Counts</option>
+                        <option value="1">1 Host</option>
+                        <option value="2">2 Hosts</option>
+                        <option value="3+">3+ Hosts</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>User Count</label>
+                    <select id="shadow-user-count-filter">
+                        <option value="all">All User Counts</option>
+                        <option value="1">1 User</option>
+                        <option value="2">2 Users</option>
+                        <option value="3+">3+ Users</option>
+                    </select>
+                </div>
+
+                <button onclick="loadShadowITDetections()" style="width: 100%;">🔄 Refresh Scan</button>
+
+            </div>
+
+            <div class="shadow-it-main">
+                <div class="shadow-it-metrics">
+                    <div class="shadow-metric-card">
+                        <div class="metric-label">Total Detections</div>
+                        <div class="metric-value" id="shadow-total-detections">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Found issues</div>
+                    </div>
+                    <div class="shadow-metric-card risk-high">
+                        <div class="metric-label">High Risk</div>
+                        <div class="metric-value" id="shadow-high-risk" style="color: #ff4444;">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Critical issues</div>
+                    </div>
+                    <div class="shadow-metric-card risk-medium">
+                        <div class="metric-label">Medium Risk</div>
+                        <div class="metric-value" id="shadow-medium-risk" style="color: #ff9944;">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Warnings</div>
+                    </div>
+                    <div class="shadow-metric-card risk-low">
+                        <div class="metric-label">Low Risk</div>
+                        <div class="metric-value" id="shadow-low-risk" style="color: #ffcc44;">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Informational</div>
+                    </div>
+                    <div class="shadow-metric-card">
+                        <div class="metric-label">Affected Hosts</div>
+                        <div class="metric-value" id="shadow-affected-hosts">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Impacted systems</div>
+                    </div>
+                    <div class="shadow-metric-card">
+                        <div class="metric-label">Affected Users</div>
+                        <div class="metric-value" id="shadow-affected-users">-</div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">Impacted users</div>
+                    </div>
+                </div>
+
+                <div class="detections-container">
+                    <div class="detections-header">
+                        <h3 style="margin: 0;">Detection Results</h3>
+                        <div style="font-size: 12px; color: var(--text-secondary);">
+                            Click a row for details
+                        </div>
+                    </div>
+                    <div id="detections-table-container" style="max-height: 600px; overflow-y: auto;">
+                        <table class="detections-table" id="shadow-detections-table">
+                            <thead>
+                                <tr>
+                                    <th>Software</th>
+                                    <th>Type</th>
+                                    <th>Risk</th>
+                                    <th>Category</th>
+                                    <th>Detection</th>
+                                    <th>Hosts</th>
+                                    <th>Users</th>
+                                    <th>Version</th>
+                                </tr>
+                                <tr class="filter-row">
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Software..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Type..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Risk..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Category..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Detection..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Hosts..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Users..." onkeyup="filterShadowTable()"></th>
+                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
+                                            placeholder="Filter Version..." onkeyup="filterShadowTable()"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="shadow-detections-tbody">
+                                <tr>
+                                    <td colspan="8"
+                                        style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                                        Loading detections...
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detection Details Modal -->
+    <div id="detection-details-modal" class="detection-details-modal" onclick="closeDetectionDetails(event)">
+        <div class="detection-details-content" onclick="event.stopPropagation()">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 style="margin: 0;">Detection Details</h2>
+                <button onclick="closeDetectionDetails()"
+                    style="background: transparent; border: none; font-size: 24px; cursor: pointer; color: var(--text-secondary);">×</button>
+            </div>
+            <div id="detection-details-body">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+    </div>
+
     <div id="status" class="status" style="display: none;"></div>
 
+    <!-- Exclusion Settings Modal -->
+    <div id="exclusion-modal" class="modal"
+        style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center;">
+        <div class="modal-content"
+            style="background: var(--bg-secondary); padding: 20px; border-radius: 8px; width: 400px; border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+            <h3 style="margin-top: 0; color: var(--text-primary);">Manage Excluded Accounts</h3>
+            <p style="color: var(--text-secondary); font-size: 12px; margin-bottom: 10px;">
+                Enter usernames to exclude from Blast Radius calculations (comma separated).<br>
+                Default system accounts are always included when the toggle is ON.
+            </p>
+            <textarea id="custom-exclusion-list"
+                style="width: 100%; height: 100px; background: var(--input-bg); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; margin-bottom: 15px;"></textarea>
+            <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button onclick="closeExclusionSettings()"
+                    style="padding: 6px 12px; background: transparent; border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 4px; cursor: pointer;">Cancel</button>
+                <button onclick="saveExclusionSettings()"
+                    style="padding: 6px 12px; background: var(--accent-color); border: none; color: white; border-radius: 4px; cursor: pointer;">Save</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // Constants and State
+        const DEFAULT_ACCOUNTS = ['root', 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount'];
+        let customExclusions = [];
+
         let currentData = { nodes: [], links: [] };
         let allGraphData = { nodes: [], links: [] };
         let simulation;
+
+        // Search mode state
+        let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
+        let caseSensitive = false;
+
+        // Toggle case sensitivity
+        function toggleCaseSensitive() {
+            caseSensitive = !caseSensitive;
+            const btn = document.getElementById('toggle-case');
+            btn.classList.toggle('active', caseSensitive);
+            // Re-run search if there's a search term
+            const searchTerm = document.getElementById('search-input').value.trim();
+            if (searchTerm) {
+                searchNodes();
+            }
+        }
+
+        // Set search mode
+        function setSearchMode(mode) {
+            searchMode = mode;
+            // Update button states
+            document.getElementById('mode-wildcard').classList.toggle('active', mode === 'wildcard');
+            document.getElementById('mode-exact').classList.toggle('active', mode === 'exact');
+
+            // Re-run search if there's a search term
+            const searchTerm = document.getElementById('search-input').value.trim();
+            if (searchTerm) {
+                searchNodes();
+            }
+        }
+
+        // Helper function to test if a value matches the search term based on current mode
+        function matchesSearch(value, searchTerm) {
+            if (!value || !searchTerm) return !searchTerm;
+
+            const testValue = caseSensitive ? value : value.toLowerCase();
+            const testTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+
+            switch (searchMode) {
+                case 'exact':
+                    return testValue === testTerm;
+
+                case 'wildcard':
+                default:
+                    return testValue.includes(testTerm);
+            }
+        }
 
         // Theme Management
         function toggleTheme() {
@@ -268,6 +1306,7 @@
         document.addEventListener('DOMContentLoaded', () => {
             loadThemePreference();
             loadPlatforms();
+            loadExclusionSettings(); // Load custom exclusions
             // Load teams (existing logic assumed elsewhere or could be added here similar to platforms)
             // For now just platforms as requested.
         });
@@ -315,31 +1354,40 @@
                 });
         }
 
-        function renderGraph(data) {
+        function renderGraph(data, filterDisconnected = true) {
             const container = d3.select("#graph");
             container.selectAll("*").remove(); // Clear previous graph
 
             const width = container.node().clientWidth;
             const height = container.node().clientHeight;
 
-            // Filter out disconnected nodes (nodes with no links)
-            const connectedNodeIds = new Set();
-            data.links.forEach(link => {
-                connectedNodeIds.add(typeof link.source === 'object' ? link.source.id : link.source);
-                connectedNodeIds.add(typeof link.target === 'object' ? link.target.id : link.target);
-            });
+            let nodesToRender;
 
-            const connectedNodes = data.nodes.filter(node => connectedNodeIds.has(node.id));
-            const disconnectedNodes = data.nodes.filter(node => !connectedNodeIds.has(node.id));
+            if (filterDisconnected && data.links.length > 0) {
+                // Filter out disconnected nodes (nodes with no links) - only for initial overview
+                const connectedNodeIds = new Set();
+                data.links.forEach(link => {
+                    connectedNodeIds.add(typeof link.source === 'object' ? link.source.id : link.source);
+                    connectedNodeIds.add(typeof link.target === 'object' ? link.target.id : link.target);
+                });
 
-            // Log disconnected nodes for debugging
-            if (disconnectedNodes.length > 0) {
-                console.log(`Filtered out ${disconnectedNodes.length} disconnected nodes:`,
-                    disconnectedNodes.map(n => n.name).slice(0, 10));
+                const connectedNodes = data.nodes.filter(node => connectedNodeIds.has(node.id));
+                const disconnectedNodes = data.nodes.filter(node => !connectedNodeIds.has(node.id));
+
+                // Log disconnected nodes for debugging
+                if (disconnectedNodes.length > 0) {
+                    console.log(`Filtered out ${disconnectedNodes.length} disconnected nodes:`,
+                        disconnectedNodes.map(n => n.name).slice(0, 10));
+                }
+
+                nodesToRender = connectedNodes;
+            } else {
+                // Show ALL nodes including disconnected ones (for search/filter results)
+                nodesToRender = data.nodes;
+                if (data.nodes.length > 0 && data.links.length === 0) {
+                    console.log(`Rendering ${data.nodes.length} nodes (no links, showing all)`);
+                }
             }
-
-            // Use only connected nodes for visualization
-            const nodesToRender = connectedNodes;
 
             const svg = container.append("svg")
                 .attr("width", width)
@@ -610,9 +1658,15 @@
                 const platformParam = platformFilter !== 'all' ? `&platform=${encodeURIComponent(platformFilter)}` : '';
                 const teamParam = teamFilter !== 'all' ? `&team=${encodeURIComponent(teamFilter)}` : '';
 
+                // Add advanced search parameters
+                const modeParam = `&mode=${searchMode}`;
+                const caseParam = `&case=${caseSensitive}`;
+
                 let statusMsg;
                 if (searchTerm) {
                     statusMsg = `Searching for "${searchTerm}"`;
+                    if (searchMode !== 'wildcard') statusMsg += ` (${searchMode} match)`;
+                    if (caseSensitive) statusMsg += ` (case sensitive)`;
                     if (nodeTypeFilter !== 'all') statusMsg += ` in ${nodeTypeFilter}s`;
                     if (platformFilter !== 'all') statusMsg += ` on ${platformFilter}`;
                     if (teamFilter !== 'all') statusMsg += ` in team`;
@@ -625,15 +1679,21 @@
                 }
                 showStatus(statusMsg);
 
-                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}`)
+                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${modeParam}${caseParam}`)
                     .then(response => response.json())
                     .then(data => {
-                        console.log(`Search results (term: "${searchTerm}", type: ${nodeTypeFilter}, platform: ${platformFilter}, team: ${teamFilter}):`, data);
+                        console.log(`Search results (term: "${searchTerm}", type: ${nodeTypeFilter}, platform: ${platformFilter}):`, data);
+
+                        if (data.error) {
+                            showStatus(`Search Error: ${data.message || data.error}`, true);
+                            return;
+                        }
 
                         if (data.nodes && data.nodes.length > 0) {
                             // Backend returned results - use them directly
                             currentData = { nodes: data.nodes, links: data.links };
-                            renderGraph(currentData);
+                            // Don't filter disconnected nodes for search results - show ALL matching nodes
+                            renderGraph(currentData, false);
 
                             // Build status message
                             let statusMsg = `Found ${data.node_count} nodes`;
@@ -655,6 +1715,9 @@
                             if (searchTerm) {
                                 statusMsg += ` for "${searchTerm}"`;
                             }
+                            // Add detail about mode if no results
+                            if (searchMode !== 'wildcard') statusMsg += ` (${searchMode})`;
+
                             if (nodeTypeFilter !== 'all') {
                                 statusMsg += ` in ${nodeTypeFilter}s`;
                             }
@@ -668,15 +1731,15 @@
                         console.error('Error searching:', error);
                         showStatus('Error performing search, using local data', true);
                         // Fall back to local filtering on error
-                        performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter);
+                        performLocalFiltering(searchTerm, nodeTypeFilter, platformFilter);
                     });
             } else {
                 // No search term, or filtering by non-software types only - use local filtering
-                performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter);
+                performLocalFiltering(searchTerm, nodeTypeFilter, platformFilter);
             }
         }
 
-        function performLocalFiltering(searchTermLower, nodeTypeFilter, platformFilter) {
+        function performLocalFiltering(searchTerm, nodeTypeFilter, platformFilter) {
             // Step 1: Filter hosts by platform (platform only applies to hosts)
             let platformFilteredHosts = allGraphData.nodes.filter(node => {
                 if (node.type !== 'host') return false;
@@ -728,11 +1791,11 @@
                 }
 
                 // Must match search term
-                const matchesSearch = !searchTermLower ||
-                    node.name.toLowerCase().includes(searchTermLower) ||
-                    (node.details && node.details.toLowerCase().includes(searchTermLower));
+                const isMatch = !searchTerm ||
+                    matchesSearch(node.name, searchTerm) ||
+                    (node.details && matchesSearch(node.details, searchTerm));
 
-                return matchesSearch;
+                return isMatch;
             });
 
             console.log(`Matching nodes after platform+search filter: ${matchingNodes.length} (${matchingNodes.filter(n => n.type === 'host').length} hosts, ${matchingNodes.filter(n => n.type === 'software').length} software, ${matchingNodes.filter(n => n.type === 'user').length} users)`);
@@ -766,20 +1829,17 @@
                 console.log(`Found ${connectedUserIds.size} users connected to platform hosts`);
 
                 // Step 3: Filter users by search term if provided
-                let matchingUsers;
-                if (searchTermLower) {
-                    matchingUsers = allGraphData.nodes.filter(node =>
-                        node.type === 'user' &&
-                        connectedUserIds.has(node.id) &&
-                        (node.name.toLowerCase().includes(searchTermLower) ||
-                            (node.details && node.details.toLowerCase().includes(searchTermLower)))
-                    );
+                let isMatch;
+                if (searchTerm) {
+                    isMatch = matchesSearch(node.name, searchTerm) ||
+                        (node.details && matchesSearch(node.details, searchTerm));
                 } else {
-                    // No search term: use all users connected to platform hosts
-                    matchingUsers = allGraphData.nodes.filter(node =>
-                        node.type === 'user' && connectedUserIds.has(node.id)
-                    );
+                    isMatch = true;
                 }
+
+                return node.type === 'user' &&
+                    connectedUserIds.has(node.id) &&
+                    isMatch;
                 console.log(`Matching users after search filter: ${matchingUsers.length}`);
 
                 const userIds = new Set(matchingUsers.map(u => u.id));
@@ -823,13 +1883,15 @@
 
                 // Step 3: Filter software by search term if provided
                 let matchingSoftware;
-                if (searchTermLower) {
-                    matchingSoftware = allGraphData.nodes.filter(node =>
-                        node.type === 'software' &&
-                        connectedSoftwareIds.has(node.id) &&
-                        (node.name.toLowerCase().includes(searchTermLower) ||
-                            (node.details && node.details.toLowerCase().includes(searchTermLower)))
-                    );
+                if (searchTerm) {
+                    matchingSoftware = allGraphData.nodes.filter(node => {
+                        const isMatch = matchesSearch(node.name, searchTerm) ||
+                            (node.details && matchesSearch(node.details, searchTerm));
+
+                        return node.type === 'software' &&
+                            connectedSoftwareIds.has(node.id) &&
+                            isMatch;
+                    });
                 } else {
                     // No search term: use all software connected to platform hosts
                     matchingSoftware = allGraphData.nodes.filter(node =>
@@ -879,7 +1941,8 @@
             };
 
             currentData = filteredData;
-            renderGraph(filteredData);
+            // Don't filter disconnected nodes when showing filtered results
+            renderGraph(filteredData, false);
             showStatus(`Found ${filteredNodes.length} nodes, ${filteredLinks.length} connections`);
         }
 
@@ -1036,6 +2099,476 @@
             showStatus(`Exported ${currentData.nodes.length} nodes and ${currentData.links.length} links as CSV`);
         }
 
+        // --- Blast Radius Functions ---
+
+        function switchView(view) {
+            // Update tabs
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            // Find the button that called this
+            const clickedBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => {
+                const text = b.textContent.toLowerCase();
+                if (view === 'graph') return text.includes('graph');
+                if (view === 'blast-radius') return text.includes('blast');
+                if (view === 'shadow-it') return text.includes('shadow');
+                return false;
+            });
+            if (clickedBtn) clickedBtn.classList.add('active');
+
+            // Update views
+            document.querySelectorAll('.view-container').forEach(el => el.classList.remove('active'));
+            document.getElementById(`${view}-view`).classList.add('active');
+
+            // Toggle controls visibility
+            const graphControls = document.getElementById('graph-controls');
+            if (view === 'graph') {
+                graphControls.style.display = 'flex';
+                // Resize graph if needed
+                if (simulation) simulation.alpha(0.1).restart();
+            } else {
+                graphControls.style.display = 'none';
+                if (view === 'blast-radius') {
+                    // Initialize blast radius view if needed
+                    if (document.getElementById('blast-entity-list').children.length <= 1) {
+                        loadBlastEntities();
+                    }
+                } else if (view === 'shadow-it') {
+                    // Initialize Shadow IT view if needed
+                    if (!window.shadowITLoaded) {
+                        loadShadowITDetections();
+                        window.shadowITLoaded = true;
+                    }
+                }
+            }
+        }
+
+        let blastEntities = [];
+        let searchTimeout;
+
+        function loadBlastEntities() {
+            const type = document.getElementById('blast-type-selector').value;
+            const listContainer = document.getElementById('blast-entity-list');
+            listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">Loading...</div>';
+
+            document.getElementById('blast-search').value = ''; // Clear search box
+
+            // Use the existing search endpoint to get all entities of a type
+            // Passing 'q=' gets all, but we increase limit to 1000 to get a good list
+            fetch(`/api/search?type=${type}&limit=1000`)
+                .then(res => res.json())
+                .then(data => {
+                    // Extract relevant nodes
+                    blastEntities = data.nodes.filter(n => n.type === type);
+                    renderBlastList(blastEntities);
+                })
+                .catch(err => {
+                    console.error("Error loading entities:", err);
+                    listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #e74c3c;">Error loading entities</div>';
+                });
+        }
+
+        function renderBlastList(entities) {
+            const listContainer = document.getElementById('blast-entity-list');
+            listContainer.innerHTML = '';
+
+            if (entities.length === 0) {
+                listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">No entities found</div>';
+                return;
+            }
+
+            // Sort alphabetically
+            entities.sort((a, b) => a.name.localeCompare(b.name));
+
+            entities.forEach(entity => {
+                const item = document.createElement('div');
+                item.className = 'entity-item';
+                item.innerHTML = `
+                    <div style="flex: 1;">
+                        <div class="entity-name">${entity.name}</div>
+                        <div class="entity-meta">${entity.details || ''}</div>
+                    </div>
+                `;
+                item.onclick = () => selectBlastEntity(entity, item);
+                listContainer.appendChild(item);
+            });
+        }
+
+        function filterBlastEntities() {
+            const term = document.getElementById('blast-search').value.toLowerCase();
+            const type = document.getElementById('blast-type-selector').value;
+
+            // Debounce backend search
+            clearTimeout(searchTimeout);
+
+            if (!term) {
+                // If empty, reload default list
+                loadBlastEntities();
+                return;
+            }
+
+            // If we have less than 1000 entities loaded, we might have everything?
+            // But if the server has more, checking locally is insufficient.
+            // Let's do a backend search if term is long enough.
+
+            searchTimeout = setTimeout(() => {
+                const listContainer = document.getElementById('blast-entity-list');
+                listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">Searching...</div>';
+
+                fetch(`/api/search?type=${type}&q=${encodeURIComponent(term)}&limit=100`)
+                    .then(res => res.json())
+                    .then(data => {
+                        const results = data.nodes.filter(n => n.type === type);
+                        renderBlastList(results);
+                    })
+                    .catch(err => {
+                        listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #e74c3c;">Error searching</div>';
+                    });
+            }, 300);
+        }
+
+        let selectedEntityId = null;
+
+        function selectBlastEntity(entity, domElement) {
+            // Highlight selection
+            document.querySelectorAll('.entity-item').forEach(el => el.classList.remove('active'));
+            domElement.classList.add('active');
+
+            // Store selected ID globally so we can re-calculate when team changes
+            selectedEntityId = entity.name;
+
+            // Calculate blast radius
+            calculateBlastRadius(entity.type, entity.name);
+        }
+
+        function calculateBlastRadius(type, id) {
+            // If called without args (e.g. from team filter change), use stored values
+            if (!type || !id) {
+                if (!selectedEntityId) return; // Nothing selected yet
+                type = document.getElementById('blast-type-selector').value;
+                id = selectedEntityId;
+            }
+
+            const teamFilter = document.getElementById('blast-team-filter').value;
+            const ignoreDefaults = document.getElementById('ignore-defaults-toggle').checked;
+
+            showStatus(`Calculating blast radius for ${id}...`);
+
+            // Add ignore_defaults param
+            // Prepare exclusion list
+            let exclusionParams = '';
+            if (ignoreDefaults) {
+                // Combine defaults and custom exclusions
+                const allExcluded = [...new Set([...DEFAULT_ACCOUNTS, ...customExclusions])];
+                if (allExcluded.length > 0) {
+                    exclusionParams = `&excluded_users=${encodeURIComponent(allExcluded.join(','))}`;
+                }
+            }
+
+            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) throw new Error(data.error);
+
+                    updateBlastMetrics(data);
+                    drawRadarChart(data.scores);
+                    updateBlastDetails(data.details);
+                    showStatus(`Blast radius calculated for ${id}`);
+                })
+                .catch(err => {
+                    console.error("Blast radius error:", err);
+                    showStatus("Error calculating blast radius", true);
+                });
+        }
+
+        // Exclusion Settings Management
+        function openExclusionSettings() {
+            document.getElementById('custom-exclusion-list').value = customExclusions.join(', ');
+            document.getElementById('exclusion-modal').style.display = 'flex';
+        }
+
+        function closeExclusionSettings() {
+            document.getElementById('exclusion-modal').style.display = 'none';
+        }
+
+        function saveExclusionSettings() {
+            const input = document.getElementById('custom-exclusion-list').value;
+            // Parse comma-separated list
+            customExclusions = input.split(',')
+                .map(s => s.trim())
+                .filter(s => s.length > 0);
+
+            // Save to localStorage
+            localStorage.setItem('customExclusions', JSON.stringify(customExclusions));
+
+            closeExclusionSettings();
+
+            // Re-calculate if toggle is on
+            if (document.getElementById('ignore-defaults-toggle').checked) {
+                calculateBlastRadius();
+            }
+            showStatus(`Saved ${customExclusions.length} custom exclusions`);
+        }
+
+        function loadExclusionSettings() {
+            const saved = localStorage.getItem('customExclusions');
+            if (saved) {
+                try {
+                    customExclusions = JSON.parse(saved);
+                } catch (e) {
+                    console.error("Error loading custom exclusions", e);
+                    customExclusions = [];
+                }
+            }
+        }
+
+        // Load teams for both views
+        // Load teams for all views (Graph, Blast Radius, Shadow IT)
+        function loadTeams() {
+            fetch('/api/teams')
+                .then(response => response.json())
+                .then(teams => {
+                    const teamFilter = document.getElementById('team-filter'); // Graph view
+                    const blastTeamFilter = document.getElementById('blast-team-filter'); // Blast view
+                    const shadowTeamFilter = document.getElementById('shadow-team-filter-new'); // Shadow IT
+
+                    // Clear existing (keep first 'All' option)
+                    while (teamFilter.options.length > 1) teamFilter.remove(1);
+                    if (blastTeamFilter) {
+                        while (blastTeamFilter.options.length > 1) blastTeamFilter.remove(1);
+                    }
+                    if (shadowTeamFilter) {
+                        // Reset to Select Team
+                        shadowTeamFilter.innerHTML = '<option value="" disabled selected>Select Team</option><option value="all">All Teams</option>';
+                    }
+
+                    const teamsCount = teams.length;
+                    if (shadowTeamFilter) {
+                        // Update Shadow IT placeholder with count
+                        shadowTeamFilter.innerHTML = `<option value="" disabled selected>Select Team (${teamsCount})</option><option value="all">All Teams</option>`;
+                    }
+
+                    teams.forEach(team => {
+                        const option = document.createElement('option');
+                        option.value = team.id;
+                        option.textContent = team.name;
+                        teamFilter.appendChild(option);
+
+                        if (blastTeamFilter) {
+                            blastTeamFilter.appendChild(option.cloneNode(true));
+                        }
+                        if (shadowTeamFilter) {
+                            shadowTeamFilter.appendChild(option.cloneNode(true));
+                        }
+                    });
+                })
+                .catch(error => console.error('Error loading teams:', error));
+        }
+
+        // Load platforms for filters
+        function loadPlatforms() {
+            fetch('/api/platforms')
+                .then(response => response.json())
+                .then(platforms => {
+                    const shadowPlatformFilter = document.getElementById('shadow-platform-filter-new');
+                    if (shadowPlatformFilter) {
+                        shadowPlatformFilter.innerHTML = `<option value="all">All Platforms (${platforms.length})</option>`;
+                        platforms.forEach(platform => {
+                            const option = document.createElement('option');
+                            option.value = platform;
+                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+                            shadowPlatformFilter.appendChild(option);
+                        });
+                    }
+                })
+                .catch(error => console.error('Error loading platforms:', error));
+        }
+
+        function updateBlastMetrics(data) {
+            // Animate numbers (simple implementation)
+            document.getElementById('metric-host-reach').textContent = data.metrics.host_reach;
+            document.getElementById('metric-user-impact').textContent = data.metrics.user_impact;
+            // Updated: Team Impact -> Lateral Movement
+            document.getElementById('metric-lateral-movement').textContent = data.metrics.lateral_movement || 0;
+            document.getElementById('metric-platform-diversity').textContent = data.metrics.platform_diversity;
+        }
+
+        function updateBlastDetails(details) {
+            const container = document.getElementById('blast-details-content');
+            container.innerHTML = '';
+
+            // Helper to create list sections
+            const addSection = (title, items) => {
+                if (!items || items.length === 0) return;
+
+                const section = document.createElement('div');
+                section.className = 'detail-section';
+                section.innerHTML = `<h4>${title} <span class="count-badge">${items.length}</span></h4>`;
+
+                const list = document.createElement('div');
+                list.className = 'detail-list';
+
+                // Show max 50 items to prevent huge lists
+                const displayItems = items.slice(0, 50);
+
+                displayItems.forEach(item => {
+                    const el = document.createElement('div');
+                    el.className = 'detail-item';
+                    el.textContent = item;
+                    list.appendChild(el);
+                });
+
+                if (items.length > 50) {
+                    const more = document.createElement('div');
+                    more.className = 'detail-item';
+                    more.style.fontStyle = 'italic';
+                    more.textContent = `...and ${items.length - 50} more`;
+                    list.appendChild(more);
+                }
+
+                section.appendChild(list);
+                container.appendChild(section);
+            };
+
+            addSection('Impacted Teams', details.teams);
+            addSection('Impacted Platforms', details.platforms);
+            addSection('Impacted Hosts', details.hosts);
+            addSection('Impacted Users', details.users);
+        }
+        function drawRadarChart(scores) {
+            const container = d3.select("#radar-chart");
+            container.selectAll("*").remove(); // Clear previous content
+
+            const containerEl = document.getElementById('radar-chart');
+            const fullWidth = containerEl.clientWidth;
+            // Cap the height for the chart drawing to prevent it from being "too big" or centered in a huge void
+            // Use Math.min with a fixed max size (e.g., 500px)
+            const maxSize = 500;
+            const width = Math.min(fullWidth, maxSize);
+            const height = Math.min(containerEl.clientHeight, maxSize);
+            const margin = 60;
+            const radius = Math.min(width, height) / 2 - margin;
+
+            // Create SVG with full width (for centering) but limited height
+            const svg = container.append("svg")
+                .attr("width", "100%")
+                .attr("height", height)
+                .attr("class", "radar-chart")
+                .append("g")
+                .attr("transform", `translate(${fullWidth / 2},${height / 2})`);
+
+            // Add Glow Filter
+            const defs = container.select("svg").append("defs");
+            const filter = defs.append("filter")
+                .attr("id", "glow")
+                .attr("x", "-50%")
+                .attr("y", "-50%")
+                .attr("width", "200%")
+                .attr("height", "200%");
+            filter.append("feGaussianBlur")
+                .attr("class", "blur")
+                .attr("stdDeviation", "2.5")
+                .attr("result", "coloredBlur");
+            const feMerge = filter.append("feMerge");
+            feMerge.append("feMergeNode").attr("in", "coloredBlur");
+            feMerge.append("feMergeNode").attr("in", "SourceGraphic");
+
+            // Radar Chart Config
+            const features = Object.keys(scores);
+
+            // Scales
+            const rScale = d3.scaleLinear().range([0, radius]).domain([0, 100]);
+            const angleSlice = Math.PI * 2 / features.length;
+
+            // Draw the grid circles
+            const levels = 5;
+            for (let i = 0; i < levels; i++) {
+                const levelFactor = radius * ((i + 1) / levels);
+                svg.selectAll(".levels")
+                    .data([1])
+                    .enter()
+                    .append("circle")
+                    .attr("r", levelFactor)
+                    .style("fill", "none")
+                    .style("stroke", "var(--border-color)")
+                    .style("stroke-opacity", "0.5")
+                    .style("filter", "url(#glow)");
+            }
+
+            // Text indicating levels
+            for (let i = 0; i < levels; i++) {
+                const levelFactor = radius * ((i + 1) / levels);
+                svg.selectAll(".levels-labels")
+                    .data([1])
+                    .enter()
+                    .append("text")
+                    .attr("x", 4)
+                    .attr("y", -levelFactor)
+                    .attr("dy", "0.4em")
+                    .style("font-size", "10px")
+                    .attr("fill", "var(--text-secondary)")
+                    .text(Math.round((i + 1) * 100 / levels));
+            }
+
+            // Draw the axes
+            const axis = svg.selectAll(".axis")
+                .data(features)
+                .enter()
+                .append("g")
+                .attr("class", "axis");
+
+            axis.append("line")
+                .attr("x1", 0)
+                .attr("y1", 0)
+                .attr("x2", (d, i) => rScale(100) * Math.cos(angleSlice * i - Math.PI / 2))
+                .attr("y2", (d, i) => rScale(100) * Math.sin(angleSlice * i - Math.PI / 2))
+                .attr("class", "line")
+                .style("stroke", "var(--border-color)")
+                .style("stroke-width", "1px");
+
+            axis.append("text")
+                .attr("class", "legend")
+                .style("font-size", "11px")
+                .attr("text-anchor", "middle")
+                .attr("dy", "0.35em")
+                .attr("x", (d, i) => rScale(115) * Math.cos(angleSlice * i - Math.PI / 2))
+                .attr("y", (d, i) => rScale(115) * Math.sin(angleSlice * i - Math.PI / 2))
+                .text(d => d)
+                .style("fill", "var(--text-primary)")
+                .style("font-weight", "bold");
+
+            // Draw the radar area
+            const radarLine = d3.lineRadial()
+                .curve(d3.curveLinearClosed)
+                .radius(d => rScale(d.value))
+                .angle((d, i) => i * angleSlice);
+
+            const data = Object.keys(scores).map(key => ({ axis: key, value: scores[key] }));
+
+            // Area
+            svg.append("path")
+                .datum(data)
+                .attr("d", radarLine)
+                .style("fill", "var(--accent-color)")
+                .style("fill-opacity", 0.3)
+                .style("stroke", "var(--accent-color)")
+                .style("stroke-width", 2)
+                .style("filter", "url(#glow)");
+
+            // Points
+            svg.selectAll(".radar-circle")
+                .data(data)
+                .enter()
+                .append("circle")
+                .attr("class", "radar-circle")
+                .attr("r", 4)
+                .attr("cx", (d, i) => rScale(d.value) * Math.cos(angleSlice * i - Math.PI / 2))
+                .attr("cy", (d, i) => rScale(d.value) * Math.sin(angleSlice * i - Math.PI / 2))
+                .style("fill", "var(--accent-color)")
+                .style("fill-opacity", 0.8)
+                .style("filter", "url(#glow)")
+                .append("title")
+                .text(d => `${d.value}%`);
+        }
+
         // Add Enter key support for search
         document.addEventListener('DOMContentLoaded', function () {
             // Load theme preference first
@@ -1053,9 +2586,361 @@
             document.getElementById('team-filter').addEventListener('change', searchNodes);
 
             // Load teams and initial data
+            // Load teams and initial data
             loadTeams();
+            loadPlatforms();
             loadGraph();
         });
+
+        // --- Shadow IT Functions ---
+
+        let shadowITData = null;
+
+        let shadowFiltersPopulated = false;
+
+        async function initShadowIT() {
+            if (!shadowFiltersPopulated) {
+                // Dependency on global loadTeams/loadPlatforms now
+                shadowFiltersPopulated = true;
+                // Select first real team if available to avoid loading everything
+                const teamFilter = document.getElementById('shadow-team-filter-new');
+                if (teamFilter.options.length > 1) {
+                    // teamFilter.selectedIndex = 1; // Removed auto-selection
+                }
+                shadowFiltersPopulated = true;
+
+                // Show intro message
+                const tbody = document.getElementById('shadow-detections-tbody');
+                tbody.innerHTML = `
+                    <tr><td colspan="8">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">👈</div>
+                            <div>Please select a Team to begin scanning</div>
+                        </div>
+                    </td></tr>`;
+            }
+        }
+
+        async function loadShadowITDetections() {
+            const teamFilter = document.getElementById('shadow-team-filter-new').value;
+
+            if (!teamFilter) {
+                const tbody = document.getElementById('shadow-detections-tbody');
+                tbody.innerHTML = `
+                    <tr><td colspan="8">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">👈</div>
+                            <div>Please select a Team to view detections</div>
+                        </div>
+                    </td></tr>`;
+                return;
+            }
+            const platformFilter = document.getElementById('shadow-platform-filter-new').value;
+            const riskFilter = document.getElementById('shadow-risk-filter').value;
+            const detectionTypeFilter = document.getElementById('shadow-detection-type-filter').value;
+            const softwareTypeFilter = document.getElementById('shadow-software-type-filter').value;
+            const hostCountFilter = document.getElementById('shadow-host-count-filter').value;
+            const userCountFilter = document.getElementById('shadow-user-count-filter').value;
+
+            // Build query params
+            const params = new URLSearchParams({
+                team: teamFilter,
+                platform: platformFilter,
+                risk: riskFilter,
+                detection_type: detectionTypeFilter,
+                software_type: softwareTypeFilter,
+                host_count: hostCountFilter,
+                user_count: userCountFilter
+            });
+
+            try {
+                const response = await fetch(`/api/shadow-it?${params}`);
+                const data = await response.json();
+
+                shadowITData = data;
+
+                // Update metrics
+                document.getElementById('shadow-total-detections').textContent = data.summary.total_detections;
+                document.getElementById('shadow-high-risk').textContent = data.summary.high_risk;
+                document.getElementById('shadow-medium-risk').textContent = data.summary.medium_risk;
+                document.getElementById('shadow-low-risk').textContent = data.summary.low_risk;
+                document.getElementById('shadow-affected-hosts').textContent = data.summary.affected_hosts;
+                document.getElementById('shadow-affected-users').textContent = data.summary.affected_users;
+
+                // Render detections table
+                renderShadowITTable(data.detections);
+
+                // Re-apply column filters if search boxes are filled
+                filterShadowTable();
+
+            } catch (error) {
+                console.error('Error loading Shadow IT detections:', error);
+                showEmptyState('Error loading detections. Please try again.');
+            }
+        }
+
+        async function authorizeSoftware(softwareName) {
+            if (!confirm(`Are you sure you want to authorize "${softwareName}"?\nIt will be added to the whitelist and won't appear in future scans.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/authorize-software', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ software_name: softwareName })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    // Close modal
+                    closeDetectionDetails();
+                    // Refresh detections
+                    loadShadowITDetections();
+                    showStatus(`${softwareName} authorized successfully.`);
+                } else {
+                    alert('Error: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Error authorizing software:', error);
+                alert('Error authorizing software');
+            }
+        }
+
+        function renderShadowITTable(detections) {
+            const tbody = document.getElementById('shadow-detections-tbody');
+
+            if (!detections || detections.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8">
+                            <div class="empty-state">
+                                <div class="empty-state-icon">✅</div>
+                                <div>No Shadow IT detections found!</div>
+                                <div style="font-size: 12px; margin-top: 5px;">Your environment looks clean.</div>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = '';
+
+            detections.forEach(detection => {
+                const row = document.createElement('tr');
+                row.onclick = () => showDetectionDetails(detection);
+
+                row.innerHTML = `
+                    <td><strong>${escapeHtml(detection.software_name)}</strong></td>
+                    <td style="font-size: 11px; color: var(--text-secondary);">${escapeHtml(detection.software_type || 'Unknown')}</td>
+                    <td>
+                        <span class="risk-badge ${detection.risk_level}">${detection.risk_level.toUpperCase()}</span>
+                    </td>
+                    <td><span class="detection-category">${detection.category}</span></td>
+                    <td style="font-size: 11px;">${detection.detection_type.replace('_', ' ').toUpperCase()}</td>
+                    <td>${detection.host_count}</td>
+                    <td>${detection.affected_users.length}</td>
+                    <td style="font-size: 11px;">${truncateText(detection.version, 30)}</td>
+                `;
+
+                tbody.appendChild(row);
+            });
+
+            // Re-apply filters if any exist (to persist filters across reloads)
+            filterShadowTable();
+        }
+
+        function filterShadowTable() {
+            const table = document.getElementById("shadow-detections-table");
+            if (!table) return;
+
+            const tr = table.getElementsByTagName("tr");
+            const inputs = document.getElementsByClassName("table-filter-input");
+
+            // Start at index 2 (skipping header row and filter row)
+            for (let i = 2; i < tr.length; i++) {
+                // Skip special rows like "Loading" or "Empty" which might merge columns
+                if (tr[i].cells.length < inputs.length) continue;
+
+                let showRow = true;
+
+                // Check all columns
+                for (let j = 0; j < inputs.length; j++) {
+                    const filter = inputs[j].value.toUpperCase();
+                    if (filter === "") continue; // Skip empty filters
+
+                    const td = tr[i].getElementsByTagName("td")[j];
+                    if (td) {
+                        const txtValue = td.textContent || td.innerText;
+                        if (txtValue.toUpperCase().indexOf(filter) === -1) {
+                            showRow = false;
+                            break;
+                        }
+                    }
+                }
+
+                tr[i].style.display = showRow ? "" : "none";
+            }
+        }
+
+        function showDetectionDetails(detection) {
+            const modal = document.getElementById('detection-details-modal');
+            const body = document.getElementById('detection-details-body');
+
+            body.innerHTML = `
+                <div class="detail-row">
+                    <div class="detail-label">Software Name</div>
+                    <div class="detail-value"><strong>${escapeHtml(detection.software_name)}</strong></div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Risk Level</div>
+                    <div class="detail-value">
+                        <span class="risk-badge ${detection.risk_level}">${detection.risk_level.toUpperCase()}</span>
+                    </div>
+                </div>
+
+                <div class="detail-row">
+                    <div class="detail-label">Risk Reason</div>
+                    <div class="detail-value" style="font-style: italic; color: #ccc; border-left: 2px solid var(--border-color); padding-left: 8px;">
+                        ${escapeHtml(detection.risk_reason || 'Reason not available')}
+                    </div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Category</div>
+                    <div class="detail-value">${detection.category}</div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Detection Type</div>
+                    <div class="detail-value">${detection.detection_type.replace('_', ' ')}</div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Version</div>
+                    <div class="detail-value">${escapeHtml(detection.version)}</div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Affected Hosts (${detection.host_count})</div>
+                    <div class="detail-value" style="max-height: 100px; overflow-y: auto;">
+                        ${detection.affected_hosts.map(h => `<div style="padding: 2px 0;">• ${escapeHtml(h)}</div>`).join('')}
+                    </div>
+                </div>
+                
+                <div class="detail-row">
+                    <div class="detail-label">Affected Users (${detection.affected_users.length})</div>
+                    <div class="detail-value" style="max-height: 100px; overflow-y: auto;">
+                        ${detection.affected_users.length > 0
+                    ? detection.affected_users.map(u => `<div style="padding: 2px 0;">• ${escapeHtml(u)}</div>`).join('')
+                    : '<span style="color: var(--text-secondary);">No users data</span>'}
+                    </div>
+                </div>
+                
+                ${detection.platforms && detection.platforms.length > 0 ? `
+                <div class="detail-row">
+                    <div class="detail-label">Platforms</div>
+                    <div class="detail-value">${detection.platforms.join(', ')}</div>
+                </div>
+                ` : ''}
+                
+                <div class="detail-row">
+                    <div class="detail-label">Details</div>
+                    <div class="detail-value">${escapeHtml(detection.details)}</div>
+                </div>
+                
+                <div class="recommendation-box">
+                    <div style="font-size: 11px; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 8px;">
+                        ⚠️ Recommendation
+                    </div>
+                    <div>${escapeHtml(detection.recommendation)}</div>
+                </div>
+
+                <div style="margin-top: 20px; text-align: right;">
+                    <button onclick="authorizeSoftware('${escapeHtml(detection.software_name).replace(/'/g, "\\'")}')" 
+                        style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">
+                        ✅ Authorize Software
+                    </button>
+                    <div style="font-size: 11px; color: var(--text-secondary); margin-top: 5px;">
+                        This will whitelist the software and prevent future alerts.
+                    </div>
+                </div>
+            `;
+
+            modal.style.display = 'flex';
+        }
+
+        function closeDetectionDetails(event) {
+            const modal = document.getElementById('detection-details-modal');
+            modal.style.display = 'none';
+        }
+
+        function showEmptyState(message) {
+            const tbody = document.getElementById('shadow-detections-tbody');
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="7">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">⚠️</div>
+                            <div>${message}</div>
+                        </div>
+                    </td>
+                </tr>
+            `;
+        }
+
+
+
+        // Utility functions
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function truncateText(text, maxLength) {
+            if (!text || text.length <= maxLength) return text || '';
+            return text.substring(0, maxLength) + '...';
+        }
+
+        async function testDebug() {
+            const out = document.getElementById('debug-output');
+            out.innerText = "Running debug...";
+
+            try {
+                out.innerText = "Fetching teams...";
+                const resp = await fetch('/api/teams');
+                const text = await resp.text(); // Get raw text first
+                out.innerText = "Fetch status: " + resp.status + " Size: " + text.length;
+
+                const teams = JSON.parse(text);
+                out.innerText = "Parsed " + teams.length + " teams.";
+
+                const el = document.getElementById('shadow-team-filter-new');
+                if (!el) {
+                    out.innerText += " ERR: Element not found!";
+                    return;
+                }
+
+                el.innerHTML = `<option value="" disabled selected>Select Team (${teams.length})</option><option value="all">All Teams</option>`;
+                teams.forEach(team => {
+                    const option = document.createElement('option');
+                    option.value = team.id;
+                    option.textContent = team.name;
+                    el.appendChild(option);
+                });
+
+                out.innerText += " Success! Updated DOM.";
+
+            } catch (e) {
+                out.innerText = "Error: " + e.message;
+                console.error(e);
+            }
+        }
     </script>
 </body>
 

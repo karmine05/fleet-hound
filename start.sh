@@ -55,7 +55,7 @@ echo ""
 
 # Step 1: Start services
 print_info "Step 1: Starting Memgraph and Web Dashboard..."
-$DOCKER_COMPOSE up -d
+$DOCKER_COMPOSE up -d --build
 
 echo ""
 print_info "Waiting for services to be healthy..."

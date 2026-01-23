@@ -1,103 +1,97 @@
 # Fleet Hound 🩸🐶
+> **High-Performance Infrastructure Graph Analysis & Risk Quantization for Fleet.**
 
-**Fleet Hound** is a high-performance graph visualization and analysis tool for **FleetDM** (Fleet Device Management). It extracts inventory data (Hosts, Users, Software) from your Fleet instance and maps their relationships in a **Memgraph** graph database, allowing you to visualize and query your infrastructure's security posture.
+[![Security: Risk Management](https://img.shields.io/badge/Security-Risk%20Management-red?style=for-the-badge&logo=securityscorecard)](https://github.com/fleetdm/fleet)
+[![Platform: Fleet](https://img.shields.io/badge/Platform-Fleet-blue?style=for-the-badge&logo=fleet)](https://fleetdm.com)
+[![Graph: Memgraph](https://img.shields.io/badge/Graph-Memgraph-brightgreen?style=for-the-badge&logo=neo4j)](https://memgraph.com)
+
+---
+
+## 🛡️ Executive Summary
+
+**Fleet Hound** is a tier-one security asset designed for Vulnerability Management, Incident Response, and GRC teams. It transforms passive inventory data from **Fleet** into an interactive, multi-dimensional **Security Graph**, enabling teams to visualize hidden relationships, quantify attack vectors, and identify Shadow IT at scale.
+
+![Universal Security Graph](assets/graph_view.png)
+
+---
+
+## ⚡ Core Capabilities
+
+### ⚛️ Blast Radius & Impact Quantization
+*Quantify the "So What?" of a compromise.*
+- **Lateral Movement Modeling**: Mathematically identify potential pivot points from any compromised node.
+- **Dynamic Risk Radar**: Visualize impact across Host Reach, User Exposure, and Platform Diversity.
+- **Smart Exclusion Engine**: Tunable whitelisting to filter out system noise (e.g., service accounts).
 
 <p align="center">
-  <img src="PIC-1.png" alt="Fleet Hound Dashboard" width="800"/>
+  <img src="assets/blast_radius.png" width="48%" />
+  <img src="assets/blast_exclusion.png" width="48%" />
 </p>
 
-## 🚀 Features
+### 🕵️ Shadow IT & Anomaly Detection
+*Reveal the "Unknown Unknowns" in your desktop and server fleet.*
+- **Software Outlier Analysis**: Automatically flag applications installed on a statistically insignificant number of hosts.
+- **High-Risk Category Tagging**: Instant identification of unauthorized Remote Access, File Sharing, and Dev tools.
+- **Version Sprawl Detection**: Identify fragmentation risks where outdated versions persist despite patching policies.
 
-*   **Graph Visualization**: Visualize your Fleet infrastructure as a graph (Hosts, Users, Software).
-*   **Relationship Mapping**: Automatically links:
-    *   `(:User)-[:USES]->(:Host)`
-    *   `(:Software)-[:INSTALLED_ON]->(:Host)`
-*   **Differential Ingestion**: Optimized sync engine that supports both Full Scans and fast, state-aware Incremental Scans.
-*   **Parallel Processing**: High-performance multi-threaded extraction for massive datasets (10k+ nodes).
-*   **Team Filtering**: Granular control to sync specific Fleet Teams or the entire organization.
-*   **Web Dashboard**: Built-in interactive WebUI (`webviz`) to explore the `Fleet Security Graph`.
-*   **Dockerized**: Fully containerized stack for easy deployment.
+<p align="center">
+  <img src="assets/shadow_it.png" width="48%" alt="Shadow IT Detection List" />
+  <img src="assets/shadow_details.png" width="48%" alt="Detection Details Modal" />
+</p>
 
-## � Screenshots
+---
 
-| Graph Analysis | Host Details |
-|:---:|:---:|
-| <img src="PIC-2.png" width="400"/> | <img src="PIC-3.png" width="400"/> |
+## 🏗️ Technical Architecture
 
-| Software Mapping | User Relationships |
-|:---:|:---:|
-| <img src="PIC-4.png" width="400"/> | <img src="PIC-5.png" width="400"/> |
+Fleet Hound utilizes a high-performance ETL pipeline to bridge device management and graph theory.
 
-## �🛠️ Prerequisites
+```mermaid
+graph LR
+    Fleet["Fleet API"] -->|Extract| ETL["Python ETL Engine (Multithreaded)"]
+    ETL -->|State Check| Persistence[".state.json"]
+    ETL -->|LOAD| Memgraph[("Memgraph (In-Memory Graph)")]
+    Memgraph <-->|Query/Visual| WebUI["Flask Web Dashboard (D3.js)"]
+    
+    subgraph "Infrastructure Layer"
+    Memgraph
+    WebUI
+    end
+```
 
-*   **Docker** & **Docker Compose**
-*   **FleetDM Instance** (API Token required)
-*   **Python 3.9+** (if running locally without Docker)
+---
 
-## 📦 Quick Start
+## 📦 Rapid Deployment
 
-### 1. Configure
-Copy the example configuration:
+### 1. Environment Preparation
 ```bash
 cp .env.example .env
-```
-Edit `.env` and add your **Fleet URL** and **API Token**:
-```ini
-FLEET_URL=https://fleet.example.com
-FLEET_API_TOKEN=your_token_here
+# Configure FLEET_URL and FLEET_API_TOKEN
 ```
 
-### 2. Start Services
-Launch the Memgraph database and WebUI:
+### 2. Orchestration
 ```bash
 ./start.sh
 ```
-*   **Memgraph**: `bolt://localhost:7687`
-*   **Dashboard**: `http://localhost:8080`
+- **Web Dashboard**: `http://localhost:8080`
+- **Bolt Protocol**: `bolt://localhost:7687`
 
-### 3. Ingest Data
-Run the crawler to populate the graph:
+### 3. Data Synchronization
+| Mode | Command | Frequency |
+| :--- | :--- | :--- |
+| **Full Baseline** | `python3 main.py --full-scan` | Weekly / Initial |
+| **Delta Sync** | `python3 main.py` | Hourly / On-Demand |
+| **Targeted Sync** | `python3 main.py --teams 5` | Per Incident |
 
-**Full Scan (Initial Run):**
-```bash
-python3 main.py --full-scan
-```
+---
 
-**Differential Sync (Subsequent Runs):**
-```bash
-python3 main.py
-```
+## 🔐 Data Privacy & Sanitization
+*Fleet Hound is designed with privacy-first principles.*
+- **Local Sovereignty**: All graph data remains within your local Docker volumes.
+- **Sanitized Exports**: Built-in capabilities to obscure PII (Usernames/Hostnames) for reporting.
+- **Audit Logs**: All whitelisting/authorization actions are recorded in `audit.log`.
 
-**Sync Specific Teams:**
-```bash
-python3 main.py --teams 1,2
-```
+---
 
-### 4. Utility Scripts
-
-**Stop Services:**
-```bash
-./stop.sh
-```
-
-**Clear Database:**
-```bash
-python3 clear_db.py
-```
-
-## 🏗️ Architecture
-
-*   **Extractor**: Python-based ETL engine using `ThreadPoolExecutor` for parallel API fetching.
-*   **Database**: **Memgraph** (In-memory implementation of Bolt/Cypher).
-*   **Frontend**: Flask + D3.js (or similar) for the `webviz` dashboard.
-*   **Deployment**: Docker Compose.
-
-## 🛡️ Security
-
-*   Data is stored locally in the `memgraph-data` Docker volume.
-*   API Tokens are managed via `.env` (never committed).
-*   Supports `--insecure` flag for self-signed Fleet certs (Dev only).
-
-## 📄 License
-
-MIT License. See [LICENSE](LICENSE) for details.
+## 📄 Governance
+Licensed under the **MIT License**. Maintained for modern security operations.
+*Built for Security Engineers. Loved by Risk Professionals.*

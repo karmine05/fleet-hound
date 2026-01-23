@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Clear all data from Memgraph database."""
 
+import os
 from neo4j import GraphDatabase
 
 def clear_memgraph():
@@ -33,6 +34,16 @@ def clear_memgraph():
     
     driver.close()
     print("✅ Memgraph database cleared successfully!")
+
+    # Reset sync state
+    if os.path.exists(".state.json"):
+        try:
+            os.remove(".state.json")
+            print("✅ Sync state (.state.json) reset successfully!")
+        except OSError as e:
+            print(f"⚠️  Warning: Failed to delete .state.json: {e}")
+    else:
+        print("ℹ️  No sync state found to reset.")
 
 if __name__ == "__main__":
     clear_memgraph()

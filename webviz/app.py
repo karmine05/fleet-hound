@@ -1,8 +1,10 @@
 from flask import Flask, jsonify, send_from_directory, request
 from neo4j import GraphDatabase
-from neo4j.exceptions import TransientError
+from neo4j.exceptions import TransientError, ClientError
 import os
 import logging
+import json
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -13,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static')
 MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://memgraph:7687")
+
+# Configuration for persistence
+WHITELIST_FILE = '/app/config/whitelist.json'
+AUDIT_FILE = '/app/config/audit.log'
+
+def load_whitelist():
+    """Load authorized software list"""
+    if not os.path.exists(WHITELIST_FILE):
+        return []
+    try:
+        with open(WHITELIST_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading whitelist: {e}")
+        return []
+
+def save_whitelist(whitelist):
+    """Save authorized software list"""
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(WHITELIST_FILE), exist_ok=True)
+        with open(WHITELIST_FILE, 'w') as f:
+            json.dump(whitelist, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving whitelist: {e}")
+
+def audit_log(action, details):
+    """Log actions to audit file"""
+    try:
+        os.makedirs(os.path.dirname(AUDIT_FILE), exist_ok=True)
+        with open(AUDIT_FILE, 'a') as f:
+            timestamp = datetime.now().isoformat()
+            f.write(f"{timestamp} - {action} - {details}\n")
+    except Exception as e:
+        logger.error(f"Error writing audit log: {e}")
 
 # Test connection to Memgraph with retry logic
 driver = None
@@ -117,6 +154,40 @@ def search_all():
     node_type = request.args.get('type', 'all').strip().lower()
     platform_filter = request.args.get('platform', 'all').strip().lower()
     team_filter = request.args.get('team', 'all').strip()
+    
+    # Advanced search parameters
+    search_mode = request.args.get('mode', 'wildcard').strip().lower() # wildcard, exact, regex
+    case_sensitive = request.args.get('case', 'false').lower() == 'true'
+    
+    # Limit parameter
+    try:
+        limit_param = int(request.args.get('limit', 0))
+    except ValueError:
+        limit_param = 0
+    
+    # Default limits
+    cypher_limit = limit_param if limit_param > 0 else 100
+    display_limit = limit_param if limit_param > 0 else 10
+
+    # Helper function to generate search condition based on mode
+    def get_search_condition(property_name, term_param_name):
+        if search_mode == 'exact':
+            if case_sensitive:
+                return f"{property_name} = ${term_param_name}"
+            else:
+                return f"toLower({property_name}) = toLower(${term_param_name})"
+
+        else: # wildcard (default)
+            if case_sensitive:
+                return f"{property_name} CONTAINS ${term_param_name}"
+            else:
+                return f"toLower({property_name}) CONTAINS toLower(${term_param_name})"
+    
+    # Prepare exact match logging
+    if search_term:
+       logger.info(f"Search: '{search_term}' (mode: {search_mode}, case: {case_sensitive}, type: {node_type})") 
+    else:
+       logger.info(f"Search: ALL (type: {node_type}, limit: {limit_param})")
 
     with driver.session() as session:
         nodes = []
@@ -126,16 +197,21 @@ def search_all():
         if node_type in ['all', 'host']:
             if search_term:
                 # Search hosts by hostname or OS version
-                host_query = """
+                host_condition = get_search_condition('h.hostname', 'search_term')
+                os_condition = get_search_condition('h.os_version', 'search_term')
+                
+                host_query = f"""
                     MATCH (h:Host)
-                    WHERE toLower(h.hostname) CONTAINS toLower($search_term)
-                       OR toLower(h.os_version) CONTAINS toLower($search_term)
+                    WHERE ({host_condition} OR {os_condition})
                 """
                 if platform_filter != 'all':
                     host_query += " AND toLower(h.platform) CONTAINS toLower($platform)"
                 if team_filter != 'all':
                     host_query += " AND toString(h.team_id) = $team_id"
                 host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                # Apply limit to search results too if requested
+                if limit_param > 0:
+                    host_query += f" LIMIT {cypher_limit}"
 
                 params = {'search_term': search_term}
                 if platform_filter != 'all':
@@ -156,6 +232,9 @@ def search_all():
                     params['team_id'] = team_filter
 
                 host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                # Apply default limit if no term
+                host_query += f" LIMIT {cypher_limit}"
+                
                 host_result = session.run(host_query, **params)
 
             for record in host_result:
@@ -173,11 +252,14 @@ def search_all():
         if node_type in ['all', 'user']:
             if search_term:
                 # Search users by username, email, or fullname
-                user_query = """
+                # Search users by username, email, or fullname
+                username_cond = get_search_condition('u.username', 'search_term')
+                email_cond = get_search_condition('u.email', 'search_term')
+                fullname_cond = get_search_condition('u.fullname', 'search_term')
+                
+                user_query = f"""
                     MATCH (u:User)-[:USES]->(h:Host)
-                    WHERE (toLower(u.username) CONTAINS toLower($search_term)
-                       OR toLower(u.email) CONTAINS toLower($search_term)
-                       OR toLower(u.fullname) CONTAINS toLower($search_term))
+                    WHERE ({username_cond} OR {email_cond} OR {fullname_cond})
                 """
                 params = {'search_term': search_term}
 
@@ -189,6 +271,9 @@ def search_all():
                     params['team_id'] = team_filter
 
                 user_query += " RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname"
+                if limit_param > 0:
+                    user_query += f" LIMIT {cypher_limit}"
+
                 user_result = session.run(user_query, **params)
             else:
                 # No search term: return ALL users (with optional platform and team filters)
@@ -203,6 +288,8 @@ def search_all():
                     params['team_id'] = team_filter
 
                 user_query += " RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname"
+                user_query += f" LIMIT {cypher_limit}"
+
                 user_result = session.run(user_query, **params)
 
             for record in user_result:
@@ -220,9 +307,11 @@ def search_all():
         if node_type in ['all', 'software']:
             if search_term:
                 # Search software by name
-                software_query = """
+                software_cond = get_search_condition('s.name', 'search_term')
+                
+                software_query = f"""
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                    WHERE toLower(s.name) CONTAINS toLower($search_term)
+                    WHERE {software_cond}
                 """
                 params = {'search_term': search_term}
 
@@ -233,7 +322,13 @@ def search_all():
                     software_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
 
-                software_query += " RETURN DISTINCT s.name AS name, s.last_version AS last_version"
+                software_query += """
+                    WITH s, COUNT(DISTINCT h) as host_count
+                    RETURN s.name AS name, s.last_version AS last_version, host_count
+                """
+                if limit_param > 0:
+                    software_query += f" LIMIT {cypher_limit}"
+                
                 software_result = session.run(software_query, **params)
             else:
                 # No search term: return top 100 software by host count (with optional platform and team filters)
@@ -250,10 +345,10 @@ def search_all():
                     software_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
 
-                software_query += """
+                software_query += f"""
                     WITH s.name AS name, s.last_version AS last_version, COUNT(DISTINCT h) AS host_count
                     ORDER BY host_count DESC
-                    LIMIT 100
+                    LIMIT {cypher_limit}
                     RETURN name, last_version, host_count
                 """
                 software_result = session.run(software_query, **params)
@@ -265,7 +360,7 @@ def search_all():
                 software_id = f"software_{record['name']}"
                 if software_id not in node_ids:
                     # Only apply limit when there's no search term (the "ALL" case)
-                    if not search_term and software_count >= 10:
+                    if not search_term and software_count >= display_limit:
                         break
                     nodes.append({
                         "id": software_id,
@@ -654,6 +749,268 @@ def search_software():
             "search_term": search_term,
             "platform_filter": platform_filter,
             "software_count": len(software_list)
+        })
+
+@app.route("/api/blast-radius")
+def get_blast_radius():
+    """Calculate blast radius metrics for a given node type and ID.
+    
+    Query parameters:
+    - type: 'user' or 'software'
+    - id: The specific ID (username or software name)
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    node_type = request.args.get('type')
+    node_id = request.args.get('id')
+    team_filter = request.args.get('team', 'all')
+    ignore_defaults = request.args.get('ignore_defaults', 'false').lower() == 'true'
+    
+    if not node_type or not node_id:
+        return jsonify({"error": "Missing type or id parameter"}), 400
+
+    with driver.session() as session:
+        metrics = {
+            "host_reach": 0,
+            "user_impact": 0,
+            "lateral_movement": 0,
+            "platform_diversity": 0
+        }
+        
+        details = {
+            "hosts": [],
+            "users": [],
+            "teams": [],
+            "platforms": []
+        }
+        
+        # Prepare team filter clause
+        team_clause = ""
+        params = {"id": node_id}
+        
+        if team_filter != 'all':
+            team_clause = "AND toString(h.team_id) = $team_id"
+            params["team_id"] = team_filter
+
+        # Common logic for finding impacted users on compromised hosts
+        # This is where we apply the ignore_defaults filter
+        user_exclusion_clause = "AND u.username <> $id" if node_type == 'user' else ""
+        
+        # Handle exclusions (dynamic list from frontend preferred)
+        excluded_users_param = request.args.get('excluded_users', '')
+        
+        if excluded_users_param:
+            # Frontend provided specific list
+            excluded_users = [u.strip() for u in excluded_users_param.split(',') if u.strip()]
+            if excluded_users:
+                user_exclusion_clause += " AND NOT u.username IN $defaults"
+                params['defaults'] = excluded_users
+        elif ignore_defaults:
+            # Fallback for backward compatibility
+            default_accounts = ['root', 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount']
+            user_exclusion_clause += " AND NOT u.username IN $defaults"
+            params['defaults'] = default_accounts
+
+        if node_type == 'user':
+            # For a User, blast radius is:
+            # 1. Hosts they have access to
+            # 2. Other Users on those hosts (lateral movement potential)
+            
+            # Find hosts accessed by this user (filtered by team)
+            host_query = f"""
+                MATCH (u:User {{username: $id}})-[:USES]->(h:Host)
+                WHERE 1=1 {team_clause}
+                RETURN collect(DISTINCT h) as hosts
+            """
+            result = session.run(host_query, **params)
+            
+            hosts = result.single()['hosts']
+            metrics['host_reach'] = len(hosts)
+            details['hosts'] = [h['hostname'] for h in hosts]
+            details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
+            metrics['platform_diversity'] = len(details['platforms'])
+            
+            # Teams involved
+            teams = set()
+            for h in hosts:
+                if h.get('team_name'):
+                    teams.add(h['team_name'])
+            # We don't use 'Team Impact' metric anymore, but we keep details
+            # metrics['team_impact'] = len(teams) 
+            details['teams'] = list(teams)
+
+            # Potential impacted users (people who use the same machines)
+            if hosts:
+                host_names = [h['hostname'] for h in hosts]
+                # Note: We don't filter impacted users by team, we see ALL users on the affected hosts
+                # because if a host is compromised, all users on it are at risk regardless of their team.
+                # However, the HOSTS themselves were filtered by the team earlier.
+                
+                user_query = f"""
+                    MATCH (u:User)-[:USES]->(h:Host)
+                    WHERE h.hostname IN $hostnames {user_exclusion_clause}
+                    RETURN collect(DISTINCT u.username) as users
+                """
+                # Update params with hostnames for this query
+                query_params = {**params, "hostnames": host_names}
+                
+                user_res = session.run(user_query, **query_params)
+                impacted_users = user_res.single()['users']
+                metrics['user_impact'] = len(impacted_users)
+                details['users'] = impacted_users
+
+        elif node_type == 'software':
+            # For Software, blast radius is:
+            # 1. Hosts installed on
+            # 2. Users on those hosts
+            
+            # Find hosts with this software (filtered by team)
+            host_query = f"""
+                MATCH (s:Software {{name: $id}})-[:INSTALLED_ON]->(h:Host)
+                WHERE 1=1 {team_clause}
+                RETURN collect(DISTINCT h) as hosts
+            """
+            result = session.run(host_query, **params)
+            
+            hosts = result.single()['hosts']
+            metrics['host_reach'] = len(hosts)
+            details['hosts'] = [h['hostname'] for h in hosts]
+            details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
+            metrics['platform_diversity'] = len(details['platforms'])
+            
+            # Teams involved
+            teams = set()
+            for h in hosts:
+                if h.get('team_name'):
+                    teams.add(h['team_name'])
+            details['teams'] = list(teams)
+            
+            # Impacted users
+            if hosts:
+                host_names = [h['hostname'] for h in hosts]
+                
+                user_query = f"""
+                    MATCH (u:User)-[:USES]->(h:Host)
+                    WHERE h.hostname IN $hostnames {user_exclusion_clause}
+                    RETURN collect(DISTINCT u.username) as users
+                """
+                query_params = {**params, "hostnames": host_names}
+                
+                user_res = session.run(user_query, **query_params)
+                impacted_users = user_res.single()['users']
+                metrics['user_impact'] = len(impacted_users)
+                details['users'] = impacted_users
+        
+        # Calculate Lateral Movement Potential (Threat Hunting Metric)
+        # Definition: Count of UNIQUE hosts accessible by the 'impacted_users', EXCLUDING the originally affected hosts.
+        # This represents "Where can they go next?"
+        
+        lateral_hosts = []
+        metrics['lateral_movement'] = 0
+        
+        if details['users'] and len(details['users']) > 0:
+            # We have impacted users. Find where they can go.
+            # Avoid re-scanning original hosts.
+            original_host_names = details['hosts']
+            
+            lateral_res = session.run("""
+                MATCH (u:User)-[:USES]->(h:Host)
+                WHERE u.username IN $users 
+                  AND NOT h.hostname IN $original_hosts
+                RETURN collect(DISTINCT h.hostname) as lateral_hosts
+            """, users=details['users'], original_hosts=original_host_names)
+            
+            lateral_hosts = lateral_res.single()['lateral_hosts']
+            metrics['lateral_movement'] = len(lateral_hosts)
+            
+        # Add lateral hosts count to details for potential display (though we might not list them all if too many)
+        # details['lateral_hosts'] = lateral_hosts 
+
+        # Calculate normalized scores (0-100) for radar chart
+        # Key Change: Use GLOBAL totals for "Team Impact" and others to avoid skewing.
+        # If we select a team, the impact is 1 team. 1/TotalTeams is small, but accurate.
+        # This prevents "100% Team Impact" when filtering by a single team.
+
+        # Fetch Global Totals (ignoring filters)
+        global_totals = session.run("""
+            MATCH (h:Host)
+            WITH count(h) as total_hosts
+            MATCH (u:User)
+            WITH total_hosts, count(u) as total_users
+            MATCH (t:Team)
+            RETURN total_hosts, total_users, count(t) as total_teams
+        """).single()
+        
+        # When normalizing:
+        # - Host/User Reach: Normalize against the SCOPE (if I filter by team, 50% of THAT team impacted is high impact).
+        # - Team Impact: Normalize against GLOBAL (impacting 1 team out of 20 is "Low" organizational spread).
+        
+        # Let's refine based on user feedback "shouldn't skew the team to become max".
+        # This implies they want Team Impact to be relative to the Whole Org.
+        
+        global_total_teams = global_totals['total_teams'] if global_totals else 1
+        
+        # For Host/User, do we normalize against TEAM totals or GLOBAL totals?
+        # If I want to see "How bad is this for the team?", I should use Team Totals.
+        # If I want to see "How bad is this for the company?", I use Global.
+        # Given the "drill down" nature, Team Totals for hosts/users makes sense (saturation of the team).
+        # BUT Team Impact must be Global.
+        
+        # Calculate scoped totals (for Host/User normalization - saturation of the filtered scope)
+        if team_filter != 'all':
+            scoped_totals = session.run("""
+                MATCH (h:Host) WHERE toString(h.team_id) = $team_id
+                WITH count(h) as total_hosts
+                OPTIONAL MATCH (u:User)-[:USES]->(h:Host) WHERE toString(h.team_id) = $team_id
+                RETURN total_hosts, count(DISTINCT u) as total_users
+            """, team_id=team_filter).single()
+        else:
+            scoped_totals = global_totals # Same as global if no filter
+            
+        total_hosts = scoped_totals['total_hosts'] if scoped_totals else 1
+        total_users = scoped_totals['total_users'] if scoped_totals else 1
+        
+        # Prevent division by zero
+        total_hosts = max(total_hosts, 1)
+        total_users = max(total_users, 1)
+        
+        # Normalization for Lateral Movement:
+        # Relative to total hosts in the scope? Or Global?
+        # Lateral movement usually implies moving ANYWHERE in the org preferably.
+        # But if we are scoped to a team, maybe "Lateral movement within team"?
+        # If I filter by team, I want to see impact ON THAT TEAM.
+        # So lateral movement should probably be filtered by team if a filter is active?
+        # My lateral query didn't filter by team.
+        # Let's adjust lateral query to respect team filter if present?
+        # Actually, lateral movement often crosses team boundaries (that's the danger).
+        # So "Lateral Potential" should probably be GLOBAL (where can they go in the whole org?).
+        # Let's stick to Global potential for Lateral Move, normalized against GLOBAL total hosts.
+        
+        global_total_hosts = global_totals['total_hosts'] if global_totals else 1
+        global_total_hosts = max(global_total_hosts, 1)
+
+        scores = {
+            "Host Reach": min(int((metrics['host_reach'] / total_hosts) * 100), 100),
+            "User Impact": min(int((metrics['user_impact'] / total_users) * 100), 100),
+            # New Metric: Lateral Movement (Normalized against GLOBAL hosts usually, or maybe scoped?)
+            # Let's Use Global Hosts to show "Access to X% of the entire fleet"
+            "Lateral Movement": min(int((metrics['lateral_movement'] / global_total_hosts) * 100), 100),
+            "Platform Diversity": min(int((metrics['platform_diversity'] / 3) * 100), 100)
+        }
+        
+        return jsonify({
+            "metrics": metrics,
+            "scores": scores,
+            "details": details,
+            "scope": {
+                "team_filter": team_filter,
+                "totals": {
+                    "hosts": total_hosts,
+                    "users": total_users,
+                    "teams": global_total_teams
+                }
+            }
         })
 
 @app.route("/api/graph")
@@ -1065,6 +1422,400 @@ def health_check():
             "error": str(e)
         }), 503
 
+@app.route("/api/authorize-software", methods=['POST'])
+def authorize_software():
+    """Authorize a software (whitelist it)"""
+    try:
+        data = request.get_json()
+        software_name = data.get('software_name')
+        
+        if not software_name:
+            return jsonify({"error": "Software name required"}), 400
+            
+        whitelist = load_whitelist()
+        if software_name not in whitelist:
+            whitelist.append(software_name)
+            save_whitelist(whitelist)
+            audit_log("AUTHORIZE", f"Authorized software: {software_name}")
+            logger.info(f"Authorized software: {software_name}")
+            
+        return jsonify({"status": "success", "message": f"{software_name} authorized"}), 200
+    except Exception as e:
+        logger.error(f"Error authorizing software: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/shadow-it")
+def get_shadow_it():
+    """Detect Shadow IT - unauthorized or risky software installations.
+    
+    Query parameters:
+    - team: team filter ('all' or team_id)
+    - platform: platform filter ('all', 'windows', 'darwin', 'ubuntu')
+    - risk: risk level filter ('all', 'high', 'medium', 'low')
+    - detection_type: detection type filter ('all', 'outlier', 'high_risk', 'version_sprawl')
+    
+    Returns Shadow IT detections with risk scores and recommendations.
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+    
+    team_filter = request.args.get('team', 'all')
+    platform_filter = request.args.get('platform', 'all').lower()
+    risk_filter = request.args.get('risk', 'all').lower()
+    detection_type_filter = request.args.get('detection_type', 'all').lower()
+    host_count_filter = request.args.get('host_count', 'all')  # New filter
+    user_count_filter = request.args.get('user_count', 'all')  # New filter
+    software_type_filter = request.args.get('software_type', 'all')  # New filter
+    
+    # Software type detection patterns
+    def detect_software_type(software_name):
+        """Detect the type of software based on name patterns"""
+        name_lower = software_name.lower()
+        
+        # Browser Extensions
+        if any(x in name_lower for x in ['-extension', 'chrome extension', 'firefox addon', 'safari extension', 'edge extension']):
+            return 'Browser Extension'
+        
+        # VSCode Extensions  
+        if any(x in name_lower for x in ['vscode-', '.vscode', 'code-extension']):
+            return 'VSCode Extension'
+        
+        # Package Managers
+        if name_lower.startswith('npm:') or name_lower.startswith('@'):
+            return 'npm Package'
+        if name_lower.startswith('pip:') or name_lower.startswith('python-'):
+            return 'Python Package'
+        if name_lower.startswith('gem:'):
+            return 'Ruby Gem'
+        
+        # Operating System Components
+        if any(x in name_lower for x in ['microsoft', 'windows', 'macos', 'darwin', 'linux', 'ubuntu']):
+            return 'OS Component'
+        
+        # Development Tools
+        if any(x in name_lower for x in ['git', 'node', 'python', 'java', 'docker', 'kubernetes']):
+            return 'Developer Tool'
+        
+        # Default
+        return 'Application'
+    
+    # High-risk software patterns (case-insensitive)
+    HIGH_RISK_PATTERNS = {
+        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop'],
+        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent'],
+        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik'],
+        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack'],
+        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate'],
+        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn'],
+    }
+    
+    
+    with driver.session() as session:
+        detections = []
+        detection_id_counter = 1
+        
+        # Load whitelist
+        whitelist = load_whitelist()
+        
+        # Build team and platform filters
+        team_clause = ""
+        platform_clause = ""
+        whitelist_clause = ""
+        filter_params = {}
+        
+        if team_filter != 'all':
+            team_clause = "AND toString(h.team_id) = $team_id"
+            filter_params['team_id'] = team_filter
+        
+        if platform_filter != 'all':
+            platform_clause = "AND toLower(h.platform) CONTAINS toLower($platform)"
+            filter_params['platform'] = platform_filter
+            
+        if whitelist:
+            whitelist_clause = "AND NOT s.name IN $whitelist"
+            filter_params['whitelist'] = whitelist
+        
+        # ===== DETECTION 1: Outlier Software (installed on very few hosts) =====
+        if detection_type_filter in ['all', 'outlier']:
+            outlier_query = f"""
+                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
+                WITH s.name AS software_name, s.last_version AS version, 
+                COUNT(DISTINCT h) AS host_count,
+                COLLECT(DISTINCT h.hostname) AS hosts,
+                COLLECT(DISTINCT h.platform) AS platforms
+                WHERE host_count <= 2
+                RETURN software_name, version, host_count, hosts, platforms
+                ORDER BY host_count ASC, software_name ASC
+            """
+            
+            result = session.run(outlier_query, **filter_params)
+            for record in result:
+                # Get users on affected hosts
+                users_query = """
+                    MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
+                    RETURN COLLECT(DISTINCT u.username) AS users
+                """
+                users_result = session.run(users_query, software_name=record['software_name'])
+                users_record = users_result.single()
+                users = users_record['users'] if users_record else []
+                
+                # Risk level based on install count
+                risk_level = "high" if record['host_count'] == 1 else "medium"
+                
+                # Apply host count filter
+                if host_count_filter != 'all':
+                    if host_count_filter == '1' and record['host_count'] != 1:
+                        continue
+                    elif host_count_filter == '2' and record['host_count'] != 2:
+                        continue
+                    elif host_count_filter == '3+' and record['host_count'] < 3:
+                        continue
+                
+                # Apply user count filter
+                user_count = len(users)
+                if user_count_filter != 'all':
+                    if user_count_filter == '1' and user_count != 1:
+                        continue
+                    elif user_count_filter == '2' and user_count != 2:
+                        continue
+                    elif user_count_filter == '3+' and user_count < 3:
+                        continue
+                
+                # Detect software type
+                software_type = detect_software_type(record['software_name'])
+
+                # Apply software type filter
+                if software_type_filter != 'all' and software_type != software_type_filter:
+                    continue
+                
+                if risk_filter == 'all' or risk_filter == risk_level:
+                    detections.append({
+                        "id": f"outlier_{detection_id_counter}",
+                        "software_name": record['software_name'],
+                        "software_type": software_type,
+                        "risk_level": risk_level,
+                        "category": "Outlier Software",
+                        "detection_type": "outlier",
+                        "host_count": record['host_count'],
+                        "affected_hosts": record['hosts'],
+                        "affected_users": users,
+                        "platforms": record['platforms'],
+                        "version": record['version'] or "Unknown",
+                        "recommendation": f"Verify if this software is authorized. Found on only {record['host_count']} host(s). Consider removing if unauthorized.",
+                        "details": f"Installed on {record['host_count']} host(s) only - unusual for enterprise software",
+                        "risk_reason": f"Risk is {risk_level.upper()} because this software is installed on only {record['host_count']} host(s), specifying a rare anomaly.", 
+                    })
+                    detection_id_counter += 1
+        
+        # ===== DETECTION 2: High-Risk Category Software =====
+        if detection_type_filter in ['all', 'high_risk']:
+            # Get all software
+            all_software_query = f"""
+                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
+                WITH s.name AS software_name, s.last_version AS version,
+                COUNT(DISTINCT h) AS host_count,
+                COLLECT(DISTINCT h.hostname) AS hosts,
+                COLLECT(DISTINCT h.platform) AS platforms
+                RETURN software_name, version, host_count, hosts, platforms
+            """
+            
+            result = session.run(all_software_query, **filter_params)
+            
+            for record in result:
+                software_lower = record['software_name'].lower()
+                matched_category = None
+                
+                # Check against high-risk patterns
+                for category, patterns in HIGH_RISK_PATTERNS.items():
+                    for pattern in patterns:
+                        if pattern in software_lower:
+                            matched_category = category
+                            break
+                    if matched_category:
+                        break
+                
+                if matched_category:
+                    # Get users on affected hosts
+                    users_query = """
+                        MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
+                        RETURN COLLECT(DISTINCT u.username) AS users
+                    """
+                    users_result = session.run(users_query, software_name=record['software_name'])
+                    users_record = users_result.single()
+                    users = users_record['users'] if users_record else []
+                    
+                    # All high-risk category detections are high risk
+                    risk_level = "high"
+                    
+                    # Apply host count filter
+                    if host_count_filter != 'all':
+                        if host_count_filter == '1' and record['host_count'] != 1:
+                            continue
+                        elif host_count_filter == '2' and record['host_count'] != 2:
+                            continue
+                        elif host_count_filter == '3+' and record['host_count'] < 3:
+                            continue
+                    
+                    # Apply user count filter
+                    user_count = len(users)
+                    if user_count_filter != 'all':
+                        if user_count_filter == '1' and user_count != 1:
+                            continue
+                        elif user_count_filter == '2' and user_count != 2:
+                            continue
+                        elif user_count_filter == '3+' and user_count < 3:
+                            continue
+                    
+                    # Detect software type
+                    software_type = detect_software_type(record['software_name'])
+                    
+                    # Apply software type filter
+                    if software_type_filter != 'all' and software_type != software_type_filter:
+                        continue
+                    
+                    if risk_filter == 'all' or risk_filter == risk_level:
+                        # Category-specific recommendations
+                        recommendations = {
+                            'Remote Access Tools': "Verify authorization. Remote access tools can be used for data exfiltration. Replace with approved enterprise solution.",
+                            'File Sharing': "Verify authorization. File sharing apps may lead to data leakage. Use approved enterprise file sharing.",
+                            'Communication Apps': "Verify authorization. Unofficial communication apps may bypass DLP policies. Use approved enterprise messaging.",
+                            'Developer Tools': "Verify if host is authorized dev machine. Developer tools on production systems pose security risks.",
+                            'Cryptocurrency': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
+                            'Tor/Privacy Tools': "CRITICAL: Investigate immediately. Privacy/anonymity tools may indicate malicious activity or policy violation.",
+                        }
+                        
+                        detections.append({
+                            "id": f"highrisk_{detection_id_counter}",
+                            "software_name": record['software_name'],
+                            "software_type": software_type,
+                            "risk_level": risk_level,
+                            "category": matched_category,
+                            "detection_type": "high_risk",
+                            "host_count": record['host_count'],
+                            "affected_hosts": record['hosts'],
+                            "affected_users": users,
+                            "platforms": record['platforms'],
+                            "version": record['version'] or "Unknown",
+                            "recommendation": recommendations.get(matched_category, "Review and verify authorization"),
+                            "details": f"High-risk category: {matched_category}",
+                            "risk_reason": f"Risk is HIGH because '{record['software_name']}' matches the '{matched_category}' category, which is flagged for security review."
+                        })
+                        detection_id_counter += 1
+        
+        # ===== DETECTION 3: Version Sprawl (multiple versions of same software) =====
+        if detection_type_filter in ['all', 'version_sprawl']:
+            version_sprawl_query = f"""
+                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                WHERE s.last_version IS NOT NULL 
+                  AND s.last_version <> '' 
+                  {team_clause} {platform_clause} {whitelist_clause}
+                WITH s.name AS software_name, 
+                     COUNT(DISTINCT s.last_version) AS version_count,
+                     COLLECT(DISTINCT s.last_version) AS versions,
+                     COUNT(DISTINCT h) AS host_count,
+                     COLLECT(DISTINCT h.hostname) AS hosts
+                WHERE version_count > 2
+                RETURN software_name, version_count, versions, host_count, hosts
+                ORDER BY version_count DESC
+                LIMIT 20
+            """
+            
+            result = session.run(version_sprawl_query, **filter_params)
+            for record in result:
+                # Get users on affected hosts
+                users_query = """
+                    MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
+                    RETURN COLLECT(DISTINCT u.username) AS users
+                """
+                users_result = session.run(users_query, software_name=record['software_name'])
+                users_record = users_result.single()
+                users = users_record['users'] if users_record else []
+                
+                # Risk level based on version count
+                if record['version_count'] > 5:
+                    risk_level = "high"
+                elif record['version_count'] > 3:
+                    risk_level = "medium"
+                else:
+                    risk_level = "low"
+                
+                # Apply host count filter
+                if host_count_filter != 'all':
+                    if host_count_filter == '1' and record['host_count'] != 1:
+                        continue
+                    elif host_count_filter == '2' and record['host_count'] != 2:
+                        continue
+                    elif host_count_filter == '3+' and record['host_count'] < 3:
+                        continue
+                
+                # Apply user count filter
+                user_count = len(users)
+                if user_count_filter != 'all':
+                    if user_count_filter == '1' and user_count != 1:
+                        continue
+                    elif user_count_filter == '2' and user_count != 2:
+                        continue
+                    elif user_count_filter == '3+' and user_count < 3:
+                        continue
+                
+                # Detect software type
+                software_type = detect_software_type(record['software_name'])
+
+                # Apply software type filter
+                if software_type_filter != 'all' and software_type != software_type_filter:
+                    continue
+                
+                if risk_filter == 'all' or risk_filter == risk_level:
+                    detections.append({
+                        "id": f"sprawl_{detection_id_counter}",
+                        "software_name": record['software_name'],
+                        "software_type": software_type,
+                        "risk_level": risk_level,
+                        "category": "Version Management",
+                        "detection_type": "version_sprawl",
+                        "host_count": record['host_count'],
+                        "affected_hosts": record['hosts'],
+                        "affected_users": users,
+                        "platforms": [],
+                        "version": f"{record['version_count']} versions: {', '.join(record['versions'][:3])}{'...' if len(record['versions']) > 3 else ''}",
+                        "recommendation": f"Standardize software versions across fleet. Currently running {record['version_count']} different versions.",
+                        "details": f"Version sprawl detected - {record['version_count']} different versions installed",
+                        "risk_reason": f"Risk is {risk_level.upper()} because there are {record['version_count']} distinct versions installed, indicating poor patch management."
+                    })
+                    detection_id_counter += 1
+        
+        # ===== Calculate Summary Metrics =====
+        summary = {
+            "total_detections": len(detections),
+            "high_risk": len([d for d in detections if d['risk_level'] == 'high']),
+            "medium_risk": len([d for d in detections if d['risk_level'] == 'medium']),
+            "low_risk": len([d for d in detections if d['risk_level'] == 'low']),
+            "affected_hosts": len(set([host for d in detections for host in d['affected_hosts']])),
+            "affected_users": len(set([user for d in detections for user in d['affected_users']])),
+        }
+        
+        # Calculate category distribution
+        risk_distribution = {}
+        for detection in detections:
+            category = detection['category']
+            risk_distribution[category] = risk_distribution.get(category, 0) + 1
+        
+        logger.info(f"Shadow IT scan (team: {team_filter}, platform: {platform_filter}): {summary['total_detections']} detections")
+        
+        return jsonify({
+            "summary": summary,
+            "detections": detections,
+            "risk_distribution": risk_distribution,
+            "filters": {
+                "team": team_filter,
+                "platform": platform_filter,
+                "risk": risk_filter,
+                "detection_type": detection_type_filter
+            }
+        })
+
 @app.route("/api/relationships")
 def get_relationships():
     if not driver:
@@ -1082,12 +1833,28 @@ def get_relationships():
 @app.route("/")
 def index():
     """Serve the main web interface"""
-    return send_from_directory(app.static_folder, "index.html")
+    response = send_from_directory(app.static_folder, "index.html")
+    # Prevent caching to ensure fresh code is always loaded
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 @app.errorhandler(404)
 def not_found(error):
     """Handle 404 errors"""
     return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(ClientError)
+def handle_database_error(error):
+    """Handle database client errors (e.g. invalid regex)"""
+    logger.error(f"Database error: {error}")
+    # Return 400 Bad Request for client errors (like bad regex)
+    return jsonify({
+        "error": "Database error", 
+        "message": str(error),
+        "code": "BAD_REQUEST"
+    }), 400
 
 @app.errorhandler(500)
 def internal_error(error):
