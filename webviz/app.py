@@ -1,9 +1,11 @@
 from flask import Flask, jsonify, send_from_directory, request
 from neo4j import GraphDatabase
 from neo4j.exceptions import TransientError, ClientError
+import atexit
 import os
 import logging
 import json
+import tempfile
 from datetime import datetime
 
 # Configure logging
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__, static_folder='static')
 MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://memgraph:7687")
 
+# Only include raw backend error details in API responses if explicitly enabled.
+# This keeps safer defaults for "production-ready" usage while still allowing debugging.
+DEBUG_ERROR_DETAILS = os.environ.get("WEBVIZ_DEBUG_ERRORS", "false").lower() == "true"
+
 # Configuration for persistence
 WHITELIST_FILE = '/app/config/whitelist.json'
 AUDIT_FILE = '/app/config/audit.log'
@@ -25,8 +31,11 @@ def load_whitelist():
     if not os.path.exists(WHITELIST_FILE):
         return []
     try:
-        with open(WHITELIST_FILE, 'r') as f:
+        with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing whitelist JSON (corrupted file?): {e}")
+        return []
     except Exception as e:
         logger.error(f"Error loading whitelist: {e}")
         return []
@@ -36,8 +45,32 @@ def save_whitelist(whitelist):
     try:
         # Ensure directory exists
         os.makedirs(os.path.dirname(WHITELIST_FILE), exist_ok=True)
-        with open(WHITELIST_FILE, 'w') as f:
-            json.dump(whitelist, f, indent=2)
+        # Atomic write to avoid partial/corrupted JSON on crash.
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                delete=False,
+                dir=os.path.dirname(WHITELIST_FILE),
+                prefix=os.path.basename(WHITELIST_FILE) + '.',
+                suffix='.tmp',
+            ) as f:
+                tmp_path = f.name
+                json.dump(whitelist, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, WHITELIST_FILE)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
     except Exception as e:
         logger.error(f"Error saving whitelist: {e}")
 
@@ -45,11 +78,24 @@ def audit_log(action, details):
     """Log actions to audit file"""
     try:
         os.makedirs(os.path.dirname(AUDIT_FILE), exist_ok=True)
-        with open(AUDIT_FILE, 'a') as f:
+        # Keep one action per line (avoid newlines in user-controlled details).
+        safe_details = (details or "").replace("\n", "\\n").replace("\r", "\\r")
+        with open(AUDIT_FILE, 'a', encoding='utf-8') as f:
             timestamp = datetime.now().isoformat()
-            f.write(f"{timestamp} - {action} - {details}\n")
+            f.write(f"{timestamp} - {action} - {safe_details}\n")
     except Exception as e:
         logger.error(f"Error writing audit log: {e}")
+
+
+@atexit.register
+def _close_memgraph_driver():
+    """Best-effort cleanup for the global Neo4j/Memgraph driver."""
+    global driver
+    try:
+        if driver:
+            driver.close()
+    except Exception:
+        pass
 
 # Test connection to Memgraph with retry logic
 driver = None
@@ -155,9 +201,32 @@ def search_all():
     platform_filter = request.args.get('platform', 'all').strip().lower()
     team_filter = request.args.get('team', 'all').strip()
     
+
     # Advanced search parameters
-    search_mode = request.args.get('mode', 'wildcard').strip().lower() # wildcard, exact, regex
-    case_sensitive = request.args.get('case', 'false').lower() == 'true'
+    search_mode = request.args.get('mode', 'wildcard').strip().lower()  # wildcard, exact, regex
+    case_sensitive = request.args.get('case', 'false').strip().lower() == 'true'
+
+    # Validate key inputs (keep permissive where possible for backwards compatibility)
+    allowed_node_types = {'all', 'host', 'user', 'software'}
+    if node_type not in allowed_node_types:
+        return jsonify({
+            "error": "Invalid node type",
+            "message": f"type must be one of {sorted(allowed_node_types)}",
+        }), 400
+
+    allowed_search_modes = {'wildcard', 'exact', 'regex'}
+    if search_mode not in allowed_search_modes:
+        return jsonify({
+            "error": "Invalid search mode",
+            "message": f"mode must be one of {sorted(allowed_search_modes)}",
+        }), 400
+
+    # Basic input size guardrails (avoid pathological queries / regex)
+    if len(search_term) > 200:
+        return jsonify({
+            "error": "Search term too long",
+            "message": "q must be <= 200 characters",
+        }), 400
     
     # Limit parameter
     try:
@@ -169,25 +238,31 @@ def search_all():
     cypher_limit = limit_param if limit_param > 0 else 100
     display_limit = limit_param if limit_param > 0 else 10
 
+
     # Helper function to generate search condition based on mode
     def get_search_condition(property_name, term_param_name):
         if search_mode == 'exact':
             if case_sensitive:
                 return f"{property_name} = ${term_param_name}"
-            else:
-                return f"toLower({property_name}) = toLower(${term_param_name})"
+            return f"toLower({property_name}) = toLower(${term_param_name})"
 
-        else: # wildcard (default)
+        if search_mode == 'regex':
+            # Regex match using =~. For case-insensitive regex we match against a lowercased property.
             if case_sensitive:
-                return f"{property_name} CONTAINS ${term_param_name}"
-            else:
-                return f"toLower({property_name}) CONTAINS toLower(${term_param_name})"
+                return f"{property_name} =~ ${term_param_name}"
+            return f"toLower({property_name}) =~ ${term_param_name}_lower"
+
+        # wildcard (default): substring match
+        if case_sensitive:
+            return f"{property_name} CONTAINS ${term_param_name}"
+        return f"toLower({property_name}) CONTAINS toLower(${term_param_name})"
     
-    # Prepare exact match logging
+
+    # Prepare search logging
     if search_term:
-       logger.info(f"Search: '{search_term}' (mode: {search_mode}, case: {case_sensitive}, type: {node_type})") 
+        logger.info(f"Search: '{search_term}' (mode: {search_mode}, case: {case_sensitive}, type: {node_type})")
     else:
-       logger.info(f"Search: ALL (type: {node_type}, limit: {limit_param})")
+        logger.info(f"Search: ALL (type: {node_type}, limit: {limit_param})")
 
     with driver.session() as session:
         nodes = []
@@ -214,6 +289,8 @@ def search_all():
                     host_query += f" LIMIT {cypher_limit}"
 
                 params = {'search_term': search_term}
+                if search_mode == 'regex' and not case_sensitive:
+                    params['search_term_lower'] = search_term.lower()
                 if platform_filter != 'all':
                     params['platform'] = platform_filter
                 if team_filter != 'all':
@@ -262,6 +339,8 @@ def search_all():
                     WHERE ({username_cond} OR {email_cond} OR {fullname_cond})
                 """
                 params = {'search_term': search_term}
+                if search_mode == 'regex' and not case_sensitive:
+                    params['search_term_lower'] = search_term.lower()
 
                 if platform_filter != 'all':
                     user_query += " AND toLower(h.platform) CONTAINS toLower($platform)"
@@ -314,6 +393,8 @@ def search_all():
                     WHERE {software_cond}
                 """
                 params = {'search_term': search_term}
+                if search_mode == 'regex' and not case_sensitive:
+                    params['search_term_lower'] = search_term.lower()
 
                 if platform_filter != 'all':
                     software_query += " AND toLower(h.platform) CONTAINS toLower($platform)"
@@ -324,7 +405,7 @@ def search_all():
 
                 software_query += """
                     WITH s, COUNT(DISTINCT h) as host_count
-                    RETURN s.name AS name, s.last_version AS last_version, host_count
+                    RETURN s.name AS name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, host_count
                 """
                 if limit_param > 0:
                     software_query += f" LIMIT {cypher_limit}"
@@ -346,10 +427,10 @@ def search_all():
                     params['team_id'] = team_filter
 
                 software_query += f"""
-                    WITH s.name AS name, s.last_version AS last_version, COUNT(DISTINCT h) AS host_count
+                    WITH s.name AS name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, COUNT(DISTINCT h) AS host_count
                     ORDER BY host_count DESC
                     LIMIT {cypher_limit}
-                    RETURN name, last_version, host_count
+                    RETURN name, last_version, category, description, host_count
                 """
                 software_result = session.run(software_query, **params)
 
@@ -366,6 +447,8 @@ def search_all():
                         "id": software_id,
                         "name": record['name'],
                         "type": "software",
+                        "category": record.get('category'),
+                        "description": record.get('description'),
                         "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
                     })
                     node_ids.add(software_id)
@@ -770,6 +853,19 @@ def get_blast_radius():
     if not node_type or not node_id:
         return jsonify({"error": "Missing type or id parameter"}), 400
 
+    allowed_types = {'user', 'software'}
+    if node_type not in allowed_types:
+        return jsonify({
+            "error": "Invalid type",
+            "message": f"type must be one of {sorted(allowed_types)}",
+        }), 400
+
+    if len(node_id) > 300:
+        return jsonify({
+            "error": "Invalid id",
+            "message": "id must be <= 300 characters",
+        }), 400
+
     with driver.session() as session:
         metrics = {
             "host_reach": 0,
@@ -803,6 +899,11 @@ def get_blast_radius():
         if excluded_users_param:
             # Frontend provided specific list
             excluded_users = [u.strip() for u in excluded_users_param.split(',') if u.strip()]
+            if len(excluded_users) > 1000:
+                return jsonify({
+                    "error": "excluded_users too large",
+                    "message": "excluded_users must contain <= 1000 usernames",
+                }), 400
             if excluded_users:
                 user_exclusion_clause += " AND NOT u.username IN $defaults"
                 params['defaults'] = excluded_users
@@ -865,15 +966,18 @@ def get_blast_radius():
             # 1. Hosts installed on
             # 2. Users on those hosts
             
-            # Find hosts with this software (filtered by team)
+            # Find hosts for software (filtered by team)
             host_query = f"""
                 MATCH (s:Software {{name: $id}})-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause}
-                RETURN collect(DISTINCT h) as hosts
+                RETURN collect(DISTINCT h) as hosts, s.category as category, s.wikidata_description as description
             """
             result = session.run(host_query, **params)
+            record = result.single()
+            hosts = record['hosts']
+            metrics['category'] = record['category']
+            metrics['description'] = record['description']
             
-            hosts = result.single()['hosts']
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
             details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
@@ -1187,18 +1291,26 @@ def get_full_graph_data():
         error_msg = str(e)
         if "Memory limit exceeded" in error_msg:
             logger.error(f"Memory limit exceeded while loading full graph: {error_msg}")
-            return jsonify({
+            payload = {
                 "error": "Dataset too large for available memory",
                 "message": "The dataset is too large to load all at once. Try increasing Memgraph's memory limit in docker-compose.yml or use the filtered view instead.",
-                "details": error_msg
-            }), 507  # HTTP 507 Insufficient Storage
+            }
+            if DEBUG_ERROR_DETAILS:
+                payload["details"] = error_msg
+            return jsonify(payload), 507  # HTTP 507 Insufficient Storage
         else:
             logger.error(f"Transient error in get_full_graph_data: {error_msg}")
-            return jsonify({"error": "Database transient error", "details": error_msg}), 503
+            payload = {"error": "Database transient error"}
+            if DEBUG_ERROR_DETAILS:
+                payload["details"] = error_msg
+            return jsonify(payload), 503
 
     except Exception as e:
         logger.error(f"Unexpected error in get_full_graph_data: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        payload = {"error": "Internal server error"}
+        if DEBUG_ERROR_DETAILS:
+            payload["details"] = str(e)
+        return jsonify(payload), 500
 
 @app.route("/api/software/<software_name>/hosts")
 def get_software_hosts(software_name):
@@ -1416,21 +1528,32 @@ def health_check():
         }), 200
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return jsonify({
+        payload = {
             "status": "unhealthy",
             "database": "error",
-            "error": str(e)
-        }), 503
+        }
+        if DEBUG_ERROR_DETAILS:
+            payload["error"] = str(e)
+        return jsonify(payload), 503
 
 @app.route("/api/authorize-software", methods=['POST'])
 def authorize_software():
     """Authorize a software (whitelist it)"""
     try:
-        data = request.get_json()
-        software_name = data.get('software_name')
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON body"}), 400
+
+        software_name = (data.get('software_name') or '').strip()
         
         if not software_name:
             return jsonify({"error": "Software name required"}), 400
+
+        if len(software_name) > 500:
+            return jsonify({
+                "error": "Software name too long",
+                "message": "software_name must be <= 500 characters",
+            }), 400
             
         whitelist = load_whitelist()
         if software_name not in whitelist:
@@ -1441,8 +1564,11 @@ def authorize_software():
             
         return jsonify({"status": "success", "message": f"{software_name} authorized"}), 200
     except Exception as e:
-        logger.error(f"Error authorizing software: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error authorizing software: {e}", exc_info=True)
+        payload = {"error": "Internal server error"}
+        if DEBUG_ERROR_DETAILS:
+            payload["details"] = str(e)
+        return jsonify(payload), 500
 
 @app.route("/api/shadow-it")
 def get_shadow_it():
@@ -1501,16 +1627,26 @@ def get_shadow_it():
     
     # High-risk software patterns (case-insensitive)
     HIGH_RISK_PATTERNS = {
-        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop'],
-        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent'],
-        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik'],
-        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack'],
-        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate'],
-        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn'],
+        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop', 'remote desktop'],
+        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent', 'file sharing'],
+        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik', 'instant messaging', 'voip', 'videotelephony'],
+        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack', 'packet analyzer', 'penetration testing'],
+	        # NOTE: Avoid overly-generic patterns like "miner" because they produce false positives
+	        # for legitimate software (e.g., GNOME Tracker components like "tracker-miner-fs").
+	        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate', 'cryptocurrency', 'bitcoin'],
+        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn', 'anonymizing proxy', 'vpn'],
     }
     
     
     with driver.session() as session:
+        # Get total host count for percentage thresholds
+        total_hosts_res = session.run("MATCH (h:Host) RETURN count(h) AS count")
+        total_hosts_count = total_hosts_res.single()['count'] or 1
+        
+        # Thresholds
+        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.05)) # 5% threshold, min 2
+        MANAGED_THRESHOLD = int(total_hosts_count * 0.30) # 30% threshold for "common" software
+        
         detections = []
         detection_id_counter = 1
         
@@ -1540,14 +1676,17 @@ def get_shadow_it():
             outlier_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version, 
+                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
                 COUNT(DISTINCT h) AS host_count,
                 COLLECT(DISTINCT h.hostname) AS hosts,
                 COLLECT(DISTINCT h.platform) AS platforms
-                WHERE host_count <= 2
-                RETURN software_name, version, host_count, hosts, platforms
+                WHERE host_count <= $outlier_threshold
+                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
                 ORDER BY host_count ASC, software_name ASC
             """
+            
+            # Add outlier_threshold to filter_params
+            filter_params['outlier_threshold'] = OUTLIER_THRESHOLD
             
             result = session.run(outlier_query, **filter_params)
             for record in result:
@@ -1596,6 +1735,8 @@ def get_shadow_it():
                         "software_type": software_type,
                         "risk_level": risk_level,
                         "category": "Outlier Software",
+                        "db_category": record.get('db_category'),
+                        "wikidata_description": record.get('db_desc'),
                         "detection_type": "outlier",
                         "host_count": record['host_count'],
                         "affected_hosts": record['hosts'],
@@ -1604,7 +1745,7 @@ def get_shadow_it():
                         "version": record['version'] or "Unknown",
                         "recommendation": f"Verify if this software is authorized. Found on only {record['host_count']} host(s). Consider removing if unauthorized.",
                         "details": f"Installed on {record['host_count']} host(s) only - unusual for enterprise software",
-                        "risk_reason": f"Risk is {risk_level.upper()} because this software is installed on only {record['host_count']} host(s), specifying a rare anomaly.", 
+                        "risk_reason": f"Risk is {risk_level.upper()} because this software is installed on only {record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).",
                     })
                     detection_id_counter += 1
         
@@ -1614,11 +1755,11 @@ def get_shadow_it():
             all_software_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version,
+                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
                 COUNT(DISTINCT h) AS host_count,
                 COLLECT(DISTINCT h.hostname) AS hosts,
                 COLLECT(DISTINCT h.platform) AS platforms
-                RETURN software_name, version, host_count, hosts, platforms
+                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
             """
             
             result = session.run(all_software_query, **filter_params)
@@ -1627,16 +1768,33 @@ def get_shadow_it():
                 software_lower = record['software_name'].lower()
                 matched_category = None
                 
-                # Check against high-risk patterns
-                for category, patterns in HIGH_RISK_PATTERNS.items():
-                    for pattern in patterns:
-                        if pattern in software_lower:
+                # Check against dynamic categories first
+                db_categories = record.get('db_category') or []
+                for db_cat in db_categories:
+                    db_cat_lower = db_cat.lower()
+                    for category, patterns in HIGH_RISK_PATTERNS.items():
+                        # Check if any high-risk pattern matches the dynamic category
+                        if any(p in db_cat_lower for p in patterns) or category.lower() in db_cat_lower:
                             matched_category = category
                             break
                     if matched_category:
                         break
                 
+                # Fallback to name pattern matching if no dynamic category match
+                if not matched_category:
+                    for category, patterns in HIGH_RISK_PATTERNS.items():
+                        for pattern in patterns:
+                            if pattern in software_lower:
+                                matched_category = category
+                                break
+                        if matched_category:
+                            break
+                
                 if matched_category:
+                    # Skip flagged Developer Tools if they are widely deployed (>30%)
+                    if matched_category == 'Developer Tools' and record['host_count'] > MANAGED_THRESHOLD:
+                        continue
+                        
                     # Get users on affected hosts
                     users_query = """
                         MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)

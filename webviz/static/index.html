@@ -1216,8 +1216,8 @@
         let allGraphData = { nodes: [], links: [] };
         let simulation;
 
-        // Search mode state
-        let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
+	        // Search mode state
+	        let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
         let caseSensitive = false;
 
         // Toggle case sensitivity
@@ -1247,15 +1247,25 @@
         }
 
         // Helper function to test if a value matches the search term based on current mode
-        function matchesSearch(value, searchTerm) {
+	        function matchesSearch(value, searchTerm) {
             if (!value || !searchTerm) return !searchTerm;
 
-            const testValue = caseSensitive ? value : value.toLowerCase();
-            const testTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+	            // NOTE: Regex handling intentionally uses raw strings and flags.
+	            const testValue = caseSensitive ? value : value.toLowerCase();
+	            const testTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
 
             switch (searchMode) {
                 case 'exact':
                     return testValue === testTerm;
+
+	                case 'regex':
+	                    try {
+	                        const re = new RegExp(searchTerm, caseSensitive ? '' : 'i');
+	                        return re.test(value);
+	                    } catch (e) {
+	                        console.warn('Invalid regex search term:', e);
+	                        return false;
+	                    }
 
                 case 'wildcard':
                 default:
@@ -1285,31 +1295,7 @@
             document.documentElement.setAttribute('data-theme', savedTheme);
         }
 
-        // Load available platforms from backend
-        function loadPlatforms() {
-            fetch('/api/platforms')
-                .then(response => response.json())
-                .then(platforms => {
-                    const select = document.getElementById('platform-filter');
-                    platforms.forEach(platform => {
-                        const option = document.createElement('option');
-                        option.value = platform;
-                        // Capitalize first letter for display
-                        option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
-                        select.appendChild(option);
-                    });
-                })
-                .catch(err => console.error('Error loading platforms:', err));
-        }
-
-        // Initialize
-        document.addEventListener('DOMContentLoaded', () => {
-            loadThemePreference();
-            loadPlatforms();
-            loadExclusionSettings(); // Load custom exclusions
-            // Load teams (existing logic assumed elsewhere or could be added here similar to platforms)
-            // For now just platforms as requested.
-        });
+	        // (Initialization happens later in the file; keep a single DOMContentLoaded handler.)
 
         function loadGraph() {
             console.log('loadGraph() called');
@@ -1448,7 +1434,19 @@
 
             // Add tooltips
             node.append("title")
-                .text(d => `${d.name}\n${d.type}\n${d.details || ''}`);
+                .text(d => {
+                    let tooltip = `${d.name}\nType: ${d.type}`;
+                    if (d.type === 'software') {
+                        if (d.category && d.category.length > 0) {
+                            tooltip += `\nCategories: ${d.category.join(', ')}`;
+                        }
+                        if (d.description) {
+                            tooltip += `\nDescription: ${d.description}`;
+                        }
+                    }
+                    if (d.details) tooltip += `\nDetails: ${d.details}`;
+                    return tooltip;
+                });
 
             // Update positions on tick
             simulation.on("tick", () => {
@@ -2014,29 +2012,7 @@
             }
         }
 
-        // Load teams from backend and populate dropdown
-        function loadTeams() {
-            fetch('/api/teams')
-                .then(response => response.json())
-                .then(teams => {
-                    const teamFilter = document.getElementById('team-filter');
-                    // Clear existing options except "All Teams"
-                    teamFilter.innerHTML = '<option value="all">All Teams</option>';
-
-                    // Add team options
-                    teams.forEach(team => {
-                        const option = document.createElement('option');
-                        option.value = team.id;
-                        option.textContent = team.name;
-                        teamFilter.appendChild(option);
-                    });
-
-                    console.log(`Loaded ${teams.length} teams`);
-                })
-                .catch(error => {
-                    console.error('Error loading teams:', error);
-                });
-        }
+	        // (loadTeams is defined later in the file for all views.)
 
         // Export current graph data as JSON
         function exportAsJSON() {
@@ -2270,7 +2246,7 @@
 
                     updateBlastMetrics(data);
                     drawRadarChart(data.scores);
-                    updateBlastDetails(data.details);
+                    updateBlastDetails(data);
                     showStatus(`Blast radius calculated for ${id}`);
                 })
                 .catch(err => {
@@ -2320,15 +2296,22 @@
             }
         }
 
-        // Load teams for both views
-        // Load teams for all views (Graph, Blast Radius, Shadow IT)
+	        // Load teams for all views (Graph, Blast Radius, Shadow IT)
         function loadTeams() {
-            fetch('/api/teams')
-                .then(response => response.json())
+	            fetch('/api/teams')
+	                .then(response => {
+	                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	                    return response.json();
+	                })
                 .then(teams => {
                     const teamFilter = document.getElementById('team-filter'); // Graph view
                     const blastTeamFilter = document.getElementById('blast-team-filter'); // Blast view
                     const shadowTeamFilter = document.getElementById('shadow-team-filter-new'); // Shadow IT
+
+	                    if (!teamFilter) {
+	                        console.warn('team-filter element not found');
+	                        return;
+	                    }
 
                     // Clear existing (keep first 'All' option)
                     while (teamFilter.options.length > 1) teamFilter.remove(1);
@@ -2359,25 +2342,41 @@
                             shadowTeamFilter.appendChild(option.cloneNode(true));
                         }
                     });
-                })
-                .catch(error => console.error('Error loading teams:', error));
+	                })
+	                .catch(error => console.error('Error loading teams:', error));
         }
 
-        // Load platforms for filters
+	        // Load platforms for filters
         function loadPlatforms() {
             fetch('/api/platforms')
-                .then(response => response.json())
+	                .then(response => {
+	                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	                    return response.json();
+	                })
                 .then(platforms => {
-                    const shadowPlatformFilter = document.getElementById('shadow-platform-filter-new');
-                    if (shadowPlatformFilter) {
-                        shadowPlatformFilter.innerHTML = `<option value="all">All Platforms (${platforms.length})</option>`;
-                        platforms.forEach(platform => {
-                            const option = document.createElement('option');
-                            option.value = platform;
-                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
-                            shadowPlatformFilter.appendChild(option);
-                        });
-                    }
+	                    const graphPlatformFilter = document.getElementById('platform-filter');
+	                    const shadowPlatformFilter = document.getElementById('shadow-platform-filter-new');
+
+	                    if (graphPlatformFilter) {
+	                        // Clear existing (keep first 'All Platforms' option)
+	                        while (graphPlatformFilter.options.length > 1) graphPlatformFilter.remove(1);
+	                        platforms.forEach(platform => {
+	                            const option = document.createElement('option');
+	                            option.value = platform;
+	                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+	                            graphPlatformFilter.appendChild(option);
+	                        });
+	                    }
+
+	                    if (shadowPlatformFilter) {
+	                        shadowPlatformFilter.innerHTML = `<option value="all">All Platforms (${platforms.length})</option>`;
+	                        platforms.forEach(platform => {
+	                            const option = document.createElement('option');
+	                            option.value = platform;
+	                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+	                            shadowPlatformFilter.appendChild(option);
+	                        });
+	                    }
                 })
                 .catch(error => console.error('Error loading platforms:', error));
         }
@@ -2391,9 +2390,46 @@
             document.getElementById('metric-platform-diversity').textContent = data.metrics.platform_diversity;
         }
 
-        function updateBlastDetails(details) {
+        function updateBlastDetails(data) {
+            const details = data.details;
+            const metrics = data.metrics;
             const container = document.getElementById('blast-details-content');
             container.innerHTML = '';
+
+            // Add Entity Info section if categories or description exist
+            if (metrics.category || metrics.description) {
+                const infoSection = document.createElement('div');
+                infoSection.className = 'detail-section';
+                infoSection.innerHTML = `<h4>Entity Info</h4>`;
+
+                const infoContent = document.createElement('div');
+                infoContent.style.padding = '10px';
+                infoContent.style.background = 'rgba(255,255,255,0.05)';
+                infoContent.style.borderRadius = '4px';
+
+                if (metrics.category && metrics.category.length > 0) {
+                    infoContent.innerHTML += `
+                        <div style="margin-bottom: 8px;">
+                            <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Categories</div>
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;">
+                                ${metrics.category.map(cat => `<span style="background: rgba(0, 122, 204, 0.2); color: var(--accent-color); padding: 1px 6px; border-radius: 8px; font-size: 10px; border: 1px solid var(--accent-color);">${escapeHtml(cat)}</span>`).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                if (metrics.description) {
+                    infoContent.innerHTML += `
+                        <div>
+                            <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Wikidata Description</div>
+                            <div style="font-size: 11px; margin-top: 2px; color: var(--text-primary); line-height: 1.3;">${escapeHtml(metrics.description)}</div>
+                        </div>
+                    `;
+                }
+
+                infoSection.appendChild(infoContent);
+                container.appendChild(infoSection);
+            }
 
             // Helper to create list sections
             const addSection = (title, items) => {
@@ -2569,28 +2605,35 @@
                 .text(d => `${d.value}%`);
         }
 
-        // Add Enter key support for search
-        document.addEventListener('DOMContentLoaded', function () {
-            // Load theme preference first
-            loadThemePreference();
+	        // Add Enter key support for search
+	        document.addEventListener('DOMContentLoaded', function () {
+	            // Load theme preference first
+	            loadThemePreference();
+	            loadExclusionSettings(); // Load custom exclusions
 
-            document.getElementById('search-input').addEventListener('keypress', function (e) {
-                if (e.key === 'Enter') {
-                    searchNodes();
-                }
-            });
+	            const searchInput = document.getElementById('search-input');
+	            if (searchInput) {
+	                // keypress is deprecated; use keydown
+	                searchInput.addEventListener('keydown', function (e) {
+	                    if (e.key === 'Enter') {
+	                        searchNodes();
+	                    }
+	                });
+	            }
 
-            // Filter change handlers
-            document.getElementById('node-type-filter').addEventListener('change', searchNodes);
-            document.getElementById('platform-filter').addEventListener('change', searchNodes);
-            document.getElementById('team-filter').addEventListener('change', searchNodes);
+	            // Filter change handlers
+	            const nodeTypeFilter = document.getElementById('node-type-filter');
+	            const platformFilter = document.getElementById('platform-filter');
+	            const teamFilter = document.getElementById('team-filter');
+	            if (nodeTypeFilter) nodeTypeFilter.addEventListener('change', searchNodes);
+	            if (platformFilter) platformFilter.addEventListener('change', searchNodes);
+	            if (teamFilter) teamFilter.addEventListener('change', searchNodes);
 
-            // Load teams and initial data
-            // Load teams and initial data
-            loadTeams();
-            loadPlatforms();
-            loadGraph();
-        });
+	            // Load filters and initial data
+	            loadTeams();
+	            loadPlatforms();
+	            loadGraph();
+	        });
 
         // --- Shadow IT Functions ---
 
@@ -2810,9 +2853,27 @@
                 </div>
                 
                 <div class="detail-row">
-                    <div class="detail-label">Category</div>
+                    <div class="detail-label">Detection Category</div>
                     <div class="detail-value">${detection.category}</div>
                 </div>
+
+                ${detection.db_category && detection.db_category.length > 0 ? `
+                <div class="detail-row">
+                    <div class="detail-label">Wikidata Categories</div>
+                    <div class="detail-value" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px;">
+                        ${detection.db_category.map(cat => `<span style="background: rgba(0, 122, 204, 0.2); color: var(--accent-color); padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--accent-color);">${escapeHtml(cat)}</span>`).join('')}
+                    </div>
+                </div>
+                ` : ''}
+
+                ${detection.wikidata_description ? `
+                <div class="detail-row">
+                    <div class="detail-label">Wikidata Description</div>
+                    <div class="detail-value" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4;">
+                        ${escapeHtml(detection.wikidata_description)}
+                    </div>
+                </div>
+                ` : ''}
                 
                 <div class="detail-row">
                     <div class="detail-label">Detection Type</div>
@@ -2907,9 +2968,13 @@
             return text.substring(0, maxLength) + '...';
         }
 
-        async function testDebug() {
-            const out = document.getElementById('debug-output');
-            out.innerText = "Running debug...";
+	        async function testDebug() {
+	            const out = document.getElementById('debug-output');
+	            if (!out) {
+	                console.warn('debug-output element not found');
+	                return;
+	            }
+	            out.innerText = "Running debug...";
 
             try {
                 out.innerText = "Fetching teams...";

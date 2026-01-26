@@ -6,12 +6,14 @@ class FleetGraphExtractor:
     def extract_all_users(self):
         """Fetch all users from Fleet's /api/v1/fleet/users endpoint."""
         users = []
+        per_page = 500
         page = 0
         while True:
             resp = self._get(
                 "/api/v1/fleet/users",
                 params={
                     'page': page,
+                    'per_page': per_page,
                 }
             )
             if not resp or resp.status_code != 200:
@@ -24,7 +26,7 @@ class FleetGraphExtractor:
                 break
             page_users = data.get('users', [])
             users.extend(page_users)
-            if len(page_users) < 500:  # Updated threshold
+            if len(page_users) < per_page:
                 break
             page += 1
             # Reduced sleep time - only needed between pages
@@ -57,28 +59,56 @@ class FleetGraphExtractor:
             page += 1
         return teams
 
-    def __init__(self, fleet_url, api_token, verify: bool = True, timeout: int = 20, debug: bool = False):
+    def __init__(self, fleet_url, api_token, verify: bool = True, timeout: int = 20, debug: bool = False, session=None):
         self.fleet_url = fleet_url.rstrip('/')
-        self.headers = {'Authorization': f'Bearer {api_token}'}
+        self.headers = {'Authorization': f'Bearer {api_token}', 'Accept': 'application/json'}
         self.verify = verify
         self.timeout = timeout
         self.debug = debug
+        self.session = session or requests.Session()
 
-    def _get(self, path: str, **kwargs):
+    def _get(self, path: str, retries: int = 3, **kwargs):
         url = f"{self.fleet_url}{path}"
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=self.timeout, verify=self.verify, **kwargs)
-            if self.debug:
-                print(f"[extractor] GET {path} status={resp.status_code}")
-            return resp
-        except requests.exceptions.SSLError as e:
-            if self.debug:
-                print(f"[extractor] SSL error on {path}: {e}")
-            return None
-        except requests.exceptions.RequestException as e:
-            if self.debug:
-                print(f"[extractor] Request error on {path}: {e}")
-            return None
+        last_resp = None
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(
+                    url,
+                    headers=self.headers,
+                    timeout=self.timeout,
+                    verify=self.verify,
+                    **kwargs,
+                )
+                last_resp = resp
+
+                # Simple retry policy for transient/ratelimit errors.
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                    retry_after = resp.headers.get('Retry-After')
+                    backoff = 0.5 * (2 ** attempt)
+                    if resp.status_code == 429 and retry_after and retry_after.isdigit():
+                        backoff = max(backoff, int(retry_after))
+                    if self.debug:
+                        print(f"[extractor] GET {path} status={resp.status_code} retrying in {backoff:.1f}s")
+                    time.sleep(backoff)
+                    continue
+
+                if self.debug:
+                    print(f"[extractor] GET {path} status={resp.status_code}")
+                return resp
+            except requests.exceptions.SSLError as e:
+                if self.debug:
+                    print(f"[extractor] SSL error on {path}: {e}")
+                return None
+            except requests.exceptions.RequestException as e:
+                if self.debug:
+                    print(f"[extractor] Request error on {path}: {e}")
+                if attempt < retries - 1:
+                    backoff = 0.5 * (2 ** attempt)
+                    time.sleep(backoff)
+                    continue
+                return None
+
+        return last_resp
 
     def extract_host_data(self, team_ids: list = None, since: str = None, since_map: dict = None):
         """
@@ -131,7 +161,7 @@ class FleetGraphExtractor:
             first_page_params['page'] = 0
             
             if self.debug:
-                 print(f"[extractor] Fetching first page for metadata...")
+                print(f"[extractor] Fetching first page for metadata...")
 
             resp = self._get("/api/v1/fleet/hosts", params=first_page_params)
             if not resp or resp.status_code != 200:

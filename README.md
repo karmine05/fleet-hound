@@ -31,6 +31,7 @@
 ### 🕵️ Shadow IT & Anomaly Detection
 *Reveal the "Unknown Unknowns" in your desktop and server fleet.*
 - **Software Outlier Analysis**: Automatically flag applications installed on a statistically insignificant number of hosts.
+- **Dynamic Enrichment**: Automatically fetch software categories and descriptions from **Wikidata** to reveal hidden risks (e.g., Identifying "VoIP" or "Remote Access" categories dynamically).
 - **High-Risk Category Tagging**: Instant identification of unauthorized Remote Access, File Sharing, and Dev tools.
 - **Version Sprawl Detection**: Identify fragmentation risks where outdated versions persist despite patching policies.
 
@@ -80,7 +81,23 @@ cp .env.example .env
 | :--- | :--- | :--- |
 | **Full Baseline** | `python3 main.py --full-scan` | Weekly / Initial |
 | **Delta Sync** | `python3 main.py` | Hourly / On-Demand |
+| **Complete Enrichment** | `python3 main.py --complete-enrichment` | For 100% Coverage ** NOT RECOMMENDED **| 
 | **Targeted Sync** | `python3 main.py --teams 5` | Per Incident |
+ 
+---
+ 
+## 🔍 Software Enrichment Tools
+
+The categorization engine enriches your data with metadata from Wikidata.
+
+| Feature | Command |
+| :--- | :--- |
+| **Automatic** | Enabled by default during `main.py` (targets top 250 outliers). |
+| **Specific Apps** | `python3 main.py --enrich-software "Zoom,Docker"` |
+| **Full Database** | `python3 main.py --complete-enrichment` |
+| **Standalone CLI** | `python3 categorize_software.py --limit 1000 --names "App1,App2"` |
+
+*Includes a visual progress bar and automatic transaction retry logic for large datasets.*
 
 ---
 

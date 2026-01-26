@@ -1,11 +1,19 @@
-import requests
 from typing import Optional, Tuple
 
+import requests
+
 class FleetAuthenticator:
-    def __init__(self, fleet_url: str, verify: bool = True, timeout: int = 15):
+    def __init__(
+        self,
+        fleet_url: str,
+        verify: bool = True,
+        timeout: int = 15,
+        session: Optional[requests.Session] = None,
+    ):
         self.fleet_url = fleet_url.rstrip('/')
         self.verify = verify
         self.timeout = timeout
+        self._session = session or requests.Session()
 
     def login(self, email: str, password: str, debug: bool = False) -> Optional[str]:
         """Attempt login and return API token or None.
@@ -15,7 +23,7 @@ class FleetAuthenticator:
         """
         url = f"{self.fleet_url}/api/v1/fleet/login"
         try:
-            response = requests.post(
+            response = self._session.post(
                 url,
                 json={"email": email, "password": password},
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
@@ -36,7 +44,12 @@ class FleetAuthenticator:
             print(f"[auth] Status={response.status_code} Body[0:300]='{snippet}'")
 
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                if debug:
+                    print("[auth] Login response was not valid JSON")
+                return None
             # Common token locations
             token = data.get("token") or data.get("access_token") or data.get("api_token")
             if not token and debug:
@@ -48,7 +61,12 @@ class FleetAuthenticator:
         """Return (status_code, truncated_body) for diagnostics without parsing token."""
         url = f"{self.fleet_url}/api/v1/fleet/login"
         try:
-            r = requests.post(url, json={"email": email, "password": password}, verify=self.verify, timeout=self.timeout)
+            r = self._session.post(
+                url,
+                json={"email": email, "password": password},
+                verify=self.verify,
+                timeout=self.timeout,
+            )
             return r.status_code, r.text[:500]
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             return 0, f"error: {e}"

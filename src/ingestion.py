@@ -8,6 +8,17 @@ class MemgraphIngestion:
         self.batch_size = 5000  # Optimized batch size
         self.max_retries = 3
 
+    def close(self):
+        """Close the underlying database driver."""
+        self.driver.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def create_constraints(self):
         """Create unique constraints on graph nodes."""
         with self.driver.session() as session:

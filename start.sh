@@ -1,7 +1,9 @@
+#!/usr/bin/env bash
+
 # Fleet Hound Quick Start Script
 # This script automates the entire setup process
 
-set -e
+set -euo pipefail
 
 echo "🩸 Fleet Hound Security Analysis Platform"
 echo "=============================================="
@@ -38,16 +40,16 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # Check if Docker Compose is installed
-if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null 2>&1; then
     print_error "Docker Compose is not installed. Please install Docker Compose first."
     exit 1
 fi
 
 # Determine docker compose command
 if docker compose version &> /dev/null 2>&1; then
-    DOCKER_COMPOSE="docker compose"
+    DOCKER_COMPOSE=(docker compose)
 else
-    DOCKER_COMPOSE="docker-compose"
+    DOCKER_COMPOSE=(docker-compose)
 fi
 
 print_success "Docker and Docker Compose are installed"
@@ -55,7 +57,7 @@ echo ""
 
 # Step 1: Start services
 print_info "Step 1: Starting Memgraph and Web Dashboard..."
-$DOCKER_COMPOSE up -d --build
+"${DOCKER_COMPOSE[@]}" up -d --build
 
 echo ""
 print_info "Waiting for services to be healthy..."
@@ -65,7 +67,7 @@ sleep 5
 MAX_RETRIES=30
 RETRY_COUNT=0
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole --host 127.0.0.1 --port 7687 &> /dev/null; then
+    if echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false &> /dev/null; then
         print_success "Memgraph is ready!"
         break
     fi
@@ -115,14 +117,14 @@ echo "🗄️  Memgraph Lab:     http://localhost:3000"
 echo "🔌 Bolt Protocol:    bolt://localhost:7687"
 echo ""
 echo "Useful commands:"
-echo "  View logs:         $DOCKER_COMPOSE logs -f"
-echo "  Stop services:     $DOCKER_COMPOSE down"
-echo "  Restart services:  $DOCKER_COMPOSE restart"
-echo "  Clear database:    python3 clear_db.py"
+echo "  View logs:         ${DOCKER_COMPOSE[*]} logs -f"
+echo "  Stop services:     ${DOCKER_COMPOSE[*]} down"
+echo "  Restart services:  ${DOCKER_COMPOSE[*]} restart"
+echo "  Clear database:    python3 clear_db.py --yes"
 echo ""
 print_info "Press Ctrl+C to stop following logs, or close this terminal."
 echo ""
 
 # Follow logs
-$DOCKER_COMPOSE logs -f
+"${DOCKER_COMPOSE[@]}" logs -f
 

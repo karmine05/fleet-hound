@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ import urllib3
 from src.auth import FleetAuthenticator
 from src.extractor import FleetGraphExtractor
 from src.ingestion import MemgraphIngestion
+from categorize_software import run_categorization
 import json
 import datetime
 
@@ -60,17 +62,42 @@ def load_state() -> dict:
         try:
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except json.JSONDecodeError as e:
+            print(f"⚠️  WARNING: Ignoring invalid JSON in {STATE_FILE}: {e}")
+        except OSError as e:
+            print(f"⚠️  WARNING: Failed to read {STATE_FILE}: {e}")
     return {}
 
 
 def save_state(state: dict):
     """Save the state file."""
+    tmp_path = None
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+        state_path = Path(STATE_FILE)
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            delete=False,
+            dir=str(state_path.parent),
+            prefix=state_path.name + '.',
+            suffix='.tmp',
+        ) as tf:
+            tmp_path = tf.name
+            json.dump(state, tf, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            # Best-effort on platforms that don't support chmod semantics.
+            pass
+        os.replace(tmp_path, STATE_FILE)
     except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
         print(f"⚠️  WARNING: Failed to save state file: {e}")
 
 
@@ -113,6 +140,8 @@ Examples:
     parser.add_argument('--dump-host-sample', action='store_true', help='Write first host object to hosts_sample.json then exit')
     parser.add_argument('--teams', help='Comma-separated list of Team IDs to fetch (e.g., 1,2). Default: All teams.')
     parser.add_argument('--full-scan', action='store_true', help='Ignore last run time and fetch ALL data.')
+    parser.add_argument('--complete-enrichment', action='store_true', help='Enrich ALL software in database with Wikidata (warning: may take long)')
+    parser.add_argument('--enrich-software', help='Comma-separated list of specific software names to enrich immediately')
 
     args = parser.parse_args()
 
@@ -218,8 +247,6 @@ Examples:
         else:
             print("ℹ️  No teams found (or insufficient permissions). Fetching ALL data.")
 
-            print("ℹ️  No teams found (or insufficient permissions). Fetching ALL data.")
-
     hosts = extractor.extract_host_data(team_ids=team_ids, since=global_since, since_map=since_map)
     
     # If using teams, we might want to only get users relevant to those hosts, 
@@ -239,11 +266,21 @@ Examples:
 
     # Ingest
     print(f"💾 Ingesting data into Memgraph: {memgraph_uri}")
-    ingestion = MemgraphIngestion(memgraph_uri)
-    ingestion.create_constraints()
-    ingestion.create_graph_relationships(hosts, extractor, global_users=global_users)
-    print("✅ Data ingested into Memgraph.")
-    ingestion.print_stats()
+    with MemgraphIngestion(memgraph_uri) as ingestion:
+        ingestion.create_constraints()
+        ingestion.create_graph_relationships(hosts, extractor, global_users=global_users)
+        print("✅ Data ingested into Memgraph.")
+        ingestion.print_stats()
+
+    print("\n🔍 Starting automatic software categorization (targeting Shadow IT outliers)...")
+    try:
+        # Prioritize rare software (outliers) to enrich Shadow IT detections
+        # If --enrich-software is provided, we prioritize those.
+        target_names = [n.strip() for n in args.enrich_software.split(',')] if args.enrich_software else None
+        limit = None if args.complete_enrichment else 250
+        run_categorization(memgraph_uri=memgraph_uri, limit=limit, target_names=target_names)
+    except Exception as e:
+        print(f"⚠️  WARNING: Software categorization failed: {e}")
 
     print("\n🎉 Fleet Hound extraction complete!")
     
