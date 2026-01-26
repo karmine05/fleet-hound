@@ -77,4 +77,3 @@ docs/_build/
 benchmark_ingestion.py
 test_wikidata.py
 config/whitelist.json
-config/whitelist.json
