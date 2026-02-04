@@ -1,1210 +1,767 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" class="dark">
 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fleet Security Graph</title>
+    <title>FLEET // SECURITY_GRAPH</title>
+
+    <!-- Dependencies -->
     <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@300;400;500;600;700&family=VT323&display=swap"
+        rel="stylesheet">
+
+    <!-- Tailwind Config -->
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        cyber: {
+                            black: '#050505',
+                            dark: '#0a0a0a',
+                            panel: '#111111',
+                            cyan: '#00f3ff',
+                            pink: '#ff0055',
+                            green: '#39ff14',
+                            yellow: '#ffee00',
+                            dim: '#666666',
+                            border: '#333333'
+                        }
+                    },
+                    fontFamily: {
+                        orbitron: ['Orbitron', 'sans-serif'],
+                        rajdhani: ['Rajdhani', 'sans-serif'],
+                        mono: ['VT323', 'monospace'],
+                    },
+                    backgroundImage: {
+                        'grid-pattern': "linear-gradient(to right, #1a1a1a 1px, transparent 1px), linear-gradient(to bottom, #1a1a1a 1px, transparent 1px)"
+                    }
+                }
+            }
+        }
+    </script>
+
     <style>
+        /* --- CUSTOM CYBERPUNK EFFECTS --- */
         :root {
-            --bg-primary: #0f0f0f;
-            --bg-secondary: #1a1a1a;
-            --bg-tertiary: #2d2d2d;
+            --bg-primary: #050505;
+            --bg-secondary: #0a0a0a;
+            --bg-tertiary: #111111;
             --text-primary: #ffffff;
-            --text-secondary: #cccccc;
-            --border-color: #555555;
-            --accent-color: #007acc;
-            --accent-hover: #005999;
-            --gradient-start: #1a1a1a;
-            --gradient-end: #0f0f0f;
-            --status-bg: rgba(0, 0, 0, 0.8);
-            --input-bg: #2d2d2d;
-        }
-
-        [data-theme="light"] {
-            --bg-primary: #f5f5f5;
-            --bg-secondary: #ffffff;
-            --bg-tertiary: #e8e8e8;
-            --text-primary: #1a1a1a;
-            --text-secondary: #4a4a4a;
-            --border-color: #cccccc;
-            --accent-color: #0078d4;
-            --accent-hover: #106ebe;
-            --gradient-start: #ffffff;
-            --gradient-end: #f0f0f0;
-            --status-bg: rgba(255, 255, 255, 0.95);
-            --input-bg: #ffffff;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+            --text-secondary: #aaaaaa;
+            --accent-color: #00f3ff;
+            --accent-hover: #00c3cc;
+            --border-color: #444444;
+            --status-bg: rgba(0, 0, 0, 0.95);
+            --input-bg: #111111;
         }
 
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            overflow: hidden;
-            transition: background 0.3s ease, color 0.3s ease;
+            background-color: #050505;
+            background-image:
+                linear-gradient(rgba(0, 243, 255, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 243, 255, 0.05) 1px, transparent 1px);
+            background-size: 30px 30px;
         }
 
-        .header {
-            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
-            padding: 15px 30px;
-            border-bottom: 2px solid var(--accent-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-            transition: all 0.3s ease;
-        }
-
-        .title {
-            font-size: 24px;
-            font-weight: bold;
-            color: var(--accent-color);
-        }
-
-        .controls {
-            display: flex;
-            gap: 15px;
-            align-items: center;
-        }
-
-        button {
-            background: var(--accent-color);
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: all 0.3s ease;
-        }
-
-        button:hover {
-            background: var(--accent-hover);
-            transform: translateY(-2px);
-        }
-
-        .theme-toggle {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border: 1px solid var(--border-color);
-            padding: 10px 15px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 18px;
-            transition: all 0.3s ease;
-        }
-
-        .theme-toggle:hover {
-            background: var(--accent-color);
-            color: white;
-            transform: translateY(-2px);
-        }
-
-        input,
-        select {
-            padding: 8px;
-            border-radius: 4px;
-            border: 1px solid var(--border-color);
-            background: var(--input-bg);
-            color: var(--text-primary);
-            font-size: 14px;
-            transition: all 0.3s ease;
-        }
-
-        input:focus,
-        select:focus {
-            outline: 2px solid var(--accent-color);
-            outline-offset: 2px;
-        }
-
-        #graph {
-            width: 100vw;
-            width: 100vw;
-            height: 100%;
-            /* background moved to #graph-view */
-            transition: background 0.3s ease;
-        }
-
-        .node text {
-            font-family: 'Segoe UI', sans-serif;
-            font-size: 10px;
-            font-weight: bold;
-            pointer-events: none;
-            fill: var(--text-primary);
-        }
-
-        [data-theme="light"] .node text {
-            fill: #1a1a1a;
-        }
-
-        .status {
-            position: absolute;
-            top: 100px;
-            left: 30px;
-            background: var(--status-bg);
-            padding: 10px 15px;
-            border-radius: 5px;
-            border-left: 4px solid var(--accent-color);
-            font-size: 14px;
-            color: var(--text-primary);
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-            transition: all 0.3s ease;
-        }
-
-        .node.highlight-node circle {
-            stroke: #ffd700 !important;
-            stroke-width: 4px !important;
-        }
-
-        .link.highlight-link {
-            stroke: #ffd700 !important;
-            stroke-width: 4px !important;
-            stroke-opacity: 1 !important;
-        }
-
-        .node circle {
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .node circle:hover {
-            stroke-width: 4px;
-            filter: brightness(1.2);
-        }
-
-        [data-theme="light"] .link {
-            stroke-opacity: 0.4 !important;
-        }
-
-        [data-theme="light"] .node circle {
-            stroke: #333 !important;
-        }
-
-        /* Advanced Search Styles */
-        .search-container {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            background: var(--input-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 2px 4px;
-        }
-
-        .search-container input {
-            border: none;
-            background: transparent;
-            padding: 6px 8px;
-            min-width: 150px;
-        }
-
-        .search-container input:focus {
-            outline: none;
-        }
-
-        .search-container:focus-within {
-            outline: 2px solid var(--accent-color);
-            outline-offset: 1px;
-        }
-
-        .search-toggles {
-            display: flex;
-            gap: 2px;
-            border-left: 1px solid var(--border-color);
-            padding-left: 4px;
-            margin-left: 4px;
-        }
-
-        .search-toggle {
-            background: transparent;
-            border: 1px solid transparent;
-            color: var(--text-secondary);
-            padding: 4px 6px;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-            font-family: 'Consolas', 'Monaco', monospace;
-            transition: all 0.2s ease;
-            min-width: 24px;
-            text-align: center;
-        }
-
-        .search-toggle:hover {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            transform: none;
-        }
-
-        .search-toggle.active {
-            background: var(--accent-color);
-            color: white;
-            border-color: var(--accent-color);
-        }
-
-        .search-toggle[title]:hover::after {
-            content: attr(title);
-        }
-
-        .search-mode-group {
-            display: flex;
-            gap: 1px;
-            background: var(--border-color);
-            border-radius: 3px;
-            overflow: hidden;
-        }
-
-        .search-mode-group .search-toggle {
-            border-radius: 0;
-            border: none;
-        }
-
-        .search-mode-group .search-toggle:first-child {
-            border-radius: 3px 0 0 3px;
-        }
-
-        .search-mode-group .search-toggle:last-child {
-            border-radius: 0 3px 3px 0;
-        }
-
-        /* Tabs */
-        .tabs {
-            display: flex;
-            background: var(--bg-tertiary);
-            padding: 0 20px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .tab-btn {
-            background: transparent;
-            color: var(--text-secondary);
-            border: none;
-            padding: 12px 24px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            position: relative;
-            transition: all 0.3s ease;
-        }
-
-        .tab-btn:hover {
-            color: var(--text-primary);
-            background: rgba(255, 255, 255, 0.05);
-        }
-
-        .tab-btn.active {
-            color: var(--accent-color);
-        }
-
-        .tab-btn.active::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            width: 100%;
-            height: 3px;
-            background: var(--accent-color);
-        }
-
-        /* View Containers */
+        /* View Switching Logic FIX */
         .view-container {
-            display: none;
-            width: 100vw;
-            height: calc(100vh - 125px);
-            /* Adjusted for header + tabs */
-            overflow: hidden;
-            position: relative;
+            display: none !important;
         }
 
         .view-container.active {
-            display: block;
+            display: block !important;
         }
 
-        #graph-view {
-            background: radial-gradient(circle at center, var(--gradient-start) 0%, var(--gradient-end) 100%);
+        #graph-view.active {
+            display: block !important;
         }
 
-        /* Blast Radius View Styles */
-        #blast-radius-view {
-            padding: 20px;
-            overflow-y: auto;
-            background: var(--bg-primary);
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
         }
 
-        .blast-dashboard {
-            display: grid;
-            grid-template-columns: 350px 1fr;
-            gap: 20px;
-            height: 100%;
-            max-width: 1600px;
-            margin: 0 auto;
+        ::-webkit-scrollbar-track {
+            background: #0a0a0a;
         }
 
-        .blast-sidebar {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            padding: 20px;
-            border: 1px solid var(--border-color);
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
+        ::-webkit-scrollbar-thumb {
+            background: #444;
+            border-radius: 5px;
+            border: 2px solid #0a0a0a;
         }
 
-        .blast-main {
-            display: grid;
-            grid-template-rows: auto 1fr;
-            gap: 20px;
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00f3ff;
         }
 
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
+        /* Scanline Overlay */
+        .scanlines {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0) 50%, rgba(0, 0, 0, 0.1) 50%, rgba(0, 0, 0, 0.1));
+            background-size: 100% 4px;
+            z-index: 9999;
+            opacity: 0.2;
+            pointer-events: none;
         }
 
-        .metric-card {
-            background: var(--bg-secondary);
-            padding: 20px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            text-align: center;
-            transition: transform 0.3s ease;
+        /* Glow Effects */
+        .neon-text {
+            text-shadow: 0 0 8px rgba(0, 243, 255, 0.8), 0 0 12px rgba(0, 243, 255, 0.4);
         }
 
-        .metric-card:hover {
-            transform: translateY(-5px);
-            border-color: var(--accent-color);
+        .neon-border {
+            box-shadow: 0 0 8px rgba(0, 243, 255, 0.3);
+            border: 1px solid rgba(0, 243, 255, 0.5);
         }
 
-        .metric-value {
-            font-size: 32px;
-            font-weight: bold;
-            color: var(--accent-color);
-            margin: 10px 0;
+        .neon-box:hover {
+            box-shadow: 0 0 15px rgba(0, 243, 255, 0.5);
+            border-color: #00f3ff;
         }
 
-        .metric-label {
-            font-size: 12px;
+        /* Typography fixes */
+        label {
+            font-weight: 700;
+            color: #00f3ff;
+            font-family: 'Rajdhani', sans-serif;
             text-transform: uppercase;
-            color: var(--text-secondary);
+            letter-spacing: 0.5px;
+            font-size: 12px;
+        }
+
+        h3 {
+            font-family: 'Orbitron', sans-serif;
+            font-weight: 800;
+            color: #ffffff;
             letter-spacing: 1px;
         }
 
-        .chart-container {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            padding: 20px;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            /* Align to top */
-            min-height: 400px;
-            position: relative;
+        /* Graph Node Styling overrides */
+        .node text {
+            font-family: 'Rajdhani', sans-serif;
+            text-shadow: 2px 2px 2px #000;
+            letter-spacing: 0.5px;
+            pointer-events: none;
         }
 
-        #radar-chart {
-            width: 100%;
-            height: 100%;
-            min-height: 400px;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            padding-top: 50px;
+        .node circle {
+            stroke-width: 2px;
+            filter: drop-shadow(0 0 5px rgba(0, 243, 255, 0.6));
         }
 
-        .entity-selector {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
+        .link {
+            stroke-opacity: 0.8 !important;
+            stroke-width: 1.5px !important;
         }
 
-        .entity-list {
-            flex: 1;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-            margin-top: 10px;
-            border-top: 1px solid var(--border-color);
-            padding-top: 10px;
+        @keyframes glitch {
+            0% {
+                transform: translate(0)
+            }
+
+            20% {
+                transform: translate(-2px, 2px)
+            }
+
+            40% {
+                transform: translate(-2px, -2px)
+            }
+
+            60% {
+                transform: translate(2px, 2px)
+            }
+
+            80% {
+                transform: translate(2px, -2px)
+            }
+
+            100% {
+                transform: translate(0)
+            }
         }
 
-        .entity-item {
-            padding: 10px;
-            border-radius: 4px;
+        .glitch:hover {
+            animation: glitch 0.3s cubic-bezier(.25, .46, .45, .94) both infinite;
+        }
+
+        .status {
+            backdrop-filter: blur(8px);
+            border: 2px solid #00f3ff;
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.4);
+            font-family: 'VT323', monospace;
+            font-size: 20px;
+            letter-spacing: 1px;
+        }
+
+        .slider {
+            background-color: #333;
+        }
+
+        input:checked+.slider {
+            background-color: #39ff14;
+            box-shadow: 0 0 10px #39ff14;
+        }
+
+        /* Table Styles for Readability */
+        .detections-table th {
+            background-color: rgba(0, 243, 255, 0.1);
+            color: #00f3ff;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 11px;
+            letter-spacing: 1px;
+            border: 1px solid #333;
+            padding: 12px !important;
+        }
+
+        .detections-table td {
+            border-bottom: 1px solid #222;
+            padding: 10px !important;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .detections-table tr:hover {
+            background-color: rgba(57, 255, 20, 0.05) !important;
             cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border: 1px solid transparent;
         }
 
-        .entity-item:hover {
-            background: var(--bg-tertiary);
+        .risk-badge {
+            font-family: 'Orbitron', sans-serif;
+            font-weight: 900;
         }
 
-        .entity-item.active {
-            background: rgba(0, 122, 204, 0.1);
-            border-color: var(--accent-color);
-        }
-
-        .blast-details-container {
-            position: absolute;
-            right: 20px;
-            top: 20px;
-            width: 300px;
-            max-height: 360px;
-            overflow-y: auto;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 15px;
-            border-radius: 8px;
-            backdrop-filter: blur(5px);
-            border: 1px solid var(--border-color);
-        }
-
+        /* Detail Panel Refinements */
         .detail-section {
-            margin-bottom: 15px;
+            margin-bottom: 20px;
         }
 
         .detail-section h4 {
-            color: var(--accent-color);
-            margin-bottom: 8px;
-            font-size: 13px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 11px;
+            font-weight: 900;
+            color: #fff;
+            background: rgba(0, 243, 255, 0.1);
+            border-left: 4px solid #00f3ff;
+            padding: 8px 12px;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
 
-        .count-badge {
-            background: rgba(255, 255, 255, 0.1);
-            padding: 2px 6px;
-            border-radius: 10px;
-            font-size: 11px;
-            color: #fff;
-        }
-
         .detail-list {
-            font-size: 12px;
             display: flex;
             flex-direction: column;
             gap: 4px;
         }
 
         .detail-item {
-            color: var(--text-primary);
-            padding: 2px 5px;
-            border-radius: 3px;
+            font-size: 13px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            font-family: 'VT323', monospace;
+            color: #ddd;
         }
 
         .detail-item:hover {
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(0, 243, 255, 0.05);
+            color: #fff;
+            border-color: rgba(0, 243, 255, 0.2);
         }
 
-        .entity-name {
-            font-weight: bold;
-        }
-
-        .entity-meta {
-            font-size: 11px;
-            color: var(--text-secondary);
-        }
-
-        /* Toggle Switch Styles */
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 40px;
-            height: 20px;
-        }
-
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-
-        .slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #3e3e3e;
-            -webkit-transition: .4s;
-            transition: .4s;
-        }
-
-        .slider:before {
-            position: absolute;
-            content: "";
-            height: 14px;
-            width: 14px;
-            left: 3px;
-            bottom: 3px;
-            background-color: white;
-            -webkit-transition: .4s;
-            transition: .4s;
-        }
-
-        input:checked+.slider {
-            background-color: var(--accent-color);
-        }
-
-        input:focus+.slider {
-            box-shadow: 0 0 1px var(--accent-color);
-        }
-
-        input:checked+.slider:before {
-            -webkit-transform: translateX(20px);
-            -ms-transform: translateX(20px);
-            transform: translateX(20px);
-        }
-
-        .slider.round {
-            border-radius: 20px;
-        }
-
-        .slider.round:before {
-            border-radius: 50%;
-        }
-
-        /* Radar Chart SVG Styles */
-        .radar-chart .level {
-            stroke: var(--border-color);
-            stroke-width: 0.5px;
-        }
-
-        .radar-chart .axis line {
-            stroke: var(--border-color);
-            stroke-width: 0.5px;
-        }
-
-        .radar-chart .axis text {
+        .count-badge {
+            background: #00f3ff;
+            color: #000;
+            padding: 2px 6px;
+            border-radius: 4px;
             font-size: 10px;
-            fill: var(--text-primary);
+            font-weight: 900;
         }
 
-        .radar-area {
-            fill: var(--accent-color);
-            fill-opacity: 0.2;
-            stroke: var(--accent-color);
-            stroke-width: 2px;
-        }
-
-        .radar-point {
-            fill: var(--accent-color);
-            stroke: #fff;
-            stroke-width: 1.5px;
-        }
-
-        /* Shadow IT Styles */
-        #shadow-it-view {
-            padding: 20px;
-            overflow-y: auto;
-            background: var(--bg-primary);
-        }
-
-        .shadow-it-dashboard {
-            display: grid;
-            grid-template-columns: 300px 1fr;
-            gap: 20px;
-            height: 100%;
-            max-width: 1800px;
-            margin: 0 auto;
-        }
-
-        .shadow-it-sidebar {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            padding: 20px;
-            border: 1px solid var(--border-color);
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-            height: fit-content;
-        }
-
-        .shadow-it-main {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        .shadow-it-metrics {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 15px;
-        }
-
-        .shadow-metric-card {
-            background: var(--bg-secondary);
-            padding: 20px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            text-align: center;
-            transition: transform 0.3s ease, border-color 0.3s ease;
-        }
-
-        .shadow-metric-card:hover {
-            transform: translateY(-3px);
-            border-color: var(--accent-color);
-        }
-
-        .shadow-metric-card.risk-high {
-            border-left: 4px solid #ff4444;
-        }
-
-        .shadow-metric-card.risk-medium {
-            border-left: 4px solid #ff9944;
-        }
-
-        .shadow-metric-card.risk-low {
-            border-left: 4px solid #ffcc44;
-        }
-
-        .detections-container {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            overflow: hidden;
-        }
-
-        .detections-header {
-            padding: 15px 20px;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .detections-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .detections-table thead {
-            background: var(--bg-tertiary);
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-
-        .detections-table th {
-            padding: 12px 15px;
-            text-align: left;
-            font-size: 12px;
-            font-weight: 600;
+        .export-btn {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 10px;
+            font-weight: 900;
+            padding: 6px 12px;
+            border-radius: 4px;
             text-transform: uppercase;
-            color: var(--text-secondary);
-            letter-spacing: 0.5px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .detections-table td {
-            padding: 15px;
-            border-bottom: 1px solid var(--border-color);
-            font-size: 13px;
-        }
-
-        .detections-table tbody tr {
-            transition: background 0.2s ease;
+            letter-spacing: 1px;
+            transition: all 0.2s;
             cursor: pointer;
-        }
-
-        .detections-table tbody tr:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .risk-badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .risk-badge.high {
-            background: rgba(255, 68, 68, 0.2);
-            color: #ff4444;
-            border: 1px solid #ff4444;
-        }
-
-        .risk-badge.medium {
-            background: rgba(255, 153, 68, 0.2);
-            color: #ff9944;
-            border: 1px solid #ff9944;
-        }
-
-        .risk-badge.low {
-            background: rgba(255, 204, 68, 0.2);
-            color: #ffcc44;
-            border: 1px solid #ffcc44;
-        }
-
-        .detection-category {
-            font-size: 11px;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .detection-details-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.7);
-            z-index: 2000;
-            justify-content: center;
+            display: inline-flex;
             align-items: center;
+            gap: 6px;
         }
 
-        .detection-details-content {
-            background: var(--bg-secondary);
-            padding: 30px;
-            border-radius: 12px;
-            width: 600px;
-            max-width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-            border: 1px solid var(--border-color);
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        .export-btn-csv {
+            background: rgba(57, 255, 20, 0.1);
+            border: 1px solid #39ff14;
+            color: #39ff14;
         }
 
-        .detail-row {
-            padding: 10px 0;
-            border-bottom: 1px solid var(--border-color);
+        .export-btn-csv:hover {
+            background: #39ff14;
+            color: #000;
         }
 
-        .detail-row:last-child {
-            border-bottom: none;
+        .export-btn-json {
+            background: rgba(0, 243, 255, 0.1);
+            border: 1px solid #00f3ff;
+            color: #00f3ff;
         }
 
-        .detail-label {
-            font-size: 11px;
-            text-transform: uppercase;
-            color: var(--text-secondary);
-            letter-spacing: 0.5px;
-            margin-bottom: 5px;
-        }
-
-        .detail-value {
-            font-size: 14px;
-            color: var(--text-primary);
-        }
-
-        .recommendation-box {
-            background: rgba(0, 122, 204, 0.1);
-            border-left: 4px solid var(--accent-color);
-            padding: 15px;
-            border-radius: 4px;
-            margin-top: 15px;
-        }
-
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .control-group label {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .empty-state {
-            text-align: center;
-            padding: 60px 20px;
-            color: var(--text-secondary);
-        }
-
-        .empty-state-icon {
-            font-size: 48px;
-            margin-bottom: 15px;
-            opacity: 0.5;
-        }
-
-        .table-filter-input {
-            width: 100%;
-            padding: 4px 8px;
-            border-radius: 4px;
-            border: 1px solid var(--border-color);
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            font-size: 11px;
-            margin-top: 5px;
-        }
-
-        .table-filter-input:focus {
-            border-color: var(--accent-color);
-            outline: none;
-        }
-
-        .filter-header-cell {
-            padding: 5px 15px 10px 15px !important;
-            background: var(--bg-tertiary);
-            border-bottom: 1px solid var(--border-color);
+        .export-btn-json:hover {
+            background: #00f3ff;
+            color: #000;
         }
     </style>
-
 </head>
 
-<body>
-    <div class="header">
-        <div class="title">🩸 Fleet Security Graph</div>
-        <div class="controls">
-            <!-- Controls will be contextual based on view -->
-            <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">🌓</button>
-            <div id="graph-controls" style="display: flex; gap: 15px; align-items: center;">
-                <div class="search-container">
-                    <input type="text" id="search-input" placeholder="Find (↑↓ for history)">
-                    <div class="search-toggles">
-                        <button id="toggle-case" class="search-toggle" onclick="toggleCaseSensitive()"
-                            title="Match Case">Aa</button>
-                        <div class="search-mode-group">
-                            <button id="mode-wildcard" class="search-toggle active" onclick="setSearchMode('wildcard')"
-                                title="Wildcard (*)">*</button>
-                            <button id="mode-exact" class="search-toggle" onclick="setSearchMode('exact')"
-                                title="Exact Match">""</button>
-                        </div>
-                    </div>
-                </div>
-                <select id="node-type-filter">
-                    <option value="all">All Types</option>
-                    <option value="host">Hosts</option>
-                    <option value="user">Users</option>
-                    <option value="software">Software</option>
-                </select>
-                <select id="platform-filter">
-                    <option value="all">All Platforms</option>
-                </select>
-                <select id="team-filter">
-                    <option value="all">All Teams</option>
-                </select>
-                <button onclick="searchNodes()">🔍 Search</button>
-                <button onclick="clearSearch()">❌ Clear</button>
-                <button onclick="resetToOverview()">🔙 Overview</button>
-                <button onclick="centerGraph()">🎯 Center</button>
-                <button onclick="resetPositions()">📍 Reset Positions</button>
-                <button onclick="loadGraph()">🔄 Refresh</button>
-                <button onclick="exportAsJSON()" title="Export current view as JSON">📥 JSON</button>
-                <button onclick="exportAsCSV()" title="Export current view as CSV">📥 CSV</button>
+<body
+    class="bg-cyber-black text-white font-rajdhani h-screen w-screen overflow-hidden flex flex-col selection:bg-cyber-cyan selection:text-black">
+
+    <!-- Scanline Overlay -->
+    <div class="scanlines"></div>
+
+    <!-- Header -->
+    <header
+        class="h-16 flex-none border-b border-cyber-border bg-cyber-dark/95 backdrop-blur-md flex justify-between items-center px-6 relative z-10">
+        <div class="flex items-center gap-3">
+            <div
+                class="title font-orbitron text-2xl font-black italic tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-cyber-cyan to-blue-500 neon-text glitch cursor-default">
+                FLEET // HOUND
+            </div>
+            <div
+                class="px-2 py-0.5 bg-cyber-green/10 border border-cyber-green text-cyber-green text-[10px] font-mono rounded animate-pulse font-bold">
+                SEC_LEVEL: ALPHA
             </div>
         </div>
-    </div>
 
-    <div class="tabs">
-        <button class="tab-btn active" onclick="switchView('graph')">🕸️ Graph View</button>
-        <button class="tab-btn" onclick="switchView('blast-radius')">💥 Blast Radius</button>
-        <button class="tab-btn" onclick="switchView('shadow-it')">🔍 Shadow IT</button>
-    </div>
+        <div class="controls flex items-center gap-4">
+            <button class="theme-toggle hidden" onclick="toggleTheme()">🌓</button>
 
-    <!-- Graph View -->
-    <div id="graph-view" class="view-container active">
-        <div id="graph" style="width: 100%; height: 100%;"></div>
-    </div>
+            <div id="graph-controls" class="flex items-center gap-3">
+                <div
+                    class="search-container flex items-center bg-cyber-panel border border-cyber-border rounded overflow-hidden focus-within:border-cyber-cyan transition-colors h-9">
+                    <span class="pl-2 text-cyber-dim">🔍</span>
+                    <input type="text" id="search-input" placeholder="ACCESS_DATABASE..."
+                        class="bg-transparent border-none text-sm font-mono text-cyber-cyan p-2 w-56 focus:outline-none placeholder-cyber-dim uppercase">
 
-    <!-- Blast Radius View -->
-    <div id="blast-radius-view" class="view-container">
-        <div class="blast-dashboard">
-            <div class="blast-sidebar">
-                <h3>Entity Analysis</h3>
-
-                <div class="control-group">
-                    <label>Select Team</label>
-                    <select id="blast-team-filter" onchange="calculateBlastRadius()">
-                        <option value="all">All Teams</option>
-                        <!-- Populated by JS -->
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Select Entity Type</label>
-                    <select id="blast-type-selector" onchange="loadBlastEntities()">
-                        <option value="software">Software</option>
-                        <option value="user">User</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Search Entity</label>
-                    <input type="text" id="blast-search" placeholder="Search..." onkeyup="filterBlastEntities()">
-                </div>
-
-                <div class="control-group" style="display: flex; align-items: center; justify-content: space-between;">
-                    <div style="display: flex; align-items: center; gap: 5px;">
-                        <label style="margin:0; font-size: 13px; cursor: pointer;" for="ignore-defaults-toggle">Exclude
-                            Accounts</label>
-                        <button onclick="openExclusionSettings()" title="Configure Excluded Accounts"
-                            style="background:none; border:none; color:var(--text-secondary); cursor:pointer; padding:0; font-size:14px;">⚙️</button>
-                    </div>
-                    <label class="switch">
-                        <input type="checkbox" id="ignore-defaults-toggle" onchange="calculateBlastRadius()">
-                        <span class="slider round"></span>
-                    </label>
-                </div>
-
-                <div id="blast-entity-list" class="entity-list">
-                    <!-- Populated by JS -->
-                    <div style="padding: 20px; text-align: center; color: var(--text-secondary);">Loading...</div>
-                </div>
-            </div>
-
-            <div class="blast-main">
-                <div class="metrics-grid">
-                    <div class="metric-card">
-                        <div class="metric-label">Host Reach</div>
-                        <div class="metric-value" id="metric-host-reach">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Hosts impacted</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">User Impact</div>
-                        <div class="metric-value" id="metric-user-impact">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Users affected</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">Lateral Movement</div>
-                        <div class="metric-value" id="metric-lateral-movement">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">2nd-degree hosts</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">Platform Spread</div>
-                        <div class="metric-value" id="metric-platform-diversity">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">OS Platforms</div>
-                    </div>
-                </div>
-
-                <div class="chart-container">
-                    <div id="radar-chart"></div>
-                    <div id="blast-details-panel" class="blast-details-container">
-                        <div id="blast-details-content">
-                            <!-- Populated by JS -->
+                    <div class="search-toggles flex border-l border-cyber-border h-full">
+                        <button id="toggle-case"
+                            class="search-toggle hover:bg-cyber-dim/20 hover:text-white px-3 text-xs font-mono text-cyber-dim transition-colors"
+                            onclick="toggleCaseSensitive()" title="Match Case">Aa</button>
+                        <div class="search-mode-group flex h-full">
+                            <button id="mode-wildcard"
+                                class="search-toggle active bg-cyber-cyan text-black px-3 text-xs font-mono hover:bg-white transition-colors"
+                                onclick="setSearchMode('wildcard')" title="Wildcard">*</button>
+                            <button id="mode-exact"
+                                class="search-toggle hover:bg-cyber-dim/20 px-3 text-xs font-mono text-cyber-dim transition-colors"
+                                onclick="setSearchMode('exact')" title="Exact">""</button>
                         </div>
                     </div>
                 </div>
+
+                <select id="node-type-filter"
+                    class="h-9 bg-cyber-panel border border-cyber-border rounded text-xs px-3 text-white focus:border-cyber-cyan outline-none uppercase font-bold tracking-wider cursor-pointer hover:border-gray-400 transition-colors">
+                    <option value="all">TYPE: ALL</option>
+                    <option value="host">TYPE: HOSTS</option>
+                    <option value="user">TYPE: USERS</option>
+                    <option value="software">TYPE: SOFTWARE</option>
+                </select>
+
+                <select id="platform-filter"
+                    class="h-9 bg-cyber-panel border border-cyber-border rounded text-xs px-3 text-white focus:border-cyber-cyan outline-none uppercase font-bold tracking-wider cursor-pointer hover:border-gray-400 transition-colors">
+                    <option value="all">OS: ALL</option>
+                </select>
+
+                <select id="team-filter"
+                    class="h-9 bg-cyber-panel border border-cyber-border rounded text-xs px-3 text-white focus:border-cyber-cyan outline-none uppercase font-bold tracking-wider cursor-pointer hover:border-gray-400 transition-colors">
+                    <option value="all">TEAM: ALL</option>
+                </select>
+
+                <div class="flex gap-1">
+                    <button onclick="searchNodes()"
+                        class="h-9 px-4 bg-cyber-cyan border border-cyber-cyan text-black text-xs font-black rounded hover:bg-white transition-all font-orbitron uppercase tracking-widest">RUN</button>
+                    <button onclick="clearSearch()"
+                        class="h-9 w-9 flex items-center justify-center bg-cyber-panel border border-cyber-border text-white text-xs rounded hover:border-cyber-pink hover:text-cyber-pink transition-colors font-bold"
+                        title="Clear">✖</button>
+                </div>
+
+                <div class="h-5 w-px bg-cyber-border mx-1"></div>
+
+                <button onclick="resetToOverview()"
+                    class="text-xs text-cyber-cyan hover:text-white font-black hover:underline tracking-widest font-orbitron">RESET</button>
             </div>
         </div>
-    </div>
+    </header>
 
-    <!-- Shadow IT View -->
-    <div id="shadow-it-view" class="view-container">
-        <div class="shadow-it-dashboard">
-            <div class="shadow-it-sidebar">
-                <h3>🔍 Shadow IT Detection</h3>
+    <!-- Navigation Tabs -->
+    <nav class="tabs flex-none h-14 bg-cyber-panel border-b border-cyber-border flex px-6 z-10 gap-2">
+        <button
+            class="tab-btn active h-full px-8 flex items-center gap-3 text-sm font-black text-cyber-cyan border-b-4 border-cyber-cyan transition-all font-orbitron tracking-tighter"
+            onclick="switchView('graph')">
+            <span>🕸️</span> GRAPH_MATRIX
+        </button>
+        <button
+            class="tab-btn h-full px-8 flex items-center gap-3 text-sm font-bold text-gray-500 hover:text-white transition-all border-b-4 border-transparent hover:border-gray-700 font-orbitron tracking-tighter"
+            onclick="switchView('blast-radius')">
+            <span>💥</span> BLAST_RADIUS
+        </button>
+        <button
+            class="tab-btn h-full px-8 flex items-center gap-3 text-sm font-bold text-gray-500 hover:text-white transition-all border-b-4 border-transparent hover:border-gray-700 font-orbitron tracking-tighter"
+            onclick="switchView('shadow-it')">
+            <span>👁️</span> SHADOW_OPS
+        </button>
+    </nav>
 
-                <div class="control-group">
-                    <label>Select Team</label>
-                    <select id="shadow-team-filter-new">
-                        <option value="" disabled selected>Select Team</option>
-                        <option value="all">All Teams</option>
-                    </select>
-                </div>
+    <!-- Main Content Area -->
+    <main class="flex-1 relative overflow-hidden z-0">
 
-                <div class="control-group">
-                    <label>Select Platform</label>
-                    <select id="shadow-platform-filter-new">
-                        <option value="all">All Platforms</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Risk Level</label>
-                    <select id="shadow-risk-filter">
-                        <option value="all">All Risk Levels</option>
-                        <option value="high">High Risk</option>
-                        <option value="medium">Medium Risk</option>
-                        <option value="low">Low Risk</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Detection Type</label>
-                    <select id="shadow-detection-type-filter">
-                        <option value="all">All Types</option>
-                        <option value="outlier">Outlier Software</option>
-                        <option value="high_risk">High-Risk Categories</option>
-                        <option value="version_sprawl">Version Sprawl</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Software Type</label>
-                    <select id="shadow-software-type-filter">
-                        <option value="all">All Software Types</option>
-                        <option value="Browser Extension">Browser Extension</option>
-                        <option value="VSCode Extension">VSCode Extension</option>
-                        <option value="npm Package">npm Package</option>
-                        <option value="Python Package">Python Package</option>
-                        <option value="Ruby Gem">Ruby Gem</option>
-                        <option value="OS Component">OS Component</option>
-                        <option value="Developer Tool">Developer Tool</option>
-                        <option value="Application">Application</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>Host Count</label>
-                    <select id="shadow-host-count-filter">
-                        <option value="all">All Host Counts</option>
-                        <option value="1">1 Host</option>
-                        <option value="2">2 Hosts</option>
-                        <option value="3+">3+ Hosts</option>
-                    </select>
-                </div>
-
-                <div class="control-group">
-                    <label>User Count</label>
-                    <select id="shadow-user-count-filter">
-                        <option value="all">All User Counts</option>
-                        <option value="1">1 User</option>
-                        <option value="2">2 Users</option>
-                        <option value="3+">3+ Users</option>
-                    </select>
-                </div>
-
-                <button onclick="loadShadowITDetections()" style="width: 100%;">🔄 Refresh Scan</button>
-
+        <!-- Graph View -->
+        <div id="graph-view" class="view-container active w-full h-full relative">
+            <div id="graph" class="w-full h-full"></div>
+            <div class="absolute bottom-10 right-10 flex flex-col gap-3">
+                <button onclick="centerGraph()"
+                    class="h-12 w-12 rounded-full bg-cyber-black/90 border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan hover:text-black shadow-[0_0_15px_rgba(0,243,255,0.4)] transition-all flex items-center justify-center text-2xl font-bold"
+                    title="Center View">🎯</button>
+                <button onclick="loadGraph()"
+                    class="h-12 w-12 rounded-full bg-cyber-black/90 border-2 border-cyber-green text-cyber-green hover:bg-cyber-green hover:text-black shadow-[0_0_15px_rgba(57,255,20,0.4)] transition-all flex items-center justify-center text-2xl font-bold mb-2"
+                    title="Force Refresh">↻</button>
+                <button onclick="exportAsCSV()"
+                    class="export-btn export-btn-csv h-12 w-28 shadow-[0_0_15px_rgba(57,255,20,0.4)] flex justify-center"
+                    title="Export CSV">📄 CSV</button>
+                <button onclick="exportAsJSON()"
+                    class="export-btn export-btn-json h-12 w-28 shadow-[0_0_15px_rgba(0,243,255,0.4)] flex justify-center"
+                    title="Export JSON">📦 JSON</button>
             </div>
 
-            <div class="shadow-it-main">
-                <div class="shadow-it-metrics">
-                    <div class="shadow-metric-card">
-                        <div class="metric-label">Total Detections</div>
-                        <div class="metric-value" id="shadow-total-detections">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Found issues</div>
-                    </div>
-                    <div class="shadow-metric-card risk-high">
-                        <div class="metric-label">High Risk</div>
-                        <div class="metric-value" id="shadow-high-risk" style="color: #ff4444;">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Critical issues</div>
-                    </div>
-                    <div class="shadow-metric-card risk-medium">
-                        <div class="metric-label">Medium Risk</div>
-                        <div class="metric-value" id="shadow-medium-risk" style="color: #ff9944;">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Warnings</div>
-                    </div>
-                    <div class="shadow-metric-card risk-low">
-                        <div class="metric-label">Low Risk</div>
-                        <div class="metric-value" id="shadow-low-risk" style="color: #ffcc44;">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Informational</div>
-                    </div>
-                    <div class="shadow-metric-card">
-                        <div class="metric-label">Affected Hosts</div>
-                        <div class="metric-value" id="shadow-affected-hosts">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Impacted systems</div>
-                    </div>
-                    <div class="shadow-metric-card">
-                        <div class="metric-label">Affected Users</div>
-                        <div class="metric-value" id="shadow-affected-users">-</div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">Impacted users</div>
-                    </div>
-                </div>
+            <div
+                class="absolute bottom-6 left-6 text-[11px] font-mono text-cyber-cyan bg-black/50 p-2 rounded border border-cyber-cyan/30 select-none">
+                PROTOCOL: HTTP_SEC<br>
+                STREAMING_NODES: TRUE<br>
+                AUTH_STATE: VALIDATED
+            </div>
+        </div>
 
-                <div class="detections-container">
-                    <div class="detections-header">
-                        <h3 style="margin: 0;">Detection Results</h3>
-                        <div style="font-size: 12px; color: var(--text-secondary);">
-                            Click a row for details
+        <!-- Blast Radius View -->
+        <div id="blast-radius-view" class="view-container w-full h-full p-6 overflow-y-auto bg-cyber-black">
+            <div class="blast-dashboard grid grid-cols-[350px_1fr] gap-8 max-w-[1600px] mx-auto h-full">
+                <aside
+                    class="blast-sidebar bg-cyber-dark border-2 border-cyber-border rounded-xl p-6 flex flex-col gap-6 shadow-2xl relative overflow-hidden">
+                    <div
+                        class="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-cyber-pink to-purple-600 shadow-[0_0_10px_rgba(255,0,85,0.5)]">
+                    </div>
+                    <h3 class="text-xl font-black">TACTICAL_ANALYSIS</h3>
+
+                    <div class="space-y-4">
+                        <div class="flex flex-col gap-2">
+                            <label>Target Team Mapping</label>
+                            <select id="blast-team-filter" onchange="calculateBlastRadius()"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold focus:border-cyber-pink outline-none shadow-inner"></select>
+                        </div>
+
+                        <div class="flex flex-col gap-2">
+                            <label>Asset Domain</label>
+                            <select id="blast-type-selector" onchange="loadBlastEntities()"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold focus:border-cyber-pink outline-none">
+                                <option value="software">SOFTWARE_RESOURCES</option>
+                                <option value="user">USER_IDENTITIES</option>
+                            </select>
+                        </div>
+
+                        <div class="flex flex-col gap-2">
+                            <label>Filter Buffer</label>
+                            <input type="text" id="blast-search" placeholder="ENTROPY SEARCH..."
+                                onkeyup="filterBlastEntities()"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-mono focus:border-cyber-pink outline-none placeholder-gray-600 uppercase">
+                        </div>
+
+                        <div
+                            class="flex items-center justify-between mt-4 p-3 bg-cyber-panel border border-cyber-pink/20 rounded-lg">
+                            <div class="flex items-center gap-3">
+                                <label class="m-0 text-sm font-black text-white cursor-pointer"
+                                    for="ignore-defaults-toggle">IGNORE_DEFAULTS</label>
+                                <button onclick="openExclusionSettings()" title="Settings"
+                                    class="text-gray-400 hover:text-cyber-cyan transition-colors text-lg">⚙️</button>
+                            </div>
+                            <label class="switch relative inline-block w-10 h-5">
+                                <input type="checkbox" id="ignore-defaults-toggle" onchange="calculateBlastRadius()"
+                                    class="opacity-0 w-0 h-0">
+                                <span
+                                    class="slider round absolute cursor-pointer inset-0 bg-gray-700 rounded-full transition-all before:absolute before:h-4 before:w-4 before:left-0.5 before:bottom-0.5 before:bg-white before:rounded-full before:transition-all shadow-md"></span>
+                            </label>
                         </div>
                     </div>
-                    <div id="detections-table-container" style="max-height: 600px; overflow-y: auto;">
-                        <table class="detections-table" id="shadow-detections-table">
-                            <thead>
-                                <tr>
-                                    <th>Software</th>
-                                    <th>Type</th>
-                                    <th>Risk</th>
-                                    <th>Category</th>
-                                    <th>Detection</th>
-                                    <th>Hosts</th>
-                                    <th>Users</th>
-                                    <th>Version</th>
-                                </tr>
-                                <tr class="filter-row">
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Software..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Type..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Risk..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Category..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Detection..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Hosts..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Users..." onkeyup="filterShadowTable()"></th>
-                                    <th class="filter-header-cell"><input type="text" class="table-filter-input"
-                                            placeholder="Filter Version..." onkeyup="filterShadowTable()"></th>
-                                </tr>
-                            </thead>
-                            <tbody id="shadow-detections-tbody">
-                                <tr>
-                                    <td colspan="8"
-                                        style="text-align: center; padding: 40px; color: var(--text-secondary);">
-                                        Loading detections...
-                                    </td>
-                                </tr>
-                            </tbody>
-                        </table>
+
+                    <div class="border-t-2 border-cyber-border pt-4 flex-1 flex flex-col min-h-0">
+                        <div class="text-[10px] font-black text-cyber-dim uppercase mb-2 tracking-widest">Active_Buffer:
+                        </div>
+                        <div id="blast-entity-list"
+                            class="flex-1 overflow-y-auto gap-2 flex flex-col pr-2 custom-scrollbar">
+                            <div class="text-center text-cyber-dim text-sm py-8 font-mono italic">Awaiting selection
+                                protocols...</div>
+                        </div>
+                    </div>
+                </aside>
+
+                <div class="blast-main grid grid-rows-[auto_1fr] gap-8">
+                    <div class="metrics-grid grid grid-cols-4 gap-5">
+                        <div
+                            class="metric-card bg-cyber-dark border-2 border-cyber-border rounded-xl p-5 text-center hover:border-cyber-pink shadow-lg transition-all">
+                            <div class="text-[11px] font-black text-cyber-pink uppercase tracking-widest">Host Reach
+                            </div>
+                            <div class="text-4xl font-black text-cyber-pink my-3 neon-text" id="metric-host-reach">-
+                            </div>
+                            <div class="text-[11px] font-bold text-gray-500 uppercase">Compromised Units</div>
+                        </div>
+                        <div
+                            class="metric-card bg-cyber-dark border-2 border-cyber-border rounded-xl p-5 text-center hover:border-cyber-cyan shadow-lg transition-all">
+                            <div class="text-[11px] font-black text-cyber-cyan uppercase tracking-widest">User Impact
+                            </div>
+                            <div class="text-4xl font-black text-cyber-cyan my-3 neon-text" id="metric-user-impact">-
+                            </div>
+                            <div class="text-[11px] font-bold text-gray-500 uppercase">Exposed Identities</div>
+                        </div>
+                        <div
+                            class="metric-card bg-cyber-dark border-2 border-cyber-border rounded-xl p-5 text-center hover:border-purple-500 shadow-lg transition-all">
+                            <div class="text-[11px] font-black text-purple-500 uppercase tracking-widest">Movement</div>
+                            <div class="text-4xl font-black text-purple-500 my-3 neon-text"
+                                id="metric-lateral-movement">-</div>
+                            <div class="text-[11px] font-bold text-gray-500 uppercase">Lateral Vectors</div>
+                        </div>
+                        <div
+                            class="metric-card bg-cyber-dark border-2 border-cyber-border rounded-xl p-5 text-center hover:border-cyber-yellow shadow-lg transition-all">
+                            <div class="text-[11px] font-black text-cyber-yellow uppercase tracking-widest">Diversity
+                            </div>
+                            <div class="text-4xl font-black text-cyber-yellow my-3 neon-text"
+                                id="metric-platform-diversity">-</div>
+                            <div class="text-[11px] font-bold text-gray-500 uppercase">Os Variants</div>
+                        </div>
+                    </div>
+
+                    <div
+                        class="bg-cyber-dark border-2 border-cyber-border rounded-xl p-8 relative flex justify-center items-center shadow-2xl">
+                        <div id="radar-chart" class="w-full h-full min-h-[500px]"></div>
+                        <div id="blast-details-panel"
+                            class="absolute right-6 top-6 w-80 max-h-[450px] overflow-y-auto bg-black/90 border-2 border-cyber-border p-5 rounded-lg shadow-3xl custom-scrollbar z-20">
+                            <div id="blast-details-content" class="text-sm">
+                                <span
+                                    class="text-cyber-cyan animate-pulse font-mono tracking-tighter text-xs">AWAITING_INPUT_SIGNAL...</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
+
+        <!-- Shadow IT View -->
+        <div id="shadow-it-view" class="view-container w-full h-full p-6 overflow-y-auto bg-cyber-black">
+            <div class="shadow-it-dashboard grid grid-cols-[300px_1fr] gap-8 max-w-[1700px] mx-auto h-full">
+                <aside
+                    class="shadow-it-sidebar bg-cyber-dark border-2 border-cyber-border rounded-xl p-6 flex flex-col gap-6 h-fit shadow-2xl overflow-hidden relative">
+                    <div
+                        class="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-cyber-cyan to-blue-600 shadow-[0_0_10px_rgba(0,243,255,0.5)]">
+                    </div>
+                    <h3 class="text-xl font-black">SCAN_PROTOCOLS</h3>
+
+                    <div class="space-y-5">
+                        <div class="flex flex-col gap-2">
+                            <label>Target Scope</label>
+                            <select id="shadow-team-filter-new"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan"></select>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <label>Kernel Variant</label>
+                            <select id="shadow-platform-filter-new"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan"></select>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <label>Risk Threshold</label>
+                            <select id="shadow-risk-filter"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
+                                <option value="all">UNFILTERED</option>
+                                <option value="high">SYSTEM_CRITICAL</option>
+                                <option value="medium">WARNING_SIG</option>
+                                <option value="low">INFORMATIONAL</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <label>Vector Type</label>
+                            <select id="shadow-detection-type-filter"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
+                                <option value="all">ALL_VECTORS</option>
+                                <option value="outlier">Statistical Outlier</option>
+                                <option value="high_risk">Categorical Risk</option>
+                                <option value="version_sprawl">Version Sprawl</option>
+                            </select>
+                        </div>
+
+                        <button onclick="loadShadowITDetections()"
+                            class="w-full py-4 bg-cyber-cyan text-black font-black text-sm rounded-lg hover:bg-white transition-all shadow-[0_0_20px_rgba(0,243,255,0.4)] font-orbitron tracking-widest">DEPLOY
+                            SCANNER</button>
+                    </div>
+                </aside>
+
+                <div class="flex flex-col gap-8">
+                    <div class="shadow-it-metrics grid grid-cols-6 gap-4">
+                        <div class="bg-cyber-dark border-2 border-cyber-border p-4 rounded-xl text-center shadow-lg">
+                            <div class="text-[10px] text-gray-400 uppercase font-black tracking-widest">Detections</div>
+                            <div class="text-3xl font-black text-white font-mono" id="shadow-total-detections">-</div>
+                        </div>
+                        <div
+                            class="bg-cyber-dark border-2 border-cyber-pink/50 p-4 rounded-xl text-center shadow-lg bg-cyber-pink/5">
+                            <div class="text-[10px] text-cyber-pink uppercase font-black tracking-widest">Critical</div>
+                            <div class="text-3xl font-black text-cyber-pink font-mono neon-text" id="shadow-high-risk">-
+                            </div>
+                        </div>
+                        <div
+                            class="bg-cyber-dark border-2 border-orange-600/50 p-4 rounded-xl text-center shadow-lg bg-orange-600/5">
+                            <div class="text-[10px] text-orange-500 uppercase font-black tracking-widest">Warning</div>
+                            <div class="text-3xl font-black text-orange-500 font-mono" id="shadow-medium-risk">-</div>
+                        </div>
+                        <div
+                            class="bg-cyber-dark border-2 border-cyber-yellow/50 p-4 rounded-xl text-center shadow-lg bg-cyber-yellow/5">
+                            <div class="text-[10px] text-cyber-yellow uppercase font-black tracking-widest">Info</div>
+                            <div class="text-3xl font-black text-cyber-yellow font-mono" id="shadow-low-risk">-</div>
+                        </div>
+                        <div class="bg-cyber-dark border-2 border-cyber-border p-4 rounded-xl text-center shadow-lg">
+                            <div class="text-[10px] text-gray-400 uppercase font-black tracking-widest">Hosts</div>
+                            <div class="text-3xl font-black text-white font-mono" id="shadow-affected-hosts">-</div>
+                        </div>
+                        <div class="bg-cyber-dark border-2 border-cyber-border p-4 rounded-xl text-center shadow-lg">
+                            <div class="text-[10px] text-gray-400 uppercase font-black tracking-widest">Users</div>
+                            <div class="text-3xl font-black text-white font-mono" id="shadow-affected-users">-</div>
+                        </div>
+                    </div>
+
+                    <div
+                        class="bg-cyber-dark border-2 border-cyber-border rounded-xl overflow-hidden flex flex-col flex-1 shadow-2xl">
+                        <div
+                            class="p-4 border-b-2 border-cyber-border flex justify-between items-center bg-cyber-panel/80">
+                            <h3 class="text-lg font-black text-cyber-cyan uppercase font-orbitron tracking-tighter">
+                                DATASET_RECORDS</h3>
+                            <span class="text-[10px] font-mono text-gray-500">SEC_PARITY: VERIFIED</span>
+                        </div>
+                        <div id="detections-table-container"
+                            class="overflow-y-auto flex-1 custom-scrollbar min-h-[500px]">
+                            <table class="detections-table w-full text-left" id="shadow-detections-table">
+                                <thead class="sticky top-0 z-10 bg-cyber-panel shadow-xl">
+                                    <tr class="bg-cyber-dark">
+                                        <th class="p-4 font-black">ASSET_NAME</th>
+                                        <th class="p-4 font-black">DOMAIN</th>
+                                        <th class="p-4 font-black">RISK</th>
+                                        <th class="p-4 font-black">CLASS</th>
+                                        <th class="p-4 font-black">VECTOR</th>
+                                        <th class="p-4 font-black">UNITS</th>
+                                        <th class="p-4 font-black">IDENTS</th>
+                                        <th class="p-4 font-black">REV</th>
+                                    </tr>
+                                    <tr class="bg-cyber-black">
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                        <th><input type="text"
+                                                class="table-filter-input w-full bg-cyber-dark border border-cyber-border rounded p-2 text-xs font-mono text-cyber-cyan focus:border-cyber-cyan outline-none"
+                                                placeholder="SEARCH..." onkeyup="filterShadowTable()"></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="shadow-detections-tbody" class="divide-y divide-cyber-border font-rajdhani">
+                                    <tr>
+                                        <td colspan="8" class="p-12 text-center text-gray-600 font-mono italic">
+                                            SCAN_SYSTEM_OFFLINE. INITIATE PROTOCOL ABOVE.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div id="status"
+        class="status fixed bottom-12 left-1/2 -translate-x-1/2 hidden px-8 py-4 bg-black/95 text-cyber-cyan border-2 border-cyber-cyan rounded-lg z-[100] font-black uppercase tracking-widest shadow-[0_0_30px_rgba(0,243,255,0.5)]">
     </div>
 
-    <!-- Detection Details Modal -->
-    <div id="detection-details-modal" class="detection-details-modal" onclick="closeDetectionDetails(event)">
-        <div class="detection-details-content" onclick="event.stopPropagation()">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h2 style="margin: 0;">Detection Details</h2>
+    <div id="detection-details-modal"
+        class="fixed inset-0 z-[2000] hidden bg-black/90 backdrop-blur-md justify-center items-center p-4"
+        onclick="closeDetectionDetails(event)">
+        <div class="bg-cyber-dark border-2 border-cyber-pink shadow-[0_0_50px_rgba(255,0,85,0.3)] w-[700px] max-w-full max-h-[90vh] rounded-2xl p-8 overflow-y-auto relative"
+            onclick="event.stopPropagation()">
+            <div class="flex justify-between items-center mb-8 border-b-2 border-cyber-border pb-4">
+                <h2 class="text-2xl font-black text-cyber-pink font-orbitron tracking-tighter">TACTICAL_INTEL_BREAKDOWN
+                </h2>
                 <button onclick="closeDetectionDetails()"
-                    style="background: transparent; border: none; font-size: 24px; cursor: pointer; color: var(--text-secondary);">×</button>
+                    class="text-gray-500 hover:text-white text-4xl transition-colors">×</button>
             </div>
-            <div id="detection-details-body">
-                <!-- Populated by JS -->
+            <div id="detection-details-body" class="space-y-6"></div>
+        </div>
+    </div>
+
+    <div id="exclusion-modal"
+        class="fixed inset-0 z-[1000] hidden bg-black/90 backdrop-blur-md justify-center items-center"
+        style="display: none;">
+        <div
+            class="bg-cyber-dark border-2 border-cyber-cyan p-8 rounded-2xl w-[450px] shadow-[0_0_40px_rgba(0,243,255,0.2)]">
+            <h3 class="text-xl font-black mb-4 font-orbitron text-cyber-cyan">EXCLUSION_CONFIG</h3>
+            <p class="text-xs text-gray-500 mb-6 font-bold uppercase tracking-wider">Define identity filters for blast
+                radius calculations (CSV).</p>
+            <textarea id="custom-exclusion-list"
+                class="w-full h-32 bg-cyber-black border-2 border-cyber-border rounded-xl p-4 text-white text-sm mb-6 focus:border-cyber-cyan outline-none font-mono"></textarea>
+            <div class="flex justify-end gap-3 text-xs font-black">
+                <button onclick="closeExclusionSettings()"
+                    class="px-6 py-2 border-2 border-gray-600 text-gray-500 rounded-lg hover:bg-gray-800 tracking-widest">ABORT</button>
+                <button onclick="saveExclusionSettings()"
+                    class="px-6 py-2 bg-cyber-cyan text-black rounded-lg hover:bg-white transition-all shadow-lg tracking-widest">COMMIT_CHANGES</button>
             </div>
         </div>
     </div>
 
-    <div id="status" class="status" style="display: none;"></div>
-
-    <!-- Exclusion Settings Modal -->
-    <div id="exclusion-modal" class="modal"
-        style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center;">
-        <div class="modal-content"
-            style="background: var(--bg-secondary); padding: 20px; border-radius: 8px; width: 400px; border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <h3 style="margin-top: 0; color: var(--text-primary);">Manage Excluded Accounts</h3>
-            <p style="color: var(--text-secondary); font-size: 12px; margin-bottom: 10px;">
-                Enter usernames to exclude from Blast Radius calculations (comma separated).<br>
-                Default system accounts are always included when the toggle is ON.
-            </p>
-            <textarea id="custom-exclusion-list"
-                style="width: 100%; height: 100px; background: var(--input-bg); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; margin-bottom: 15px;"></textarea>
-            <div style="display: flex; justify-content: flex-end; gap: 10px;">
-                <button onclick="closeExclusionSettings()"
-                    style="padding: 6px 12px; background: transparent; border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 4px; cursor: pointer;">Cancel</button>
-                <button onclick="saveExclusionSettings()"
-                    style="padding: 6px 12px; background: var(--accent-color); border: none; color: white; border-radius: 4px; cursor: pointer;">Save</button>
-            </div>
-        </div>
+    <!-- Hidden placeholders for legacy JS compatibility -->
+    <div style="display:none;">
+        <select id="shadow-software-type-filter">
+            <option value="all">all</option>
+        </select>
+        <select id="shadow-host-count-filter">
+            <option value="all">all</option>
+        </select>
+        <select id="shadow-user-count-filter">
+            <option value="all">all</option>
+        </select>
     </div>
 
     <script>
@@ -1216,8 +773,8 @@
         let allGraphData = { nodes: [], links: [] };
         let simulation;
 
-	        // Search mode state
-	        let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
+        // Search mode state
+        let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
         let caseSensitive = false;
 
         // Toggle case sensitivity
@@ -1247,25 +804,25 @@
         }
 
         // Helper function to test if a value matches the search term based on current mode
-	        function matchesSearch(value, searchTerm) {
+        function matchesSearch(value, searchTerm) {
             if (!value || !searchTerm) return !searchTerm;
 
-	            // NOTE: Regex handling intentionally uses raw strings and flags.
-	            const testValue = caseSensitive ? value : value.toLowerCase();
-	            const testTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+            // NOTE: Regex handling intentionally uses raw strings and flags.
+            const testValue = caseSensitive ? value : value.toLowerCase();
+            const testTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
 
             switch (searchMode) {
                 case 'exact':
                     return testValue === testTerm;
 
-	                case 'regex':
-	                    try {
-	                        const re = new RegExp(searchTerm, caseSensitive ? '' : 'i');
-	                        return re.test(value);
-	                    } catch (e) {
-	                        console.warn('Invalid regex search term:', e);
-	                        return false;
-	                    }
+                case 'regex':
+                    try {
+                        const re = new RegExp(searchTerm, caseSensitive ? '' : 'i');
+                        return re.test(value);
+                    } catch (e) {
+                        console.warn('Invalid regex search term:', e);
+                        return false;
+                    }
 
                 case 'wildcard':
                 default:
@@ -1295,7 +852,7 @@
             document.documentElement.setAttribute('data-theme', savedTheme);
         }
 
-	        // (Initialization happens later in the file; keep a single DOMContentLoaded handler.)
+        // (Initialization happens later in the file; keep a single DOMContentLoaded handler.)
 
         function loadGraph() {
             console.log('loadGraph() called');
@@ -1395,7 +952,7 @@
                 .data(data.links)
                 .enter().append("line")
                 .attr("class", "link")
-                .attr("stroke", d => d.type === 'uses' ? "#007acc" : "#888")
+                .attr("stroke", d => d.type === 'uses' ? "#00f3ff" : "#888")
                 .attr("stroke-width", 2)
                 .attr("stroke-opacity", 0.6);
 
@@ -1416,9 +973,9 @@
             node.append("circle")
                 .attr("r", d => d.type === 'host' ? 20 : d.type === 'user' ? 15 : 10)
                 .attr("fill", d => {
-                    if (d.type === 'host') return "#e74c3c";
-                    if (d.type === 'user') return "#3498db";
-                    return "#27ae60";
+                    if (d.type === 'host') return "#ff0055";
+                    if (d.type === 'user') return "#00f3ff";
+                    return "#39ff14";
                 })
                 .attr("stroke", "#fff")
                 .attr("stroke-width", 2);
@@ -1428,8 +985,8 @@
                 .text(d => d.name)
                 .attr("text-anchor", "middle")
                 .attr("dy", "0.35em")
-                .attr("font-size", "10px")
-                .attr("font-weight", "bold")
+                .attr("font-size", "13px")
+                .attr("font-weight", "900")
                 .attr("fill", "#fff");
 
             // Add tooltips
@@ -2003,7 +1560,7 @@
             const status = document.getElementById('status');
             status.textContent = message;
             status.style.display = 'block';
-            status.style.borderLeftColor = isError ? '#e74c3c' : '#007acc';
+            status.style.borderLeftColor = isError ? '#ff0055' : '#00f3ff';
 
             if (!isError) {
                 setTimeout(() => {
@@ -2012,7 +1569,7 @@
             }
         }
 
-	        // (loadTeams is defined later in the file for all views.)
+        // (loadTeams is defined later in the file for all views.)
 
         // Export current graph data as JSON
         function exportAsJSON() {
@@ -2138,7 +1695,7 @@
                 })
                 .catch(err => {
                     console.error("Error loading entities:", err);
-                    listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #e74c3c;">Error loading entities</div>';
+                    listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #ff0055;">Error loading entities</div>';
                 });
         }
 
@@ -2196,7 +1753,7 @@
                         renderBlastList(results);
                     })
                     .catch(err => {
-                        listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #e74c3c;">Error searching</div>';
+                        listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #ff0055;">Error searching</div>';
                     });
             }, 300);
         }
@@ -2296,22 +1853,22 @@
             }
         }
 
-	        // Load teams for all views (Graph, Blast Radius, Shadow IT)
+        // Load teams for all views (Graph, Blast Radius, Shadow IT)
         function loadTeams() {
-	            fetch('/api/teams')
-	                .then(response => {
-	                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	                    return response.json();
-	                })
+            fetch('/api/teams')
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.json();
+                })
                 .then(teams => {
                     const teamFilter = document.getElementById('team-filter'); // Graph view
                     const blastTeamFilter = document.getElementById('blast-team-filter'); // Blast view
                     const shadowTeamFilter = document.getElementById('shadow-team-filter-new'); // Shadow IT
 
-	                    if (!teamFilter) {
-	                        console.warn('team-filter element not found');
-	                        return;
-	                    }
+                    if (!teamFilter) {
+                        console.warn('team-filter element not found');
+                        return;
+                    }
 
                     // Clear existing (keep first 'All' option)
                     while (teamFilter.options.length > 1) teamFilter.remove(1);
@@ -2342,41 +1899,41 @@
                             shadowTeamFilter.appendChild(option.cloneNode(true));
                         }
                     });
-	                })
-	                .catch(error => console.error('Error loading teams:', error));
+                })
+                .catch(error => console.error('Error loading teams:', error));
         }
 
-	        // Load platforms for filters
+        // Load platforms for filters
         function loadPlatforms() {
             fetch('/api/platforms')
-	                .then(response => {
-	                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	                    return response.json();
-	                })
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.json();
+                })
                 .then(platforms => {
-	                    const graphPlatformFilter = document.getElementById('platform-filter');
-	                    const shadowPlatformFilter = document.getElementById('shadow-platform-filter-new');
+                    const graphPlatformFilter = document.getElementById('platform-filter');
+                    const shadowPlatformFilter = document.getElementById('shadow-platform-filter-new');
 
-	                    if (graphPlatformFilter) {
-	                        // Clear existing (keep first 'All Platforms' option)
-	                        while (graphPlatformFilter.options.length > 1) graphPlatformFilter.remove(1);
-	                        platforms.forEach(platform => {
-	                            const option = document.createElement('option');
-	                            option.value = platform;
-	                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
-	                            graphPlatformFilter.appendChild(option);
-	                        });
-	                    }
+                    if (graphPlatformFilter) {
+                        // Clear existing (keep first 'All Platforms' option)
+                        while (graphPlatformFilter.options.length > 1) graphPlatformFilter.remove(1);
+                        platforms.forEach(platform => {
+                            const option = document.createElement('option');
+                            option.value = platform;
+                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+                            graphPlatformFilter.appendChild(option);
+                        });
+                    }
 
-	                    if (shadowPlatformFilter) {
-	                        shadowPlatformFilter.innerHTML = `<option value="all">All Platforms (${platforms.length})</option>`;
-	                        platforms.forEach(platform => {
-	                            const option = document.createElement('option');
-	                            option.value = platform;
-	                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
-	                            shadowPlatformFilter.appendChild(option);
-	                        });
-	                    }
+                    if (shadowPlatformFilter) {
+                        shadowPlatformFilter.innerHTML = `<option value="all">All Platforms (${platforms.length})</option>`;
+                        platforms.forEach(platform => {
+                            const option = document.createElement('option');
+                            option.value = platform;
+                            option.textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+                            shadowPlatformFilter.appendChild(option);
+                        });
+                    }
                 })
                 .catch(error => console.error('Error loading platforms:', error));
         }
@@ -2396,23 +1953,24 @@
             const container = document.getElementById('blast-details-content');
             container.innerHTML = '';
 
+            // Store current blast data for export
+            window.currentBlastData = data;
+
             // Add Entity Info section if categories or description exist
             if (metrics.category || metrics.description) {
                 const infoSection = document.createElement('div');
                 infoSection.className = 'detail-section';
-                infoSection.innerHTML = `<h4>Entity Info</h4>`;
+                infoSection.innerHTML = `<h4>ENT_PROFILE</h4>`;
 
                 const infoContent = document.createElement('div');
-                infoContent.style.padding = '10px';
-                infoContent.style.background = 'rgba(255,255,255,0.05)';
-                infoContent.style.borderRadius = '4px';
+                infoContent.className = 'p-3 bg-white/5 rounded-lg border border-white/10 space-y-3';
 
                 if (metrics.category && metrics.category.length > 0) {
                     infoContent.innerHTML += `
-                        <div style="margin-bottom: 8px;">
-                            <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Categories</div>
-                            <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;">
-                                ${metrics.category.map(cat => `<span style="background: rgba(0, 122, 204, 0.2); color: var(--accent-color); padding: 1px 6px; border-radius: 8px; font-size: 10px; border: 1px solid var(--accent-color);">${escapeHtml(cat)}</span>`).join('')}
+                        <div>
+                            <div class="text-[9px] text-cyber-dim uppercase font-black tracking-tighter mb-1">Class_Tagging</div>
+                            <div class="flex flex-wrap gap-1">
+                                ${metrics.category.map(cat => `<span class="bg-cyber-cyan/10 text-cyber-cyan px-2 py-0.5 rounded border border-cyber-cyan/30 text-[10px] font-bold">${escapeHtml(cat)}</span>`).join('')}
                             </div>
                         </div>
                     `;
@@ -2421,8 +1979,8 @@
                 if (metrics.description) {
                     infoContent.innerHTML += `
                         <div>
-                            <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Wikidata Description</div>
-                            <div style="font-size: 11px; margin-top: 2px; color: var(--text-primary); line-height: 1.3;">${escapeHtml(metrics.description)}</div>
+                            <div class="text-[9px] text-cyber-dim uppercase font-black tracking-tighter mb-1">Tactical_Intel</div>
+                            <div class="text-[12px] leading-relaxed text-gray-300 font-medium">${escapeHtml(metrics.description)}</div>
                         </div>
                     `;
                 }
@@ -2431,13 +1989,35 @@
                 container.appendChild(infoSection);
             }
 
+            // Export Section
+            const exportSection = document.createElement('div');
+            exportSection.className = 'detail-section';
+            exportSection.innerHTML = `<h4>EXPORT_REPORTS</h4>`;
+            const exportGroup = document.createElement('div');
+            exportGroup.className = 'flex gap-2 p-2 bg-white/5 rounded-lg border border-white/10';
+
+            const csvBtn = document.createElement('button');
+            csvBtn.className = 'export-btn export-btn-csv flex-1 justify-center';
+            csvBtn.innerHTML = '<span>📄</span> CSV';
+            csvBtn.onclick = () => exportBlastRadius('csv');
+
+            const jsonBtn = document.createElement('button');
+            jsonBtn.className = 'export-btn export-btn-json flex-1 justify-center';
+            jsonBtn.innerHTML = '<span>📦</span> JSON';
+            jsonBtn.onclick = () => exportBlastRadius('json');
+
+            exportGroup.appendChild(csvBtn);
+            exportGroup.appendChild(jsonBtn);
+            exportSection.appendChild(exportGroup);
+            container.appendChild(exportSection);
+
             // Helper to create list sections
-            const addSection = (title, items) => {
+            const addSection = (title, items, totalCount, icon) => {
                 if (!items || items.length === 0) return;
 
                 const section = document.createElement('div');
                 section.className = 'detail-section';
-                section.innerHTML = `<h4>${title} <span class="count-badge">${items.length}</span></h4>`;
+                section.innerHTML = `<h4><span>${icon || ''} ${title}</span> <span class="count-badge">${totalCount || items.length}</span></h4>`;
 
                 const list = document.createElement('div');
                 list.className = 'detail-list';
@@ -2454,8 +2034,7 @@
 
                 if (items.length > 50) {
                     const more = document.createElement('div');
-                    more.className = 'detail-item';
-                    more.style.fontStyle = 'italic';
+                    more.className = 'detail-item italic text-cyber-dim';
                     more.textContent = `...and ${items.length - 50} more`;
                     list.appendChild(more);
                 }
@@ -2464,10 +2043,53 @@
                 container.appendChild(section);
             };
 
-            addSection('Impacted Teams', details.teams);
-            addSection('Impacted Platforms', details.platforms);
-            addSection('Impacted Hosts', details.hosts);
-            addSection('Impacted Users', details.users);
+            addSection('Teams', details.teams, null, '👥');
+            addSection('Platforms', details.platforms, null, '💻');
+            addSection('Hosts', details.hosts, null, '🖥️');
+            addSection('Users', details.users, null, '👤');
+        }
+
+        function exportBlastRadius(format) {
+            const data = window.currentBlastData;
+            if (!data) return;
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const filename = `blast_radius_report_${timestamp}`;
+
+            if (format === 'json') {
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                saveAs(blob, `${filename}.json`);
+            } else if (format === 'csv') {
+                // Flatten data for CSV
+                let csvContent = "Category,Value\n";
+                csvContent += `Host Reach,${data.metrics.host_reach}\n`;
+                csvContent += `User Impact,${data.metrics.user_impact}\n`;
+                csvContent += `Lateral Movement,${data.metrics.lateral_movement || 0}\n`;
+                csvContent += `Platform Diversity,${data.metrics.platform_diversity}\n\n`;
+
+                csvContent += "Type,Entity Name\n";
+                data.details.teams.forEach(t => csvContent += `Team,${t}\n`);
+                data.details.platforms.forEach(p => csvContent += `Platform,${p}\n`);
+                data.details.hosts.forEach(h => csvContent += `Host,${h}\n`);
+                data.details.users.forEach(u => csvContent += `User,${u}\n`);
+
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+                saveAs(blob, `${filename}.csv`);
+            }
+            showStatus(`Exported ${format.toUpperCase()} report`);
+        }
+
+        function saveAs(blob, filename) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }, 0);
         }
         function drawRadarChart(scores) {
             const container = d3.select("#radar-chart");
@@ -2539,7 +2161,7 @@
                     .attr("x", 4)
                     .attr("y", -levelFactor)
                     .attr("dy", "0.4em")
-                    .style("font-size", "10px")
+                    .style("font-size", "13px")
                     .attr("fill", "var(--text-secondary)")
                     .text(Math.round((i + 1) * 100 / levels));
             }
@@ -2569,7 +2191,7 @@
                 .attr("y", (d, i) => rScale(115) * Math.sin(angleSlice * i - Math.PI / 2))
                 .text(d => d)
                 .style("fill", "var(--text-primary)")
-                .style("font-weight", "bold");
+                .style("font-weight", "900");
 
             // Draw the radar area
             const radarLine = d3.lineRadial()
@@ -2605,35 +2227,35 @@
                 .text(d => `${d.value}%`);
         }
 
-	        // Add Enter key support for search
-	        document.addEventListener('DOMContentLoaded', function () {
-	            // Load theme preference first
-	            loadThemePreference();
-	            loadExclusionSettings(); // Load custom exclusions
+        // Add Enter key support for search
+        document.addEventListener('DOMContentLoaded', function () {
+            // Load theme preference first
+            loadThemePreference();
+            loadExclusionSettings(); // Load custom exclusions
 
-	            const searchInput = document.getElementById('search-input');
-	            if (searchInput) {
-	                // keypress is deprecated; use keydown
-	                searchInput.addEventListener('keydown', function (e) {
-	                    if (e.key === 'Enter') {
-	                        searchNodes();
-	                    }
-	                });
-	            }
+            const searchInput = document.getElementById('search-input');
+            if (searchInput) {
+                // keypress is deprecated; use keydown
+                searchInput.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') {
+                        searchNodes();
+                    }
+                });
+            }
 
-	            // Filter change handlers
-	            const nodeTypeFilter = document.getElementById('node-type-filter');
-	            const platformFilter = document.getElementById('platform-filter');
-	            const teamFilter = document.getElementById('team-filter');
-	            if (nodeTypeFilter) nodeTypeFilter.addEventListener('change', searchNodes);
-	            if (platformFilter) platformFilter.addEventListener('change', searchNodes);
-	            if (teamFilter) teamFilter.addEventListener('change', searchNodes);
+            // Filter change handlers
+            const nodeTypeFilter = document.getElementById('node-type-filter');
+            const platformFilter = document.getElementById('platform-filter');
+            const teamFilter = document.getElementById('team-filter');
+            if (nodeTypeFilter) nodeTypeFilter.addEventListener('change', searchNodes);
+            if (platformFilter) platformFilter.addEventListener('change', searchNodes);
+            if (teamFilter) teamFilter.addEventListener('change', searchNodes);
 
-	            // Load filters and initial data
-	            loadTeams();
-	            loadPlatforms();
-	            loadGraph();
-	        });
+            // Load filters and initial data
+            loadTeams();
+            loadPlatforms();
+            loadGraph();
+        });
 
         // --- Shadow IT Functions ---
 
@@ -2922,7 +2544,7 @@
 
                 <div style="margin-top: 20px; text-align: right;">
                     <button onclick="authorizeSoftware('${escapeHtml(detection.software_name).replace(/'/g, "\\'")}')" 
-                        style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">
+                        style="background: #39ff14; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">
                         ✅ Authorize Software
                     </button>
                     <div style="font-size: 11px; color: var(--text-secondary); margin-top: 5px;">
@@ -2968,13 +2590,13 @@
             return text.substring(0, maxLength) + '...';
         }
 
-	        async function testDebug() {
-	            const out = document.getElementById('debug-output');
-	            if (!out) {
-	                console.warn('debug-output element not found');
-	                return;
-	            }
-	            out.innerText = "Running debug...";
+        async function testDebug() {
+            const out = document.getElementById('debug-output');
+            if (!out) {
+                console.warn('debug-output element not found');
+                return;
+            }
+            out.innerText = "Running debug...";
 
             try {
                 out.innerText = "Fetching teams...";
