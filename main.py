@@ -15,6 +15,7 @@ from src.ingestion import MemgraphIngestion
 from categorize_software import run_categorization
 import json
 import datetime
+from neo4j import GraphDatabase
 
 STATE_FILE = '.state.json'
 
@@ -142,6 +143,7 @@ Examples:
     parser.add_argument('--full-scan', action='store_true', help='Ignore last run time and fetch ALL data.')
     parser.add_argument('--complete-enrichment', action='store_true', help='Enrich ALL software in database with Wikidata (warning: may take long)')
     parser.add_argument('--enrich-software', help='Comma-separated list of specific software names to enrich immediately')
+    parser.add_argument('--force', action='store_true', help='Force enrichment limit to exceed 250 (uses 3% of total hosts)')
 
     args = parser.parse_args()
 
@@ -277,7 +279,38 @@ Examples:
         # Prioritize rare software (outliers) to enrich Shadow IT detections
         # If --enrich-software is provided, we prioritize those.
         target_names = [n.strip() for n in args.enrich_software.split(',')] if args.enrich_software else None
-        limit = None if args.complete_enrichment else 250
+        
+        limit = None
+        if args.complete_enrichment:
+            limit = None
+            print("🚀 Full enrichment requested (no limit).")
+        else:
+            # Calculate dynamic limit: 3% of total hosts, capped at 250 (unless forced)
+            try:
+                # We need a quick driver check to get total hosts. 
+                # (Ingestion just closed its driver, categorize opens its own, checking here is safe)
+                with GraphDatabase.driver(memgraph_uri) as driver:
+                    with driver.session() as session:
+                        result = session.run("MATCH (h:Host) RETURN count(h) as count")
+                        total_hosts = result.single()['count']
+                        
+                        # 3% threshold
+                        target_limit = int(total_hosts * 0.03)
+                        # Ensure at least minimal enrichment happens (e.g. top 10) if fleet is tiny
+                        target_limit = max(10, target_limit) 
+                        
+                        if args.force:
+                            limit = target_limit
+                            print(f"🎯 Auto-calculated enrichment limit: {limit} (3% of {total_hosts} hosts) -- FORCE ENABLED (ignoring 250 cap)")
+                        else:
+                            limit = min(target_limit, 250)
+                            cap_msg = "(capped at 250)" if target_limit > 250 else ""
+                            print(f"🎯 Auto-calculated enrichment limit: {limit} (3% of {total_hosts} hosts) {cap_msg}")
+                            
+            except Exception as e:
+                print(f"⚠️  Could not query total hosts for limit calculation, defaulting to 250. Error: {e}")
+                limit = 250
+
         run_categorization(memgraph_uri=memgraph_uri, limit=limit, target_names=target_names)
     except Exception as e:
         print(f"⚠️  WARNING: Software categorization failed: {e}")

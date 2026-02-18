@@ -1644,7 +1644,7 @@ def get_shadow_it():
         total_hosts_count = total_hosts_res.single()['count'] or 1
         
         # Thresholds
-        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.05)) # 5% threshold, min 2
+        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.03)) # 3% threshold, min 2
         MANAGED_THRESHOLD = int(total_hosts_count * 0.30) # 30% threshold for "common" software
         
         detections = []
@@ -1751,7 +1751,15 @@ def get_shadow_it():
         
         # ===== DETECTION 2: High-Risk Category Software =====
         if detection_type_filter in ['all', 'high_risk']:
-            # Get all software
+            # Get all software THAT IS RARE enough to be considered Shadow IT
+            # We apply the same outlier threshold here to respect the "Shadow IT = rare/unauthorized" definition.
+            # However, we might want to also flag "High Risk" software even if widespread?
+            # User specifically asked: "why am i seeing host count 70.; the idea of Shadow IT is to display only items thats are less than 3% of the total"
+            # So user wants STRICT percentages even for High Risk items in this view.
+            
+            # Add outlier_threshold to filter_params if not already there (it might be from outlier block)
+            filter_params['outlier_threshold'] = OUTLIER_THRESHOLD
+
             all_software_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
@@ -1759,6 +1767,7 @@ def get_shadow_it():
                 COUNT(DISTINCT h) AS host_count,
                 COLLECT(DISTINCT h.hostname) AS hosts,
                 COLLECT(DISTINCT h.platform) AS platforms
+                WHERE host_count <= $outlier_threshold 
                 RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
             """
             
