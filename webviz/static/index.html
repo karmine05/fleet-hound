@@ -329,6 +329,236 @@
             background: #00f3ff;
             color: #000;
         }
+
+        /* Particle Background Canvas */
+        #particles-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        /* Keyboard Shortcuts Modal */
+        .shortcuts-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 9999;
+            animation: modalSlideIn 0.3s ease-out;
+        }
+
+        @keyframes modalSlideIn {
+            from {
+                opacity: 0;
+                transform: translate(-50%, -50%) scale(0.9);
+            }
+            to {
+                opacity: 1;
+                transform: translate(-50%, -50%) scale(1);
+            }
+        }
+
+        .shortcuts-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 8px 24px;
+        }
+
+        .kbd {
+            background: rgba(0, 243, 255, 0.1);
+            border: 1px solid rgba(0, 243, 255, 0.3);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-family: 'VT323', monospace;
+            font-size: 14px;
+            color: #00f3ff;
+        }
+
+        /* Enhanced Button Animations */
+        .cyber-btn {
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .cyber-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s ease;
+        }
+
+        .cyber-btn:hover::before {
+            left: 100%;
+        }
+
+        .cyber-btn:active {
+            transform: scale(0.95);
+        }
+
+        /* Node Highlight Animation */
+        @keyframes nodePulse {
+            0%, 100% {
+                filter: drop-shadow(0 0 5px rgba(0, 243, 255, 0.6));
+            }
+            50% {
+                filter: drop-shadow(0 0 20px rgba(0, 243, 255, 1));
+            }
+        }
+
+        .node-highlighted circle {
+            animation: nodePulse 1s ease-in-out infinite;
+        }
+
+        /* Search Match Highlight */
+        .search-match {
+            background: rgba(57, 255, 20, 0.3);
+            border-radius: 2px;
+            padding: 0 2px;
+        }
+
+        /* Loading Skeleton */
+        @keyframes skeletonPulse {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 0.8; }
+        }
+
+        .skeleton {
+            background: linear-gradient(90deg, #1a1a1a 25%, #2a2a2a 50%, #1a1a1a 75%);
+            background-size: 200% 100%;
+            animation: skeletonPulse 1.5s ease-in-out infinite;
+        }
+
+        /* Toast Container */
+        #toast-container {
+            position: fixed;
+            top: 80px;
+            right: 20px;
+            z-index: 10000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-family: 'VT323', monospace;
+            font-size: 16px;
+            animation: toastSlideIn 0.3s ease-out;
+            min-width: 250px;
+        }
+
+        .toast-success {
+            background: rgba(57, 255, 20, 0.15);
+            border: 1px solid #39ff14;
+            color: #39ff14;
+        }
+
+        .toast-error {
+            background: rgba(255, 0, 85, 0.15);
+            border: 1px solid #ff0055;
+            color: #ff0055;
+        }
+
+        .toast-info {
+            background: rgba(0, 243, 255, 0.15);
+            border: 1px solid #00f3ff;
+            color: #00f3ff;
+        }
+
+        @keyframes toastSlideIn {
+            from {
+                opacity: 0;
+                transform: translateX(100px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        /* Tab hover effect */
+        .tab-btn {
+            position: relative;
+        }
+
+        .tab-btn::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            width: 0;
+            height: 2px;
+            background: #00f3ff;
+            transition: all 0.3s ease;
+            transform: translateX(-50%);
+        }
+
+        .tab-btn:hover::after {
+            width: 80%;
+        }
+
+        /* Graph container transition */
+        #graph {
+            transition: all 0.3s ease;
+        }
+
+        /* Enhanced scrollbar for modal */
+        .custom-scroll::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .custom-scroll::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 4px;
+        }
+
+        .custom-scroll::-webkit-scrollbar-thumb {
+            background: rgba(0, 243, 255, 0.5);
+            border-radius: 4px;
+        }
+
+        .custom-scroll::-webkit-scrollbar-thumb:hover {
+            background: #00f3ff;
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 1200px) {
+            .blast-dashboard {
+                grid-template-columns: 1fr !important;
+            }
+        }
+
+        @media (max-width: 768px) {
+            header {
+                flex-direction: column;
+                height: auto;
+                padding: 12px;
+                gap: 12px;
+            }
+
+            .controls {
+                flex-wrap: wrap;
+                justify-content: center;
+            }
+
+            .search-container {
+                width: 100% !important;
+            }
+
+            nav.tabs {
+                overflow-x: auto;
+            }
+        }
     </style>
 </head>
 
@@ -337,6 +567,39 @@
 
     <!-- Scanline Overlay -->
     <div class="scanlines"></div>
+
+    <!-- Particle Background -->
+    <canvas id="particles-canvas"></canvas>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+
+    <!-- Keyboard Shortcuts Modal -->
+    <div id="shortcuts-modal" class="fixed inset-0 z-[9998] hidden bg-black/80 backdrop-blur-sm" onclick="closeShortcuts(event)">
+        <div class="shortcuts-modal" onclick="event.stopPropagation()">
+            <div class="bg-cyber-dark border-2 border-cyber-cyan rounded-2xl p-8 shadow-[0_0_60px_rgba(0,243,255,0.4)] max-w-md">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-xl font-black font-orbitron text-cyber-cyan tracking-wider">KEYBOARD_SHORTCUTS</h2>
+                    <button onclick="closeShortcuts()" class="text-gray-500 hover:text-white text-3xl transition-colors">&times;</button>
+                </div>
+                <div class="shortcuts-grid text-sm text-gray-300 font-rajdhani">
+                    <span class="kbd">?</span><span>Show keyboard shortcuts</span>
+                    <span class="kbd">/</span><span>Focus search input</span>
+                    <span class="kbd">Esc</span><span>Clear search / Close modal</span>
+                    <span class="kbd">Enter</span><span>Execute search</span>
+                    <span class="kbd">G</span><span>Switch to Graph view</span>
+                    <span class="kbd">B</span><span>Switch to Blast Radius</span>
+                    <span class="kbd">S</span><span>Switch to Shadow Ops</span>
+                    <span class="kbd">R</span><span>Reset graph view</span>
+                    <span class="kbd">L</span><span>Reload data</span>
+                    <span class="kbd">←→</span><span>Navigate tabs</span>
+                    <span class="kbd">+</span><span>Zoom in graph</span>
+                    <span class="kbd">-</span><span>Zoom out graph</span>
+                    <span class="kbd">0</span><span>Reset graph zoom</span>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Header -->
     <header
@@ -472,7 +735,7 @@
                     <div class="space-y-4">
                         <div class="flex flex-col gap-2">
                             <label>Target Team Mapping</label>
-                            <select id="blast-team-filter" onchange="calculateBlastRadius()"
+                            <select id="blast-team-filter" onchange="onBlastTeamChange()"
                                 class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold focus:border-cyber-pink outline-none shadow-inner"></select>
                         </div>
 
@@ -609,6 +872,28 @@
                                 <option value="outlier">Statistical Outlier</option>
                                 <option value="high_risk">Categorical Risk</option>
                                 <option value="version_sprawl">Version Sprawl</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <label>Units (Host Count)</label>
+                            <select id="shadow-host-count-filter"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
+                                <option value="all">UNFILTERED</option>
+                                <option value="1">&lt; 2 hosts</option>
+                                <option value="2">&lt; 3 hosts</option>
+                                <option value="3">&lt; 5 hosts</option>
+                                <option value="3+">3+ hosts</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <label>Idents (User Count)</label>
+                            <select id="shadow-user-count-filter"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
+                                <option value="all">UNFILTERED</option>
+                                <option value="2">&lt; 3 users</option>
+                                <option value="4">&lt; 5 users</option>
+                                <option value="9">&lt; 10 users</option>
+                                <option value="10+">10+ users</option>
                             </select>
                         </div>
 
@@ -1677,16 +1962,31 @@
         let blastEntities = [];
         let searchTimeout;
 
+        function onBlastTeamChange() {
+            // Reload entities list with new team filter
+            loadBlastEntities();
+            // If there's a currently selected entity, recalculate blast radius
+            if (selectedBlastEntity) {
+                calculateBlastRadius();
+            }
+        }
+
         function loadBlastEntities() {
             const type = document.getElementById('blast-type-selector').value;
+            const teamFilter = document.getElementById('blast-team-filter').value;
             const listContainer = document.getElementById('blast-entity-list');
             listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">Loading...</div>';
 
             document.getElementById('blast-search').value = ''; // Clear search box
 
+            // Build URL with team filter if selected
+            let url = `/api/search?type=${type}&limit=1000`;
+            if (teamFilter && teamFilter !== 'all') {
+                url += `&team=${encodeURIComponent(teamFilter)}`;
+            }
+
             // Use the existing search endpoint to get all entities of a type
-            // Passing 'q=' gets all, but we increase limit to 1000 to get a good list
-            fetch(`/api/search?type=${type}&limit=1000`)
+            fetch(url)
                 .then(res => res.json())
                 .then(data => {
                     // Extract relevant nodes
@@ -2628,6 +2928,306 @@
                 console.error(e);
             }
         }
+
+        // ============== ENHANCED FEATURES ==============
+
+        // Particle Background Effect
+        (function initParticles() {
+            const canvas = document.getElementById('particles-canvas');
+            if (!canvas) return;
+
+            const ctx = canvas.getContext('2d');
+            let particles = [];
+            let animationId;
+
+            function resize() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            }
+
+            function createParticles() {
+                particles = [];
+                const count = Math.floor((canvas.width * canvas.height) / 15000);
+                for (let i = 0; i < count; i++) {
+                    particles.push({
+                        x: Math.random() * canvas.width,
+                        y: Math.random() * canvas.height,
+                        vx: (Math.random() - 0.5) * 0.5,
+                        vy: (Math.random() - 0.5) * 0.5,
+                        size: Math.random() * 2 + 0.5,
+                        opacity: Math.random() * 0.5 + 0.1
+                    });
+                }
+            }
+
+            function drawParticles() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                particles.forEach(p => {
+                    p.x += p.vx;
+                    p.y += p.vy;
+
+                    // Wrap around edges
+                    if (p.x < 0) p.x = canvas.width;
+                    if (p.x > canvas.width) p.x = 0;
+                    if (p.y < 0) p.y = canvas.height;
+                    if (p.y > canvas.height) p.y = 0;
+
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fillStyle = `rgba(0, 243, 255, ${p.opacity})`;
+                    ctx.fill();
+                });
+
+                // Draw connections
+                particles.forEach((p1, i) => {
+                    particles.slice(i + 1).forEach(p2 => {
+                        const dx = p1.x - p2.x;
+                        const dy = p1.y - p2.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+
+                        if (dist < 100) {
+                            ctx.beginPath();
+                            ctx.moveTo(p1.x, p1.y);
+                            ctx.lineTo(p2.x, p2.y);
+                            ctx.strokeStyle = `rgba(0, 243, 255, ${0.1 * (1 - dist / 100)})`;
+                            ctx.stroke();
+                        }
+                    });
+                });
+
+                animationId = requestAnimationFrame(drawParticles);
+            }
+
+            // Initialize
+            resize();
+            createParticles();
+            drawParticles();
+
+            window.addEventListener('resize', () => {
+                resize();
+                createParticles();
+            });
+        })();
+
+        // Toast Notifications
+        function showToast(message, type = 'info', duration = 3000) {
+            const container = document.getElementById('toast-container');
+            if (!container) return;
+
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+
+            setTimeout(() => {
+                toast.style.animation = 'toastSlideIn 0.3s ease-out reverse';
+                setTimeout(() => toast.remove(), 300);
+            }, duration);
+        }
+
+        // Keyboard Shortcuts
+        function openShortcuts() {
+            document.getElementById('shortcuts-modal').classList.remove('hidden');
+        }
+
+        function closeShortcuts(event) {
+            if (!event || event.target.id === 'shortcuts-modal') {
+                document.getElementById('shortcuts-modal').classList.add('hidden');
+            }
+        }
+
+        // Graph zoom functions
+        function zoomIn() {
+            const graphDiv = document.getElementById('graph');
+            if (graphDiv && graphDiv.__d3Zoom) {
+                graphDiv.__d3Zoom.scaleBy(1.3);
+            }
+        }
+
+        function zoomOut() {
+            const graphDiv = document.getElementById('graph');
+            if (graphDiv && graphDiv.__d3Zoom) {
+                graphDiv.__d3Zoom.scaleBy(0.7);
+            }
+        }
+
+        function resetZoom() {
+            const graphDiv = document.getElementById('graph');
+            if (graphDiv && graphDiv.__d3Zoom) {
+                graphDiv.__d3Zoom.transform(d3.zoomIdentity);
+            }
+        }
+
+        // Enhanced keyboard event handler
+        document.addEventListener('keydown', function(e) {
+            // Don't trigger shortcuts when typing in inputs
+            const tag = e.target.tagName.toLowerCase();
+            const isInput = tag === 'input' || tag === 'textarea';
+
+            // ? - Show shortcuts
+            if (e.key === '?' && !isInput) {
+                e.preventDefault();
+                openShortcuts();
+                return;
+            }
+
+            // / - Focus search (unless in modal)
+            if (e.key === '/' && !isInput) {
+                e.preventDefault();
+                document.getElementById('search-input').focus();
+                return;
+            }
+
+            // Esc - Close modals or clear search
+            if (e.key === 'Escape') {
+                const shortcutsModal = document.getElementById('shortcuts-modal');
+                if (!shortcutsModal.classList.contains('hidden')) {
+                    closeShortcuts();
+                    return;
+                }
+                if (isInput) {
+                    e.target.blur();
+                    clearSearch();
+                }
+                return;
+            }
+
+            // View switching shortcuts (only when not in input)
+            if (!isInput) {
+                switch(e.key.toLowerCase()) {
+                    case 'g':
+                        switchView('graph');
+                        showToast('View: Graph Matrix', 'info', 1500);
+                        break;
+                    case 'b':
+                        switchView('blast-radius');
+                        showToast('View: Blast Radius', 'info', 1500);
+                        break;
+                    case 's':
+                        switchView('shadow-it');
+                        showToast('View: Shadow Ops', 'info', 1500);
+                        break;
+                    case 'r':
+                        resetToOverview();
+                        showToast('Graph reset', 'success', 1500);
+                        break;
+                    case 'l':
+                        loadGraph();
+                        showToast('Reloading data...', 'info', 1500);
+                        break;
+                    case '+':
+                    case '=':
+                        zoomIn();
+                        break;
+                    case '-':
+                        zoomOut();
+                        break;
+                    case '0':
+                        resetZoom();
+                        break;
+                }
+
+                // Tab navigation with arrow keys
+                if (e.key === 'ArrowRight' && e.altKey) {
+                    const tabs = document.querySelectorAll('.tab-btn');
+                    const activeIndex = Array.from(tabs).findIndex(t => t.classList.contains('active'));
+                    if (activeIndex < tabs.length - 1) {
+                        tabs[activeIndex + 1].click();
+                    }
+                }
+                if (e.key === 'ArrowLeft' && e.altKey) {
+                    const tabs = document.querySelectorAll('.tab-btn');
+                    const activeIndex = Array.from(tabs).findIndex(t => t.classList.contains('active'));
+                    if (activeIndex > 0) {
+                        tabs[activeIndex - 1].click();
+                    }
+                }
+            }
+
+            // Enter - Execute search
+            if (e.key === 'Enter' && isInput && e.target.id === 'search-input') {
+                searchNodes();
+            }
+        });
+
+        // Enhance search with animation
+        const originalSearchNodes = searchNodes;
+        searchNodes = function() {
+            const btn = document.querySelector('button[onclick="searchNodes()"]');
+            if (btn) {
+                btn.classList.add('cyber-btn');
+            }
+            originalSearchNodes();
+        };
+
+        // Enhanced graph loading feedback
+        const originalLoadGraph = loadGraph;
+        loadGraph = function() {
+            const graphDiv = document.getElementById('graph');
+            if (graphDiv) {
+                graphDiv.style.opacity = '0.5';
+                graphDiv.style.transition = 'opacity 0.3s ease';
+            }
+
+            originalLoadGraph();
+
+            // Restore opacity after a delay
+            setTimeout(() => {
+                if (graphDiv) {
+                    graphDiv.style.opacity = '1';
+                }
+            }, 500);
+        };
+
+        // Add transition to graph render
+        const originalRenderGraph = renderGraph;
+        renderGraph = function(data) {
+            const graphDiv = document.getElementById('graph');
+            if (graphDiv) {
+                graphDiv.style.transition = 'opacity 0.2s ease';
+            }
+            originalRenderGraph(data);
+        };
+
+        // Enhanced status display with toast
+        const originalShowStatus = showStatus;
+        showStatus = function(message, isError = false) {
+            originalShowStatus(message, isError);
+            if (!isError && message.includes('Loaded')) {
+                showToast(message, 'success', 2000);
+            }
+        };
+
+        // Export enhancements with feedback
+        const originalExportAsCSV = exportAsCSV;
+        exportAsCSV = function() {
+            showToast('Exporting CSV...', 'info', 1500);
+            setTimeout(originalExportAsCSV, 100);
+        };
+
+        const originalExportAsJSON = exportAsJSON;
+        exportAsJSON = function() {
+            showToast('Exporting JSON...', 'info', 1500);
+            setTimeout(originalExportAsJSON, 100);
+        };
+
+        // Add loading skeleton style for future use
+        function showSkeleton(elementId) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.classList.add('skeleton');
+            }
+        }
+
+        function hideSkeleton(elementId) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.classList.remove('skeleton');
+            }
+        }
+
+        console.log('Fleet Hound UI Enhancements Loaded');
     </script>
 </body>
 

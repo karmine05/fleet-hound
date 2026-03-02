@@ -1007,17 +1007,30 @@ def get_blast_radius():
                     teams.add(h['team_name'])
             details['teams'] = list(teams)
             
-            # Impacted users
+            # Impacted users - filter by team if selected
             if hosts:
                 host_names = [h['hostname'] for h in hosts]
-                
-                user_query = f"""
-                    MATCH (u:User)-[:USES]->(h:Host)
-                    WHERE h.hostname IN $hostnames {user_exclusion_clause}
-                    RETURN collect(DISTINCT u.username) as users
-                """
-                query_params = {**params, "hostnames": host_names}
-                
+
+                # Build base params
+                base_params = {"id": node_id, "hostnames": host_names}
+
+                # Filter users by team if specified
+                if team_filter != 'all':
+                    # Only include users on hosts belonging to the selected team
+                    user_query = """
+                        MATCH (u:User)-[:USES]->(h:Host)
+                        WHERE h.hostname IN $hostnames AND toString(h.team_id) = $team_id {user_exclusion_clause}
+                        RETURN collect(DISTINCT u.username) as users
+                    """.format(user_exclusion_clause=user_exclusion_clause)
+                    query_params = {**base_params, "team_id": team_filter}
+                else:
+                    user_query = """
+                        MATCH (u:User)-[:USES]->(h:Host)
+                        WHERE h.hostname IN $hostnames {user_exclusion_clause}
+                        RETURN collect(DISTINCT u.username) as users
+                    """.format(user_exclusion_clause=user_exclusion_clause)
+                    query_params = base_params
+
                 user_res = session.run(user_query, **query_params)
                 impacted_users = user_res.single()['users']
                 metrics['user_impact'] = len(impacted_users)
