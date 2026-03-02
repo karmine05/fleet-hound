@@ -37,8 +37,14 @@ USER_AGENT = 'FleetBloodhoundSoftwareCategorizer/1.0 (+https://github.com/fleetd
 
 def _escape_sparql_string_literal(value: str) -> str:
     """Escape a Python string so it is safe inside a SPARQL double-quoted literal."""
-    # Minimal escaping: backslash first, then quotes.
-    return value.replace('\\', '\\\\').replace('"', '\\"')
+    # Escape backslash first, then other special characters
+    return (
+        value.replace('\\', '\\\\')
+        .replace('"', '\\"')
+        .replace('\n', '\\n')
+        .replace('\r', '\\r')
+        .replace('\t', '\\t')
+    )
 
 def get_wikidata_info(software_name: str, session: requests.Session) -> Optional[Tuple[List[str], Optional[str]]]:
     """
@@ -217,5 +223,5 @@ if __name__ == "__main__":
     parser.add_argument('--names', help="Comma-separated list of specific software names to enrich")
     args = parser.parse_args()
     
-    name_list = [n.strip() for n in args.names.split(',')] if args.names else None
+    name_list = [n.strip() for n in args.names.split(',') if n.strip()] if args.names and args.names.strip() else None
     run_categorization(memgraph_uri=args.memgraph_uri, limit=None if args.limit == 0 else args.limit, target_names=name_list)

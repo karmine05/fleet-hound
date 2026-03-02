@@ -227,6 +227,23 @@ def search_all():
             "error": "Search term too long",
             "message": "q must be <= 200 characters",
         }), 400
+
+    # Validate regex complexity to prevent ReDoS
+    if search_mode == 'regex':
+        if search_term.count('(') > 10 or search_term.count('*') > 10 or search_term.count('+') > 10:
+            return jsonify({
+                "error": "Invalid regex pattern",
+                "message": "Regex contains too many quantifiers or groups",
+            }), 400
+        # Test regex compilation to catch invalid patterns early
+        try:
+            import re
+            re.compile(search_term)
+        except re.error as e:
+            return jsonify({
+                "error": "Invalid regex pattern",
+                "message": str(e),
+            }), 400
     
     # Limit parameter
     try:
@@ -1523,8 +1540,7 @@ def health_check():
             result.single()
         return jsonify({
             "status": "healthy",
-            "database": "connected",
-            "memgraph_uri": MEMGRAPH_URI
+            "database": "connected"
         }), 200
     except Exception as e:
         logger.error(f"Health check failed: {e}")

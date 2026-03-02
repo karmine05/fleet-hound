@@ -4,7 +4,7 @@ import sys
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Any
 
 # Suppress SSL warnings when using --insecure flag
 import urllib3
@@ -20,7 +20,7 @@ from neo4j import GraphDatabase
 STATE_FILE = '.state.json'
 
 
-def load_env_file(env_path: str = '.env') -> dict:
+def load_env_file(env_path: str = '.env') -> Dict[str, str]:
     """Load environment variables from .env file."""
     env_vars = {}
     env_file = Path(env_path)
@@ -57,7 +57,10 @@ def str_to_bool(value: str) -> bool:
     return value.lower() in ('true', '1', 'yes', 'on')
 
 
-def load_state() -> dict:
+from typing import Optional, Dict, Any, List, Tuple
+
+
+def load_state() -> Dict[str, Any]:
     """Load the state file."""
     if Path(STATE_FILE).exists():
         try:
@@ -70,7 +73,7 @@ def load_state() -> dict:
     return {}
 
 
-def save_state(state: dict):
+def save_state(state: Dict[str, Any]) -> None:
     """Save the state file."""
     tmp_path = None
     try:
@@ -278,7 +281,7 @@ Examples:
     try:
         # Prioritize rare software (outliers) to enrich Shadow IT detections
         # If --enrich-software is provided, we prioritize those.
-        target_names = [n.strip() for n in args.enrich_software.split(',')] if args.enrich_software else None
+        target_names = [n.strip() for n in args.enrich_software.split(',') if n.strip()] if args.enrich_software and args.enrich_software.strip() else None
         
         limit = None
         if args.complete_enrichment:
@@ -292,7 +295,8 @@ Examples:
                 with GraphDatabase.driver(memgraph_uri) as driver:
                     with driver.session() as session:
                         result = session.run("MATCH (h:Host) RETURN count(h) as count")
-                        total_hosts = result.single()['count']
+                        record = result.single()
+                        total_hosts = record['count'] if record else 0
                         
                         # 3% threshold
                         target_limit = int(total_hosts * 0.03)

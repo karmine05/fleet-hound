@@ -1,9 +1,10 @@
 import requests
 import time
 import concurrent.futures
+from typing import List, Dict, Any, Optional
 
 class FleetGraphExtractor:
-    def extract_all_users(self):
+    def extract_all_users(self) -> List[Dict[str, Any]]:
         """Fetch all users from Fleet's /api/v1/fleet/users endpoint."""
         users = []
         per_page = 500

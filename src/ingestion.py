@@ -1,25 +1,26 @@
 from neo4j import GraphDatabase
 from neo4j.exceptions import TransientError
 import time
+from typing import Any, Dict, List, Optional
 
 class MemgraphIngestion:
-    def __init__(self, uri="bolt://localhost:7687"):
+    def __init__(self, uri: str = "bolt://localhost:7687") -> None:
         self.driver = GraphDatabase.driver(uri)
-        self.batch_size = 5000  # Optimized batch size
-        self.max_retries = 3
+        self.batch_size: int = 5000  # Optimized batch size
+        self.max_retries: int = 3
 
-    def close(self):
+    def close(self) -> None:
         """Close the underlying database driver."""
         self.driver.close()
 
-    def __enter__(self):
+    def __enter__(self) -> 'MemgraphIngestion':
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         self.close()
         return False
 
-    def create_constraints(self):
+    def create_constraints(self) -> None:
         """Create unique constraints on graph nodes."""
         with self.driver.session() as session:
             # Try to create constraints, ignore if they already exist
@@ -35,7 +36,7 @@ class MemgraphIngestion:
                     # Constraint already exists, ignore
                     pass
 
-    def create_graph_relationships(self, hosts_data, extractor, global_users=None):
+    def create_graph_relationships(self, hosts_data: List[Dict[str, Any]], extractor: Any, global_users: Optional[List[Dict[str, Any]]] = None) -> None:
         """
         Ingest hosts, users, software, and relationships into Memgraph.
 

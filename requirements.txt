@@ -1,4 +1,4 @@
-flask==3.0.2
-requests==2.31.0
-neo4j==5.22.0
-gunicorn==21.2.0
+flask==3.0.3
+requests==2.32.3
+neo4j==5.25.0
+gunicorn==23.0.0
