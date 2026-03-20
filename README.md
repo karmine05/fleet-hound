@@ -40,75 +40,113 @@
   <img src="assets/shadow_details.png" width="48%" alt="Detection Details Modal" />
 </p>
 
----
+## Technical Architecture
 
-## 🏗️ Technical Architecture
+### Backend (Flask)
+- **`/api/graph/full`**: Returns filtered overview graph (important software only)
+- **`/api/host/<hostname>/software`**: Returns ALL software for specific host
+- **`/api/software/<name>/hosts`**: Returns ALL hosts with specific software
+- **Error Handling**: Graceful fallback for failed requests
+- **Performance**: Optimized queries for 2K+ assets
 
-Fleet Hound utilizes a high-performance ETL pipeline to bridge device management and graph theory.
+### Frontend (D3.js)
+- **Force Simulation**: Interactive physics-based layout
+- **Node Types**: Hosts (blue), Users (green), Software (red)  
+- **Drag & Drop**: Repositionable nodes with physics
+- **Zoom & Pan**: Navigate large graphs efficiently
+- **Type-aware Expansion**: Different endpoints for different node types
 
-```mermaid
-graph LR
-    Fleet["Fleet API"] -->|Extract| ETL["Python ETL Engine (Multithreaded)"]
-    ETL -->|State Check| Persistence[".state.json"]
-    ETL -->|LOAD| Memgraph[("Memgraph (In-Memory Graph)")]
-    Memgraph <-->|Query/Visual| WebUI["Flask Web Dashboard (D3.js)"]
-    
-    subgraph "Infrastructure Layer"
-    Memgraph
-    WebUI
-    end
-```
+## Docker Deployment
 
----
-
-## 📦 Rapid Deployment
-
-### 1. Environment Preparation
+### Build and Run
 ```bash
-cp .env.example .env
-# Configure FLEET_URL and FLEET_API_TOKEN
+# Build the dashboard
+docker build -t fleet-webviz .
+
+# Run with custom network (recommended)
+docker run -d --name fleet-webviz --network fleet-network -p 8080:8080 fleet-webviz
+
+# Access at http://localhost:8080
 ```
 
-### 2. Orchestration
+### Development Mode
 ```bash
-./start.sh
+# Local development
+cd webviz
+python3 app.py
+
+# Access at http://localhost:8080
 ```
-- **Web Dashboard**: `http://localhost:8080`
-- **Bolt Protocol**: `bolt://localhost:7687`
 
-### 3. Data Synchronization
-| Mode | Command | Frequency |
-| :--- | :--- | :--- |
-| **Full Baseline** | `python3 main.py --full-scan` | Weekly / Initial |
-| **Delta Sync** | `python3 main.py` | Hourly / On-Demand |
-| **Complete Enrichment** | `python3 main.py --complete-enrichment` | For 100% Coverage ** NOT RECOMMENDED **| 
-| **Targeted Sync** | `python3 main.py --teams 5` | Per Incident |
- 
+## Configuration
+
+### Environment Variables
+- **`MEMGRAPH_URI`**: Database connection (default: `bolt://memgraph:7687`)
+- **`PORT`**: Web server port (default: `8080`)
+
+### Network Requirements
+- Dashboard must be on same Docker network as Memgraph
+- Uses container name `memgraph` for database connection
+- External access via port 8080
+
+## API Endpoints
+
+### Graph Data
+- `GET /api/graph/full` - Complete graph with filtering
+- `GET /api/host/<hostname>/software` - All software for host
+- `GET /api/software/<name>/hosts` - All hosts with software
+
+### Response Format
+```json
+{
+  "nodes": [
+    {"id": "hostname", "type": "Host", "details": {...}},
+    {"id": "software", "type": "Software", "details": {...}}
+  ],
+  "links": [
+    {"source": "software", "target": "hostname", "type": "INSTALLED_ON"}
+  ]
+}
+```
+
+## Performance Optimizations
+
+### Graph Filtering
+- Shows only "important" software in main view (Chrome, Office, etc.)
+- Full data available via node expansion
+- Prevents visualization overload with 1800+ software packages
+
+### API Design
+- Type-specific endpoints for complete data access
+- Caching-friendly structure
+- Minimal payload for initial load
+
+### Frontend Optimization
+- Efficient D3.js force simulation
+- Lazy loading of extended relationships
+- Debounced search and filtering
+
+## Troubleshooting
+
+### Common Issues
+```bash
+# Dashboard not connecting to database
+docker logs fleet-webviz
+
+# Network connectivity issues
+docker network inspect fleet-network
+
+# Performance issues
+# Check browser console for JavaScript errors
+# Verify Memgraph is responsive at localhost:3000
+```
+
+### Dependencies
+- Python 3.11+
+- Flask web framework
+- Neo4j driver for Memgraph
+- D3.js for frontend visualization
+
 ---
- 
-## 🔍 Software Enrichment Tools
 
-The categorization engine enriches your data with metadata from Wikidata.
-
-| Feature | Command |
-| :--- | :--- |
-| **Automatic** | Enabled by default during `main.py` (targets top 250 outliers). |
-| **Specific Apps** | `python3 main.py --enrich-software "Zoom,Docker"` |
-| **Full Database** | `python3 main.py --complete-enrichment` |
-| **Standalone CLI** | `python3 categorize_software.py --limit 1000 --names "App1,App2"` |
-
-*Includes a visual progress bar and automatic transaction retry logic for large datasets.*
-
----
-
-## 🔐 Data Privacy & Sanitization
-*Fleet Hound is designed with privacy-first principles.*
-- **Local Sovereignty**: All graph data remains within your local Docker volumes.
-- **Sanitized Exports**: Built-in capabilities to obscure PII (Usernames/Hostnames) for reporting.
-- **Audit Logs**: All whitelisting/authorization actions are recorded in `audit.log`.
-
----
-
-## 📄 Governance
-Licensed under the **MIT License**. Maintained for modern security operations.
-*Built for Security Engineers. Loved by Risk Professionals.*
+This dashboard provides comprehensive Fleet security analysis with BloodHound-style relationship mapping and modern web interface.

@@ -531,7 +531,23 @@
             background: #00f3ff;
         }
 
-        /* Responsive adjustments */
+        /* Small Switch for Header */
+        .switch-small input:checked + .slider {
+            background-color: #00f3ff;
+        }
+
+        .switch-small input:checked + .slider:before {
+            transform: translateX(16px);
+        }
+
+        .switch-small .slider.round {
+            border-radius: 20px;
+        }
+
+        .switch-small .slider.round:before {
+            border-radius: 50%;
+        }
+
         @media (max-width: 1200px) {
             .blast-dashboard {
                 grid-template-columns: 1fr !important;
@@ -657,6 +673,17 @@
                     class="h-9 bg-cyber-panel border border-cyber-border rounded text-xs px-3 text-white focus:border-cyber-cyan outline-none uppercase font-bold tracking-wider cursor-pointer hover:border-gray-400 transition-colors">
                     <option value="all">TEAM: ALL</option>
                 </select>
+
+                <div class="h-9 flex items-center bg-cyber-panel border border-cyber-border rounded px-3 gap-3">
+                    <label class="m-0 text-[10px] font-black text-cyber-cyan cursor-pointer whitespace-nowrap"
+                        for="aggregate-software-toggle">AGGREGATE_SW</label>
+                    <label class="switch-small relative inline-block w-8 h-4">
+                        <input type="checkbox" id="aggregate-software-toggle" onchange="toggleAggregation()"
+                            class="opacity-0 w-0 h-0">
+                        <span
+                            class="slider round absolute cursor-pointer inset-0 bg-gray-700 rounded-full transition-all before:absolute before:h-3 before:w-3 before:left-0.5 before:bottom-0.5 before:bg-white before:rounded-full before:transition-all shadow-md"></span>
+                    </label>
+                </div>
 
                 <div class="flex gap-1">
                     <button onclick="searchNodes()"
@@ -875,6 +902,21 @@
                             </select>
                         </div>
                         <div class="flex flex-col gap-2">
+                            <label>Asset Type</label>
+                            <select id="shadow-software-type-filter"
+                                class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
+                                <option value="all">ALL_TYPES</option>
+                                <option value="Application">Application</option>
+                                <option value="Browser Extension">Browser Extension</option>
+                                <option value="VSCode Extension">VSCode Extension</option>
+                                <option value="npm Package">npm Package</option>
+                                <option value="Python Package">Python Package</option>
+                                <option value="OS Component">OS Component</option>
+                                <option value="Developer Tool">Developer Tool</option>
+                                <option value="Security Software">Security Software</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-2">
                             <label>Units (Host Count)</label>
                             <select id="shadow-host-count-filter"
                                 class="w-full bg-cyber-panel border border-cyber-border rounded-lg text-sm p-3 font-bold outline-none focus:border-cyber-cyan">
@@ -1036,22 +1078,18 @@
         </div>
     </div>
 
-    <!-- Hidden placeholders for legacy JS compatibility -->
     <div style="display:none;">
-        <select id="shadow-software-type-filter">
-            <option value="all">all</option>
-        </select>
-        <select id="shadow-host-count-filter">
-            <option value="all">all</option>
-        </select>
-        <select id="shadow-user-count-filter">
-            <option value="all">all</option>
-        </select>
+        <!-- Cleaned up duplicate placeholders -->
     </div>
 
     <script>
         // Constants and State
-        const DEFAULT_ACCOUNTS = ['root', 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount'];
+        const DEFAULT_ACCOUNTS = [
+            'root', 'administrator', 'guest', 'defaultaccount', 'wdagutilityaccount', 
+            'admin', 'krbtgt', 'system', 'local service', 'network service',
+            'trustedinstaller', 'sshd', 'nobody', 'dbus', 'syslog', 'messagebus',
+            'nt authority\\system', 'nt authority\\local service', 'nt authority\\network service'
+        ];
         let customExclusions = [];
 
         let currentData = { nodes: [], links: [] };
@@ -1060,6 +1098,33 @@
 
         // Search mode state
         let searchMode = 'wildcard'; // 'wildcard', 'exact', 'regex'
+        let aggregateSoftware = localStorage.getItem('aggregateSoftware') === 'true';
+
+        // Initialize UI state
+        document.addEventListener('DOMContentLoaded', () => {
+            const toggle = document.getElementById('aggregate-software-toggle');
+            if (toggle) toggle.checked = aggregateSoftware;
+            
+            // Initial load of some data if needed or just wait for user
+            loadStats();
+            loadPlatforms();
+            loadTeams();
+        });
+
+        function toggleAggregation() {
+            aggregateSoftware = document.getElementById('aggregate-software-toggle').checked;
+            localStorage.setItem('aggregateSoftware', aggregateSoftware);
+            
+            // Refresh current view
+            const activeTab = document.querySelector('.tab-btn.active').dataset.tab;
+            if (activeTab === 'graph') {
+                searchNodes();
+            } else if (activeTab === 'blast-radius') {
+                loadBlastRadius();
+            } else if (activeTab === 'shadow-it') {
+                loadShadowITDetections();
+            }
+        }
         let caseSensitive = false;
 
         // Toggle case sensitivity
@@ -1519,7 +1584,7 @@
                 }
                 showStatus(statusMsg);
 
-                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${modeParam}${caseParam}`)
+                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${modeParam}${caseParam}&aggregate_software=${aggregateSoftware}`)
                     .then(response => response.json())
                     .then(data => {
                         console.log(`Search results (term: "${searchTerm}", type: ${nodeTypeFilter}, platform: ${platformFilter}):`, data);
@@ -2046,7 +2111,7 @@
                 const listContainer = document.getElementById('blast-entity-list');
                 listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">Searching...</div>';
 
-                fetch(`/api/search?type=${type}&q=${encodeURIComponent(term)}&limit=100`)
+                fetch(`/api/search?type=${type}&q=${encodeURIComponent(term)}&limit=100&aggregate_software=${aggregateSoftware}`)
                     .then(res => res.json())
                     .then(data => {
                         const results = data.nodes.filter(n => n.type === type);
@@ -2096,7 +2161,7 @@
                 }
             }
 
-            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}`)
+            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}&aggregate=${aggregateSoftware}${exclusionParams}`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) throw new Error(data.error);
@@ -2615,7 +2680,8 @@
                 detection_type: detectionTypeFilter,
                 software_type: softwareTypeFilter,
                 host_count: hostCountFilter,
-                user_count: userCountFilter
+                user_count: userCountFilter,
+                aggregate: aggregateSoftware
             });
 
             try {
@@ -2788,6 +2854,15 @@
                 </div>
                 ` : ''}
 
+                ${detection.db_use && detection.db_use.length > 0 ? `
+                <div class="detail-row">
+                    <div class="detail-label">Intended Use</div>
+                    <div class="detail-value" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px;">
+                        ${detection.db_use.map(use => `<span style="background: rgba(255, 215, 0, 0.1); color: #ffd700; padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid #ffd700;">${escapeHtml(use)}</span>`).join('')}
+                    </div>
+                </div>
+                ` : ''}
+
                 ${detection.wikidata_description ? `
                 <div class="detail-row">
                     <div class="detail-label">Wikidata Description</div>
@@ -2796,6 +2871,13 @@
                     </div>
                 </div>
                 ` : ''}
+                
+                <div class="detail-row" style="background: rgba(255, 255, 255, 0.03); padding: 10px; border-radius: 4px; border: 1px dashed var(--border-color); margin-top: 15px;">
+                    <div class="detail-label" style="color: var(--accent-color); font-weight: bold; margin-bottom: 5px;">🔒 Recommendation</div>
+                    <div class="detail-value" style="color: var(--text-primary); font-size: 13px;">
+                        ${escapeHtml(detection.recommendation || 'No specific recommendation provided.')}
+                    </div>
+                </div>
                 
                 <div class="detail-row">
                     <div class="detail-label">Detection Type</div>

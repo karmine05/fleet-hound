@@ -136,8 +136,6 @@ Examples:
     # Make arguments optional - fallback to .env
     parser.add_argument('--fleet-url', help='Fleet server URL (default: from .env)')
     parser.add_argument('--email', help='Fleet user email (default: from .env)')
-    parser.add_argument('--password', help='Fleet user password (default: from .env)')
-    parser.add_argument('--api-token', help='Fleet API token (alternative to email/password, for production)')
     parser.add_argument('--memgraph-uri', help='Memgraph URI (default: from .env or bolt://localhost:7687)')
     parser.add_argument('--insecure', action='store_true', help='Disable TLS verification for self-signed certs (development only)')
     parser.add_argument('--debug-auth', action='store_true', help='Print auth response diagnostics')
@@ -153,8 +151,9 @@ Examples:
     # Get configuration from args or .env (args take precedence)
     fleet_url = args.fleet_url or env_vars.get('FLEET_URL')
     email = args.email or env_vars.get('FLEET_EMAIL')
-    password = args.password or env_vars.get('FLEET_PASSWORD')
-    api_token = args.api_token or env_vars.get('FLEET_API_TOKEN')
+    # Secrets MUST come from .env or environment variables, not CLI arguments
+    password = env_vars.get('FLEET_PASSWORD')
+    api_token = env_vars.get('FLEET_API_TOKEN')
     memgraph_uri = args.memgraph_uri or env_vars.get('MEMGRAPH_URI', 'bolt://localhost:7687')
     insecure = args.insecure or str_to_bool(env_vars.get('INSECURE', 'false'))
     debug_auth = args.debug_auth or str_to_bool(env_vars.get('DEBUG', 'false'))
@@ -186,9 +185,8 @@ Examples:
         if not token:
             print("❌ Login failed. Check credentials or use --debug-auth / --insecure if self-signed cert.")
             if debug_auth:
-                status, body = auth.probe_login(email, password)
-                safe_body = body[:300].replace("\n", " ")
-                print(f"Auth probe status={status} body_snippet='{safe_body}'")
+                status, msg = auth.probe_login(email, password)
+                print(f"Auth probe status={status} diagnostic_msg='{msg}'")
             sys.exit(1)
         print("✅ Login successful.")
     else:

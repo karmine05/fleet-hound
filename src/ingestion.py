@@ -65,7 +65,7 @@ class MemgraphIngestion:
                     if uname:
                         user_lookup[uname] = user
                         user_batch.append({
-                            'username': uname,
+                            'username': uname.lower(),
                             'email': user.get('email'),
                             'fullname': user.get('name') or user.get('full_name')
                         })
@@ -97,7 +97,7 @@ class MemgraphIngestion:
 
                 # Host Data
                 host_batch.append({
-                    'hostname': hostname,
+                    'hostname': hostname.lower(),
                     'os_version': host.get('os_version'),
                     'platform': host.get('platform'),
                     'ip': host.get('primary_ip'),
@@ -112,10 +112,10 @@ class MemgraphIngestion:
                      # Simple lookup for enrichment
                      user = user_lookup.get(uname)
                      user_rel_batch.append({
-                        'username': uname,
+                        'username': uname.lower(),
                         'email': user.get('email') if user else None,
                         'fullname': (user.get('name') or user.get('full_name')) if user else None,
-                        'hostname': hostname
+                        'hostname': hostname.lower()
                     })
 
                 # Software Data (Grouped)
@@ -130,7 +130,7 @@ class MemgraphIngestion:
                             })
                     if cleaned_software:
                         software_grouped_batch.append({
-                            'hostname': hostname,
+                            'hostname': hostname.lower(),
                             'software_list': cleaned_software
                         })
 
@@ -294,9 +294,10 @@ class MemgraphIngestion:
         seen = set()
         deduped = []
         for u in users_out:
-            if u not in seen:
-                seen.add(u)
-                deduped.append(u)
+            u_lower = u.lower()
+            if u_lower not in seen:
+                seen.add(u_lower)
+                deduped.append(u_lower)
         return deduped
 
     def _batch_create_software_grouped(self, session, software_grouped_batch):

@@ -46,22 +46,25 @@ def _escape_sparql_string_literal(value: str) -> str:
         .replace('\t', '\\t')
     )
 
-def get_wikidata_info(software_name: str, session: requests.Session) -> Optional[Tuple[List[str], Optional[str]]]:
+import concurrent.futures
+
+# Refined query to target software items with more metadata
+def get_wikidata_info(software_name: str, session: requests.Session) -> Optional[dict]:
     """
-    Query Wikidata for categories and description.
+    Query Wikidata for categories, description, developer, and intended use.
     """
     safe_name = _escape_sparql_string_literal(software_name)
-    # Refined query to target software items
     query = f"""
-    SELECT DISTINCT ?itemLabel ?itemDescription ?instanceOfLabel ?useLabel WHERE {{
+    SELECT DISTINCT ?itemLabel ?itemDescription ?instanceOfLabel ?useLabel ?developerLabel WHERE {{
       ?item rdfs:label "{safe_name}"@en.
       ?item (wdt:P31/wdt:P279*) wd:Q7397. 
       ?item wdt:P31 ?instanceOf.
       OPTIONAL {{ ?item wdt:P366 ?use. }}
+      OPTIONAL {{ ?item wdt:P178 ?developer. }}
       OPTIONAL {{ ?item schema:description ?itemDescription . FILTER(LANG(?itemDescription) = "en") }}
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
     }}
-    LIMIT 10
+    LIMIT 5
     """
     
     headers = {
@@ -87,55 +90,58 @@ def get_wikidata_info(software_name: str, session: requests.Session) -> Optional
         data = response.json()
         
         categories = set()
+        uses = set()
+        developers = set()
         description = None
         
         for result in data.get('results', {}).get('bindings', []):
             if 'instanceOfLabel' in result:
                 categories.add(result['instanceOfLabel']['value'])
             if 'useLabel' in result:
-                categories.add(result['useLabel']['value'])
+                uses.add(result['useLabel']['value'])
+            if 'developerLabel' in result:
+                developers.add(result['developerLabel']['value'])
             if 'itemDescription' in result and not description:
                 description = result['itemDescription']['value']
         
-        return list(categories), description
+        if not categories and not uses and not description:
+            return None
+            
+        return {
+            'categories': list(categories),
+            'uses': list(uses),
+            'developers': list(developers),
+            'description': description
+        }
     except Exception as e:
         print(f"Error querying Wikidata for '{software_name}': {e}")
         return None
 
-def run_query_with_retry(session, query, params, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            session.run(query, **params)
-            return True
-        except (TransientError, ServiceUnavailable, SessionExpired) as e:
-            if attempt < max_retries - 1:
-                wait_time = 0.5 * (2 ** attempt)
-                time.sleep(wait_time)
-            else:
-                print(f"   ⚠️ Failed after {max_retries} attempts: {e}")
-                return False
+def process_software_item(name, session, driver_session):
+    """Worker function for concurrent processing"""
+    info = get_wikidata_info(name, session)
+    if info:
+        # Update Memgraph with retry
+        success = run_query_with_retry(
+            driver_session,
+            """
+                MATCH (s:Software {name: $name})
+                SET s.category = $category,
+                    s.primary_use = $uses,
+                    s.developer = $developers,
+                    s.wikidata_description = $desc,
+                    s.last_categorized = datetime()
+            """,
+            {
+                'name': name, 
+                'category': info['categories'], 
+                'uses': info['uses'],
+                'developers': info['developers'],
+                'desc': info['description']
+            },
+        )
+        return success
     return False
-
-def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█', print_end="\r"):
-    """
-    Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-        print_end   - Optional  : end character (e.g. "\r", "\r\n") (Str)
-    """
-    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filled_length = int(length * iteration // total)
-    bar = fill * filled_length + '-' * (length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end=print_end)
-    # Print New Line on Complete
-    if iteration == total:
-        print()
 
 def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 500, target_names=None):
     print(f"🔗 Connecting to Memgraph at {memgraph_uri}...")
@@ -155,17 +161,17 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
         print(f"🔍 Fetching specific software items: {', '.join(target_names[:5])}{'...' if len(target_names) > 5 else ''}")
         software_list = target_names
     else:
-        limit_clause = f"LIMIT {limit}" if limit else ""
         print(f"🔍 Fetching software without categories (prioritizing outliers/least frequent{' - ' + str(limit) + ' max' if limit else ' - ALL'})...")
         with driver.session() as session:
-            result = session.run(f"""
+            limit_val = int(limit) if limit else 1000000 
+            result = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE s.category IS NULL
                 WITH s.name AS name, COUNT(DISTINCT h) AS host_count
                 RETURN name
                 ORDER BY host_count ASC
-                {limit_clause}
-            """)
+                LIMIT $limit
+            """, {'limit': limit_val})
             software_list = [record['name'] for record in result]
 
     if not software_list:
@@ -173,48 +179,46 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
         return
 
     total = len(software_list)
-    print(f"🚀 Processing {total} items.")
+    print(f"🚀 Processing {total} items with concurrency...")
     
-    processed = 0
     updated = 0
+    processed = 0
     
     http = requests.Session()
+    # Use ThreadPoolExecutor for concurrent Wikidata lookups
+    # Max workers kept low to avoid aggressive rate limiting
+    MAX_WORKERS = 5
+    
     try:
-        with driver.session() as session:
-            # Initialize bar
+        # We need to manage Memgraph sessions carefully with threads. 
+        # Using a single session for all updates or multiple?
+        # Neo4j drivers are thread-safe, sessions are not.
+        
+        with driver.session() as db_session:
             print_progress_bar(0, total, prefix='Enriching:', suffix='Complete', length=50)
-
-            for name in software_list:
-                info = get_wikidata_info(name, http)
-                if info:
-                    # info is (categories, desc)
-                    categories, desc = info
-                    if categories:
-                        # Update Memgraph with retry
-                        success = run_query_with_retry(
-                            session,
-                            """
-                                MATCH (s:Software {name: $name})
-                                SET s.category = $category,
-                                    s.wikidata_description = $desc,
-                                    s.last_categorized = datetime()
-                            """,
-                            {'name': name, 'category': categories, 'desc': desc},
-                        )
-                        if success:
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # To maintain progress bar accuracy, we'll map futures
+                future_to_name = {executor.submit(process_software_item, name, http, db_session): name for name in software_list}
+                
+                for future in concurrent.futures.as_completed(future_to_name):
+                    processed += 1
+                    try:
+                        if future.result():
                             updated += 1
-
-                processed += 1
-                print_progress_bar(processed, total, prefix='Enriching:', suffix=f'({updated} updated)', length=50)
-
-                # Defensive sleep to avoid aggressive rate limiting
-                time.sleep(0.2)
+                    except Exception as e:
+                        name = future_to_name[future]
+                        print(f"\n❌ Error processing '{name}': {e}")
+                    
+                    print_progress_bar(processed, total, prefix='Enriching:', suffix=f'({updated} updated)', length=50)
+                    
     finally:
         http.close()
         if driver is not None:
             driver.close()
 
     print(f"\n🎉 Enrichment finished! Updated {updated} items in Memgraph.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Enrich software nodes with Wikidata categories.")

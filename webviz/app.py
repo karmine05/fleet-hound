@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, send_from_directory, request
+import re
 from neo4j import GraphDatabase
 from neo4j.exceptions import TransientError, ClientError
 import atexit
@@ -86,6 +87,34 @@ def audit_log(action, details):
     except Exception as e:
         logger.error(f"Error writing audit log: {e}")
 
+def get_base_software_name(name):
+    """
+    Extract a base software name by removing version numbers, architectures,
+    and other noisy suffixes to allow for aggregation.
+    
+    Example: 
+    - "Google Chrome 101.0.4951.64" -> "Google Chrome"
+    - "Zoom Workplace (64-bit)" -> "Zoom Workplace"
+    - "Slack 4.25.0-beta" -> "Slack"
+    """
+    if not name:
+        return ""
+    
+    # 1. Strip version patterns: space followed by digit/v and dots
+    # Handles: "App 1.2.3", "App v4.5", "App 101.0.4951.64"
+    name = re.sub(r'\s+v?\d+(?:\.\d+)+(?:-\w+)?$', '', name)
+    
+    # 2. Strip parenthetical architectures/tags
+    # Handles: "App (64-bit)", "App (ARM64)", "App (x64)"
+    name = re.sub(r'\s*\((?:64-bit|32-bit|ARM64|x64|x86|Renderer|Alerts|GPU)\)$', '', name)
+    
+    # 3. Strip trailing release years if separated by space
+    # Handles: "Visual Studio 2022" -> "Visual Studio" (optional, but requested for 'aggregated')
+    # Use with caution; keep for now as it aligns with "software + version" noise reduction
+    name = re.sub(r'\s+\d{4}$', '', name)
+    
+    return name.strip()
+
 
 @atexit.register
 def _close_memgraph_driver():
@@ -148,9 +177,38 @@ def get_users():
 def get_software():
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+    
+    aggregate = request.args.get('aggregate', 'false').lower() == 'true'
+    
     with driver.session() as session:
         result = session.run("MATCH (s:Software) RETURN s.name AS name, s.versions AS versions, s.last_version AS last_version")
-        return jsonify([r.data() for r in result])
+        software_data = [r.data() for r in result]
+        
+        if aggregate:
+            aggregated = {}
+            for sw in software_data:
+                base_name = get_base_software_name(sw['name'])
+                if base_name not in aggregated:
+                    aggregated[base_name] = {
+                        "name": base_name,
+                        "versions": sw.get('versions') or [],
+                        "last_version": sw.get('last_version')
+                    }
+                else:
+                    # Merge unique versions
+                    if sw.get('versions'):
+                        current_versions = set(aggregated[base_name].get("versions") or [])
+                        current_versions.update(sw['versions'])
+                        aggregated[base_name]["versions"] = sorted(list(current_versions))
+                    
+                    # Track latest version
+                    if sw.get('last_version'):
+                        if not aggregated[base_name]["last_version"] or sw['last_version'] > aggregated[base_name]["last_version"]:
+                            aggregated[base_name]["last_version"] = sw['last_version']
+            
+            return jsonify(list(aggregated.values()))
+            
+        return jsonify(software_data)
 
 @app.route("/api/teams")
 def get_teams():
@@ -200,11 +258,15 @@ def search_all():
     node_type = request.args.get('type', 'all').strip().lower()
     platform_filter = request.args.get('platform', 'all').strip().lower()
     team_filter = request.args.get('team', 'all').strip()
+    aggregate_software = request.args.get('aggregate_software', 'false').lower() == 'true'
     
 
     # Advanced search parameters
     search_mode = request.args.get('mode', 'wildcard').strip().lower()  # wildcard, exact, regex
     case_sensitive = request.args.get('case', 'false').strip().lower() == 'true'
+    
+    # Track mapping from raw software name to aggregated ID for link resolution
+    sw_name_to_id = {}
 
     # Validate key inputs (keep permissive where possible for backwards compatibility)
     allowed_node_types = {'all', 'host', 'user', 'software'}
@@ -454,22 +516,52 @@ def search_all():
             # Limit to 10 unique software items for visualization ONLY when showing "ALL" (no search term)
             # When user searches for specific software, show ALL matching results
             software_count = 0
+            
+            # Use sw_name_to_id for relationship resolution later
+            aggregated_sw = {}
+
             for record in software_result:
-                software_id = f"software_{record['name']}"
-                if software_id not in node_ids:
-                    # Only apply limit when there's no search term (the "ALL" case)
-                    if not search_term and software_count >= display_limit:
-                        break
-                    nodes.append({
-                        "id": software_id,
-                        "name": record['name'],
-                        "type": "software",
-                        "category": record.get('category'),
-                        "description": record.get('description'),
-                        "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
-                    })
-                    node_ids.add(software_id)
-                    software_count += 1
+                raw_name = record['name']
+                display_name = get_base_software_name(raw_name) if aggregate_software else raw_name
+                software_id = f"software_{display_name}"
+                
+                sw_name_to_id[raw_name] = software_id
+
+                if aggregate_software:
+                    if software_id not in aggregated_sw:
+                        if not search_term and len(aggregated_sw) >= display_limit:
+                            continue
+                        aggregated_sw[software_id] = {
+                            "id": software_id,
+                            "name": display_name,
+                            "type": "software",
+                            "category": record.get('category'),
+                            "description": record.get('description'),
+                            "details": "Aggregated Software",
+                            "host_count": record.get('host_count', 0)
+                        }
+                    else:
+                        aggregated_sw[software_id]["host_count"] += record.get('host_count', 0)
+                else:
+                    if software_id not in node_ids:
+                        if not search_term and software_count >= display_limit:
+                            break
+                        nodes.append({
+                            "id": software_id,
+                            "name": record['name'],
+                            "type": "software",
+                            "category": record.get('category'),
+                            "description": record.get('description'),
+                            "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
+                        })
+                        node_ids.add(software_id)
+                        software_count += 1
+
+            if aggregate_software:
+                for sw_id, sw_node in aggregated_sw.items():
+                    sw_node["details"] = f"Aggregated Software (on {sw_node['host_count']} hosts)"
+                    nodes.append(sw_node)
+                    node_ids.add(sw_id)
 
         # If we loaded software or users, we need to also load their connected hosts
         # to ensure we have complete relationships
@@ -642,14 +734,27 @@ def search_all():
                 software_host_result = session.run(software_host_query, **params)
 
                 for record in software_host_result:
-                    source_id = f"software_{record['software_name']}"
+                    raw_sw_name = record['software_name']
+                    # Resolve to aggregated ID if mapping exists, else fallback to raw id
+                    source_id = sw_name_to_id.get(raw_sw_name, f"software_{raw_sw_name}")
                     target_id = f"host_{record['hostname']}"
+                    
                     if source_id in node_ids and target_id in node_ids:
                         links.append({
                             "source": source_id,
                             "target": target_id,
                             "type": "installed"
                         })
+
+        # Deduplicate links (important when aggregating software)
+        unique_links = []
+        seen_links = set()
+        for link in links:
+            link_key = f"{link['source']}_{link['target']}_{link['type']}"
+            if link_key not in seen_links:
+                unique_links.append(link)
+                seen_links.add(link_key)
+        links = unique_links
 
         search_desc = f"'{search_term}'" if search_term else "ALL"
         logger.info(f"Search {search_desc} (type: {node_type}, platform: {platform_filter}): Returning {len(nodes)} nodes and {len(links)} links")
@@ -675,10 +780,14 @@ def search_software():
 
     search_term = request.args.get('q', '').strip()
     platform_filter = request.args.get('platform', 'all').strip().lower()
+    aggregate_software = request.args.get('aggregate_software', 'false').lower() == 'true'
 
     with driver.session() as session:
         nodes = []
         node_ids = set()
+        
+        # Track mapping from raw software name to aggregated ID for link resolution
+        sw_name_to_id = {}
 
         # Search for ALL software matching the search term (case-insensitive, partial match)
         # If search_term is empty, return ALL software
@@ -719,22 +828,53 @@ def search_software():
             msg = f"No software found matching '{search_term}'" if search_term else "No software found"
             return jsonify({"nodes": [], "links": [], "message": msg}), 200
 
-        # Add matching software nodes - limit to 10 unique items ONLY when showing "ALL" (no search term)
-        # When user searches for specific software, show ALL matching results
+        # Add matching software nodes
         software_count = 0
+        
+        # If aggregating, we use a temporary dict to group
+        aggregated_sw = {}
+
         for record in software_list:
-            # Only apply limit when there's no search term (the "ALL" case)
-            if not search_term and software_count >= 10:
-                break
-            software_id = f"software_{record['name']}"
-            nodes.append({
-                "id": software_id,
-                "name": record['name'],
-                "type": "software",
-                "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
-            })
-            node_ids.add(software_id)
-            software_count += 1
+            raw_name = record['name']
+            display_name = get_base_software_name(raw_name) if aggregate_software else raw_name
+            software_id = f"software_{display_name}"
+            
+            sw_name_to_id[raw_name] = software_id
+
+            if aggregate_software:
+                if software_id not in aggregated_sw:
+                    # Only apply limit when there's no search term (the "ALL" case)
+                    if not search_term and len(aggregated_sw) >= 10:
+                        continue
+                        
+                    aggregated_sw[software_id] = {
+                        "id": software_id,
+                        "name": display_name,
+                        "type": "software",
+                        "details": f"Aggregated Software (Multiple versions)",
+                        "host_count": record.get('host_count', 0)
+                    }
+                else:
+                    aggregated_sw[software_id]["host_count"] += record.get('host_count', 0)
+            else:
+                # Only apply limit when there's no search term (the "ALL" case)
+                if not search_term and software_count >= 10:
+                    break
+                    
+                nodes.append({
+                    "id": software_id,
+                    "name": raw_name,
+                    "type": "software",
+                    "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
+                })
+                node_ids.add(software_id)
+                software_count += 1
+
+        if aggregate_software:
+            for sw_id, sw_node in aggregated_sw.items():
+                sw_node["details"] = f"Aggregated Software (on {sw_node['host_count']} hosts)"
+                nodes.append(sw_node)
+                node_ids.add(sw_id)
 
         # Get ALL hosts that have any of the matching software, with optional platform filter
         if platform_filter == 'all':
@@ -807,9 +947,9 @@ def search_software():
             """, search_term=search_term, platform=platform_filter)
 
         for record in software_host_links:
-            source_id = f"software_{record['software_name']}"
+            source_id = sw_name_to_id.get(record['software_name'])
             target_id = f"host_{record['hostname']}"
-            if source_id in node_ids and target_id in node_ids:
+            if source_id and source_id in node_ids and target_id in node_ids:
                 links.append({
                     "source": source_id,
                     "target": target_id,
@@ -841,11 +981,20 @@ def search_software():
                     "type": "uses"
                 })
 
+        # Deduplicate links (important when aggregating software)
+        unique_links = []
+        seen_links = set()
+        for link in links:
+            link_key = f"{link['source']}_{link['target']}_{link['type']}"
+            if link_key not in seen_links:
+                unique_links.append(link)
+                seen_links.add(link_key)
+
         search_desc = f"'{search_term}'" if search_term else "ALL"
-        logger.info(f"Software search {search_desc} (platform: {platform_filter}): Found {len(software_list)} software, returning {len(nodes)} nodes and {len(links)} links")
+        logger.info(f"Software search {search_desc} (platform: {platform_filter}, aggregate: {aggregate_software}): Found {len(software_list)} software, returning {len(nodes)} nodes and {len(unique_links)} links")
         return jsonify({
             "nodes": nodes,
-            "links": links,
+            "links": unique_links,
             "search_term": search_term,
             "platform_filter": platform_filter,
             "software_count": len(software_list)
@@ -866,6 +1015,7 @@ def get_blast_radius():
     node_id = request.args.get('id')
     team_filter = request.args.get('team', 'all')
     ignore_defaults = request.args.get('ignore_defaults', 'false').lower() == 'true'
+    aggregate = request.args.get('aggregate', 'false').lower() == 'true'
     
     if not node_type or not node_id:
         return jsonify({"error": "Missing type or id parameter"}), 400
@@ -926,7 +1076,12 @@ def get_blast_radius():
                 params['defaults'] = excluded_users
         elif ignore_defaults:
             # Fallback for backward compatibility
-            default_accounts = ['root', 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount']
+            default_accounts = [
+                'root', 'administrator', 'guest', 'defaultaccount', 'wdagutilityaccount', 
+                'admin', 'krbtgt', 'system', 'local service', 'network service',
+                'trustedinstaller', 'sshd', 'nobody', 'dbus', 'syslog', 'messagebus',
+                'nt authority\\system', 'nt authority\\local service', 'nt authority\\network service'
+            ]
             user_exclusion_clause += " AND NOT u.username IN $defaults"
             params['defaults'] = default_accounts
 
@@ -984,16 +1139,24 @@ def get_blast_radius():
             # 2. Users on those hosts
             
             # Find hosts for software (filtered by team)
+            # If aggregate is enabled, match all software that share this base name
+            sw_match_clause = "s.name = $id"
+            if aggregate:
+                # Use a prefix match as a heuristic for aggregated software
+                # This matches "Name", "Name 1.2", "Name (64-bit)" etc.
+                sw_match_clause = "toLower(s.name) STARTS WITH $id_lower OR s.name = $id"
+                params["id_lower"] = node_id.lower()
+
             host_query = f"""
-                MATCH (s:Software {{name: $id}})-[:INSTALLED_ON]->(h:Host)
-                WHERE 1=1 {team_clause}
-                RETURN collect(DISTINCT h) as hosts, s.category as category, s.wikidata_description as description
+                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                WHERE {sw_match_clause} {team_clause}
+                RETURN collect(DISTINCT h) as hosts, collect(DISTINCT s.category) as categories, collect(DISTINCT s.wikidata_description) as descriptions
             """
             result = session.run(host_query, **params)
             record = result.single()
             hosts = record['hosts']
-            metrics['category'] = record['category']
-            metrics['description'] = record['description']
+            metrics['category'] = record['categories'][0] if record['categories'] else None
+            metrics['description'] = record['descriptions'][0] if record['descriptions'] else None
             
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
@@ -1022,14 +1185,14 @@ def get_blast_radius():
                         WHERE h.hostname IN $hostnames AND toString(h.team_id) = $team_id {user_exclusion_clause}
                         RETURN collect(DISTINCT u.username) as users
                     """.format(user_exclusion_clause=user_exclusion_clause)
-                    query_params = {**base_params, "team_id": team_filter}
+                    query_params = {**params, **base_params, "team_id": team_filter}
                 else:
                     user_query = """
                         MATCH (u:User)-[:USES]->(h:Host)
                         WHERE h.hostname IN $hostnames {user_exclusion_clause}
                         RETURN collect(DISTINCT u.username) as users
                     """.format(user_exclusion_clause=user_exclusion_clause)
-                    query_params = base_params
+                    query_params = {**params, **base_params}
 
                 user_res = session.run(user_query, **query_params)
                 impacted_users = user_res.single()['users']
@@ -1621,12 +1784,28 @@ def get_shadow_it():
     host_count_filter = request.args.get('host_count', 'all')  # New filter
     user_count_filter = request.args.get('user_count', 'all')  # New filter
     software_type_filter = request.args.get('software_type', 'all')  # New filter
+    aggregate = request.args.get('aggregate', 'false').lower() == 'true'
     
     # Software type detection patterns
-    def detect_software_type(software_name):
-        """Detect the type of software based on name patterns"""
+    def detect_software_type(software_name, db_categories=None, db_uses=None):
+        """Detect the type of software based on name patterns and Wikidata metadata"""
+        # Sanitization: Handle template variables like ${{arpDisplayName}}
+        if '${{' in software_name and '}}' in software_name:
+             # Try to extract something meaningful or mark as placeholder
+             import re
+             match = re.search(r'\${{(.*?)}}', software_name)
+             if match:
+                 software_name = f"Generic {match.group(1)} (Placeholder)"
+             else:
+                 software_name = "Unknown Asset"
+
         name_lower = software_name.lower()
         
+        # Cross-reference with Wikidata metadata if available
+        all_metadata = []
+        if db_categories: all_metadata.extend([c.lower() for c in db_categories])
+        if db_uses: all_metadata.extend([u.lower() for u in db_uses])
+
         # Browser Extensions
         if any(x in name_lower for x in ['-extension', 'chrome extension', 'firefox addon', 'safari extension', 'edge extension']):
             return 'Browser Extension'
@@ -1644,27 +1823,43 @@ def get_shadow_it():
             return 'Ruby Gem'
         
         # Operating System Components
-        if any(x in name_lower for x in ['microsoft', 'windows', 'macos', 'darwin', 'linux', 'ubuntu']):
+        if any(x in name_lower for x in ['microsoft', 'windows', 'macos', 'darwin', 'linux', 'ubuntu']) or \
+           any('operating system' in m for m in all_metadata):
             return 'OS Component'
         
         # Development Tools
-        if any(x in name_lower for x in ['git', 'node', 'python', 'java', 'docker', 'kubernetes']):
+        if any(x in name_lower for x in ['git', 'node', 'python', 'java', 'docker', 'kubernetes']) or \
+           any(m in ['programming language', 'software framework', 'library'] for m in all_metadata):
             return 'Developer Tool'
         
+        # Security Tools
+        if any('security' in m or 'antivirus' in m for m in all_metadata):
+            return 'Security Software'
+
         # Default
         return 'Application'
     
     # High-risk software patterns (case-insensitive)
     HIGH_RISK_PATTERNS = {
-        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop', 'remote desktop'],
-        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent', 'file sharing'],
-        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik', 'instant messaging', 'voip', 'videotelephony'],
-        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack', 'packet analyzer', 'penetration testing'],
-	        # NOTE: Avoid overly-generic patterns like "miner" because they produce false positives
-	        # for legitimate software (e.g., GNOME Tracker components like "tracker-miner-fs").
-	        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate', 'cryptocurrency', 'bitcoin'],
-        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn', 'anonymizing proxy', 'vpn'],
+        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop', 'remote desktop', 'screen sharing'],
+        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent', 'file sharing', 'peer-to-peer'],
+        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik', 'instant messaging', 'voip', 'videotelephony', 'chat'],
+        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack', 'packet analyzer', 'penetration testing', 'debugger'],
+        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate', 'cryptocurrency', 'bitcoin', 'miner'],
+        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn', 'anonymizing proxy', 'vpn', 'proxy'],
     }
+
+    def get_recommendation(risk_category, software_name):
+        recs = {
+            'Remote Access Tools': "Unauthorized remote access tools can bypass firewalls. Verify business justification or move to corporate VPN/Zero-Trust solution.",
+            'File Sharing': "Potential data exfiltration vector. Use corporate-sanitized storage (e.g. OneDrive, Google Drive) instead.",
+            'Communication Apps': "Risk of unmonitored data transfer. Enforce use of corporate Slack/Teams.",
+            'Developer Tools': "Tools like Docker or Wireshark can be used for privilege escalation or sniffing. Restrict to authorized developer hosts.",
+            'Cryptocurrency': "Violation of acceptable use policy. Potential resource theft or malware indicator.",
+            'Tor/Privacy Tools': "Used to bypass security controls. Block via endpoint policy or network level filters.",
+            'Outlier Software': "Unusual software installation detected. Verify with user if this was manually installed and for what purpose."
+        }
+        return recs.get(risk_category, "Verify software authorization and security posture.")
     
     
     with driver.session() as session:
@@ -1705,12 +1900,13 @@ def get_shadow_it():
             outlier_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
+                WITH s.name AS software_name, s.last_version AS version, 
+                     s.category AS db_category, s.primary_use AS db_use, s.wikidata_description AS db_desc,
                 COUNT(DISTINCT h) AS host_count,
                 COLLECT(DISTINCT h.hostname) AS hosts,
                 COLLECT(DISTINCT h.platform) AS platforms
                 WHERE host_count <= $outlier_threshold
-                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
+                RETURN software_name, version, host_count, hosts, platforms, db_category, db_use, db_desc
                 ORDER BY host_count ASC, software_name ASC
             """
             
@@ -1728,8 +1924,42 @@ def get_shadow_it():
                 users_record = users_result.single()
                 users = users_record['users'] if users_record else []
                 
-                # Risk level based on install count
-                risk_level = "high" if record['host_count'] == 1 else "medium"
+                # Metadata check
+                db_categories = record.get('db_category', [])
+                db_uses = record.get('db_use', [])
+                
+                # Sanitization for display
+                display_name = record['software_name']
+                if '${{' in display_name:
+                    display_name = display_name.replace('${{', '').replace('}}', ' (Legacy Asset)')
+
+                # Risk classification logic
+                detected_category = "Outlier Software"
+                risk_level = "low"
+                risk_reason = f"Installed on only {record['host_count']} host(s) (<3% threshold)."
+
+                # 1. Check if name matches high risk patterns
+                for risk_cat, patterns in HIGH_RISK_PATTERNS.items():
+                    if any(p in record['software_name'].lower() for p in patterns):
+                        detected_category = risk_cat
+                        risk_level = "high"
+                        risk_reason = f"Identified as {risk_cat} via name-pattern matching."
+                        break
+                
+                # 2. Check if Wikidata metadata matches high risk patterns
+                if risk_level != "high":
+                    meta_to_check = (db_categories or []) + (db_uses or [])
+                    for risk_cat, patterns in HIGH_RISK_PATTERNS.items():
+                        if any(any(p in str(m).lower() for p in patterns) for m in meta_to_check):
+                            detected_category = risk_cat
+                            risk_level = "high"
+                            risk_reason = f"Identified as {risk_cat} via Wikidata enrichment (categories/intended-use)."
+                            break
+
+                # 3. Adjust risk level based on extreme rarity if not already high
+                if risk_level != "high" and record['host_count'] == 1:
+                    risk_level = "medium"
+                    risk_reason += " Escalated to MEDIUM due to singleton installation status."
                 
                 # Apply host count filter
                 if host_count_filter != 'all':
@@ -1737,21 +1967,25 @@ def get_shadow_it():
                         continue
                     elif host_count_filter == '2' and record['host_count'] != 2:
                         continue
+                    elif host_count_filter == '3' and record['host_count'] >= 5: # New logic for <5
+                        continue
                     elif host_count_filter == '3+' and record['host_count'] < 3:
                         continue
                 
                 # Apply user count filter
                 user_count = len(users)
                 if user_count_filter != 'all':
-                    if user_count_filter == '1' and user_count != 1:
+                    if user_count_filter == '2' and user_count >= 3:
                         continue
-                    elif user_count_filter == '2' and user_count != 2:
+                    elif user_count_filter == '4' and user_count >= 5:
                         continue
-                    elif user_count_filter == '3+' and user_count < 3:
+                    elif user_count_filter == '9' and user_count >= 10:
+                        continue
+                    elif user_count_filter == '10+' and user_count < 10:
                         continue
                 
                 # Detect software type
-                software_type = detect_software_type(record['software_name'])
+                software_type = detect_software_type(record['software_name'], db_categories, db_uses)
 
                 # Apply software type filter
                 if software_type_filter != 'all' and software_type != software_type_filter:
@@ -1759,12 +1993,14 @@ def get_shadow_it():
                 
                 if risk_filter == 'all' or risk_filter == risk_level:
                     detections.append({
-                        "id": f"outlier_{detection_id_counter}",
-                        "software_name": record['software_name'],
+                        "id": f"det_{detection_id_counter}",
+                        "software_name": display_name,
+                        "raw_name": record['software_name'],
                         "software_type": software_type,
                         "risk_level": risk_level,
-                        "category": "Outlier Software",
-                        "db_category": record.get('db_category'),
+                        "category": detected_category,
+                        "db_category": db_categories,
+                        "db_use": db_uses,
                         "wikidata_description": record.get('db_desc'),
                         "detection_type": "outlier",
                         "host_count": record['host_count'],
@@ -1772,133 +2008,12 @@ def get_shadow_it():
                         "affected_users": users,
                         "platforms": record['platforms'],
                         "version": record['version'] or "Unknown",
-                        "recommendation": f"Verify if this software is authorized. Found on only {record['host_count']} host(s). Consider removing if unauthorized.",
-                        "details": f"Installed on {record['host_count']} host(s) only - unusual for enterprise software",
-                        "risk_reason": f"Risk is {risk_level.upper()} because this software is installed on only {record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).",
+                        "recommendation": get_recommendation(detected_category, record['software_name']),
+                        "risk_reason": risk_reason,
                     })
                     detection_id_counter += 1
         
-        # ===== DETECTION 2: High-Risk Category Software =====
-        if detection_type_filter in ['all', 'high_risk']:
-            # Get all software THAT IS RARE enough to be considered Shadow IT
-            # We apply the same outlier threshold here to respect the "Shadow IT = rare/unauthorized" definition.
-            # However, we might want to also flag "High Risk" software even if widespread?
-            # User specifically asked: "why am i seeing host count 70.; the idea of Shadow IT is to display only items thats are less than 3% of the total"
-            # So user wants STRICT percentages even for High Risk items in this view.
-            
-            # Add outlier_threshold to filter_params if not already there (it might be from outlier block)
-            filter_params['outlier_threshold'] = OUTLIER_THRESHOLD
-
-            all_software_query = f"""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
-                COUNT(DISTINCT h) AS host_count,
-                COLLECT(DISTINCT h.hostname) AS hosts,
-                COLLECT(DISTINCT h.platform) AS platforms
-                WHERE host_count <= $outlier_threshold 
-                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
-            """
-            
-            result = session.run(all_software_query, **filter_params)
-            
-            for record in result:
-                software_lower = record['software_name'].lower()
-                matched_category = None
-                
-                # Check against dynamic categories first
-                db_categories = record.get('db_category') or []
-                for db_cat in db_categories:
-                    db_cat_lower = db_cat.lower()
-                    for category, patterns in HIGH_RISK_PATTERNS.items():
-                        # Check if any high-risk pattern matches the dynamic category
-                        if any(p in db_cat_lower for p in patterns) or category.lower() in db_cat_lower:
-                            matched_category = category
-                            break
-                    if matched_category:
-                        break
-                
-                # Fallback to name pattern matching if no dynamic category match
-                if not matched_category:
-                    for category, patterns in HIGH_RISK_PATTERNS.items():
-                        for pattern in patterns:
-                            if pattern in software_lower:
-                                matched_category = category
-                                break
-                        if matched_category:
-                            break
-                
-                if matched_category:
-                    # Skip flagged Developer Tools if they are widely deployed (>30%)
-                    if matched_category == 'Developer Tools' and record['host_count'] > MANAGED_THRESHOLD:
-                        continue
-                        
-                    # Get users on affected hosts
-                    users_query = """
-                        MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                        RETURN COLLECT(DISTINCT u.username) AS users
-                    """
-                    users_result = session.run(users_query, software_name=record['software_name'])
-                    users_record = users_result.single()
-                    users = users_record['users'] if users_record else []
-                    
-                    # All high-risk category detections are high risk
-                    risk_level = "high"
-                    
-                    # Apply host count filter
-                    if host_count_filter != 'all':
-                        if host_count_filter == '1' and record['host_count'] != 1:
-                            continue
-                        elif host_count_filter == '2' and record['host_count'] != 2:
-                            continue
-                        elif host_count_filter == '3+' and record['host_count'] < 3:
-                            continue
-                    
-                    # Apply user count filter
-                    user_count = len(users)
-                    if user_count_filter != 'all':
-                        if user_count_filter == '1' and user_count != 1:
-                            continue
-                        elif user_count_filter == '2' and user_count != 2:
-                            continue
-                        elif user_count_filter == '3+' and user_count < 3:
-                            continue
-                    
-                    # Detect software type
-                    software_type = detect_software_type(record['software_name'])
-                    
-                    # Apply software type filter
-                    if software_type_filter != 'all' and software_type != software_type_filter:
-                        continue
-                    
-                    if risk_filter == 'all' or risk_filter == risk_level:
-                        # Category-specific recommendations
-                        recommendations = {
-                            'Remote Access Tools': "Verify authorization. Remote access tools can be used for data exfiltration. Replace with approved enterprise solution.",
-                            'File Sharing': "Verify authorization. File sharing apps may lead to data leakage. Use approved enterprise file sharing.",
-                            'Communication Apps': "Verify authorization. Unofficial communication apps may bypass DLP policies. Use approved enterprise messaging.",
-                            'Developer Tools': "Verify if host is authorized dev machine. Developer tools on production systems pose security risks.",
-                            'Cryptocurrency': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
-                            'Tor/Privacy Tools': "CRITICAL: Investigate immediately. Privacy/anonymity tools may indicate malicious activity or policy violation.",
-                        }
-                        
-                        detections.append({
-                            "id": f"highrisk_{detection_id_counter}",
-                            "software_name": record['software_name'],
-                            "software_type": software_type,
-                            "risk_level": risk_level,
-                            "category": matched_category,
-                            "detection_type": "high_risk",
-                            "host_count": record['host_count'],
-                            "affected_hosts": record['hosts'],
-                            "affected_users": users,
-                            "platforms": record['platforms'],
-                            "version": record['version'] or "Unknown",
-                            "recommendation": recommendations.get(matched_category, "Review and verify authorization"),
-                            "details": f"High-risk category: {matched_category}",
-                            "risk_reason": f"Risk is HIGH because '{record['software_name']}' matches the '{matched_category}' category, which is flagged for security review."
-                        })
-                        detection_id_counter += 1
+        # Detection 2 (High-Risk) is now merged into Detection 1 for efficiency and to avoid duplicates.
         
         # ===== DETECTION 3: Version Sprawl (multiple versions of same software) =====
         if detection_type_filter in ['all', 'version_sprawl']:
@@ -1982,6 +2097,46 @@ def get_shadow_it():
                     })
                     detection_id_counter += 1
         
+        # Apply aggregation if requested
+        if aggregate:
+            aggregated_detections = {}
+            for d in detections:
+                base_name = get_base_software_name(d['software_name'])
+                if base_name not in aggregated_detections:
+                    new_det = d.copy()
+                    new_det['software_name'] = base_name
+                    new_det['affected_hosts'] = set(d.get('affected_hosts', []))
+                    new_det['affected_users'] = set(d.get('affected_users', []))
+                    new_det['platforms'] = set(d.get('platforms', []))
+                    aggregated_detections[base_name] = new_det
+                else:
+                    target = aggregated_detections[base_name]
+                    target['affected_hosts'].update(d.get('affected_hosts', []))
+                    target['affected_users'].update(d.get('affected_users', []))
+                    target['platforms'].update(d.get('platforms', []))
+                    target['host_count'] = len(target['affected_hosts'])
+                    
+                    # Track highest risk level
+                    risk_order = {'high': 3, 'medium': 2, 'low': 1, 'none': 0}
+                    curr_level = d.get('risk_level', 'none')
+                    target_level = target.get('risk_level', 'none')
+                    if risk_order.get(curr_level, 0) > risk_order.get(target_level, 0):
+                        target['risk_level'] = curr_level
+                        target['risk_reason'] = d.get('risk_reason')
+                        target['recommendation'] = d.get('recommendation')
+                        target['detection_type'] = d.get('detection_type')
+            
+            # Convert sets back to sorted lists
+            final_detections = []
+            for idx, (base_name, det) in enumerate(aggregated_detections.items()):
+                det['id'] = f"agg_{idx+1}"
+                det['affected_hosts'] = sorted(list(det['affected_hosts']))
+                det['affected_users'] = sorted(list(det['affected_users']))
+                det['platforms'] = sorted(list(det['platforms']))
+                final_detections.append(det)
+            
+            detections = final_detections
+
         # ===== Calculate Summary Metrics =====
         summary = {
             "total_detections": len(detections),
