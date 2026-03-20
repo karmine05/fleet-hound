@@ -11,7 +11,8 @@
 
 **Fleet Hound** is a tier-one security asset designed for Vulnerability Management, Incident Response, and GRC teams. It transforms passive inventory data from **Fleet** into an interactive, multi-dimensional **Security Graph**, enabling teams to visualize hidden relationships, quantify attack vectors, and identify Shadow IT at scale.
 
-![Universal Security Graph](assets/graph_view.png)
+<img width="2546" height="1268" alt="image" src="https://github.com/user-attachments/assets/a1eab684-8732-49e8-b12a-b7e872fa152e" />
+
 
 ---
 
