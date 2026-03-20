@@ -9,145 +9,144 @@
 
 ## 🛡️ Executive Summary
 
-**Fleet Hound** is a tier-one security asset designed for Vulnerability Management, Incident Response, and GRC teams. It transforms passive inventory data from **Fleet** into an interactive, multi-dimensional **Security Graph**, enabling teams to visualize hidden relationships, quantify attack vectors, and identify Shadow IT at scale.
+**Fleet Hound** transforms passive inventory data from **Fleet** into an interactive **Security Graph**. It enables security teams to visualize hidden relationships, quantify attack vectors, and identify Shadow IT at scale.
 
 <img width="2546" height="1268" alt="image" src="https://github.com/user-attachments/assets/a1eab684-8732-49e8-b12a-b7e872fa152e" />
-
 
 ---
 
 ## ⚡ Core Capabilities
 
-### ⚛️ Blast Radius & Impact Quantization
-*Quantify the "So What?" of a compromise.*
-- **Lateral Movement Modeling**: Mathematically identify potential pivot points from any compromised node.
-- **Dynamic Risk Radar**: Visualize impact across Host Reach, User Exposure, and Platform Diversity.
-- **Smart Exclusion Engine**: Tunable whitelisting to filter out system noise (e.g., service accounts).
-
-<p align="center">
-  <img src="assets/blast_radius.png" width="48%" />
-  <img src="assets/blast_exclusion.png" width="48%" />
-</p>
-
-### 🕵️ Shadow IT & Anomaly Detection
-*Reveal the "Unknown Unknowns" in your desktop and server fleet.*
-- **Software Outlier Analysis**: Automatically flag applications installed on a statistically insignificant number of hosts.
-- **Dynamic Enrichment**: Automatically fetch software categories and descriptions from **Wikidata** to reveal hidden risks (e.g., Identifying "VoIP" or "Remote Access" categories dynamically).
-- **High-Risk Category Tagging**: Instant identification of unauthorized Remote Access, File Sharing, and Dev tools.
+- **Blast Radius & Impact Quantization**: Mathematically identify potential pivot points from any compromised node.
+- **Shadow IT & Anomaly Detection**: Automatically flag applications installed on a statistically insignificant number of hosts.
+- **Dynamic Enrichment**: Automatically fetch software categories from **Wikidata** to reveal hidden risks.
 - **Version Sprawl Detection**: Identify fragmentation risks where outdated versions persist despite patching policies.
-
-<p align="center">
-  <img src="assets/shadow_it.png" width="48%" alt="Shadow IT Detection List" />
-  <img src="assets/shadow_details.png" width="48%" alt="Detection Details Modal" />
-</p>
-
-## Technical Architecture
-
-### Backend (Flask)
-- **`/api/graph/full`**: Returns filtered overview graph (important software only)
-- **`/api/host/<hostname>/software`**: Returns ALL software for specific host
-- **`/api/software/<name>/hosts`**: Returns ALL hosts with specific software
-- **Error Handling**: Graceful fallback for failed requests
-- **Performance**: Optimized queries for 2K+ assets
-
-### Frontend (D3.js)
-- **Force Simulation**: Interactive physics-based layout
-- **Node Types**: Hosts (blue), Users (green), Software (red)  
-- **Drag & Drop**: Repositionable nodes with physics
-- **Zoom & Pan**: Navigate large graphs efficiently
-- **Type-aware Expansion**: Different endpoints for different node types
-
-## Docker Deployment
-
-### Build and Run
-```bash
-# Build the dashboard
-docker build -t fleet-webviz .
-
-# Run with custom network (recommended)
-docker run -d --name fleet-webviz --network fleet-network -p 8080:8080 fleet-webviz
-
-# Access at http://localhost:8080
-```
-
-### Development Mode
-```bash
-# Local development
-cd webviz
-python3 app.py
-
-# Access at http://localhost:8080
-```
-
-## Configuration
-
-### Environment Variables
-- **`MEMGRAPH_URI`**: Database connection (default: `bolt://memgraph:7687`)
-- **`PORT`**: Web server port (default: `8080`)
-
-### Network Requirements
-- Dashboard must be on same Docker network as Memgraph
-- Uses container name `memgraph` for database connection
-- External access via port 8080
-
-## API Endpoints
-
-### Graph Data
-- `GET /api/graph/full` - Complete graph with filtering
-- `GET /api/host/<hostname>/software` - All software for host
-- `GET /api/software/<name>/hosts` - All hosts with software
-
-### Response Format
-```json
-{
-  "nodes": [
-    {"id": "hostname", "type": "Host", "details": {...}},
-    {"id": "software", "type": "Software", "details": {...}}
-  ],
-  "links": [
-    {"source": "software", "target": "hostname", "type": "INSTALLED_ON"}
-  ]
-}
-```
-
-## Performance Optimizations
-
-### Graph Filtering
-- Shows only "important" software in main view (Chrome, Office, etc.)
-- Full data available via node expansion
-- Prevents visualization overload with 1800+ software packages
-
-### API Design
-- Type-specific endpoints for complete data access
-- Caching-friendly structure
-- Minimal payload for initial load
-
-### Frontend Optimization
-- Efficient D3.js force simulation
-- Lazy loading of extended relationships
-- Debounced search and filtering
-
-## Troubleshooting
-
-### Common Issues
-```bash
-# Dashboard not connecting to database
-docker logs fleet-webviz
-
-# Network connectivity issues
-docker network inspect fleet-network
-
-# Performance issues
-# Check browser console for JavaScript errors
-# Verify Memgraph is responsive at localhost:3000
-```
-
-### Dependencies
-- Python 3.11+
-- Flask web framework
-- Neo4j driver for Memgraph
-- D3.js for frontend visualization
 
 ---
 
-This dashboard provides comprehensive Fleet security analysis with BloodHound-style relationship mapping and modern web interface.
+## 🚀 Quick Start
+
+### 1. Prerequisites
+- **Docker & Docker Compose**
+- **Python 3.11+** (for data extraction)
+
+### 2. Setup and Start Services
+The easiest way to get started is using the provided scripts:
+
+```bash
+# Clone the repository
+git clone https://github.com/fleetdm/fleet-bloodhound.git
+cd fleet-bloodhound/prod
+
+# Start Memgraph and the Web Dashboard
+./start.sh
+```
+
+`./start.sh` will:
+1. Verify Docker installation.
+2. Start Memgraph and the Web Dashboard using Docker Compose.
+3. Wait for Memgraph to become healthy.
+4. Optionally start the data extraction process (if credentials provided).
+
+### 3. Access the Platform
+Once started, you can access the following interfaces:
+
+- **📊 Web Dashboard**: [http://localhost:8080](http://localhost:8080)
+- **🗄️ Memgraph Lab**: [http://localhost:3000](http://localhost:3000)
+
+### 4. Stop Services
+To shut down the platform safely:
+
+```bash
+./stop.sh
+```
+
+---
+
+## 📡 Data Extraction
+
+Fleet Hound needs data from your Fleet server to build the security graph.
+
+### Method A: Using `.env` (Recommended)
+1. Copy the example environment file:
+   ```bash
+   cp .env.example .env
+   ```
+2. Edit `.env` and provide your Fleet URL and API Token:
+   ```env
+   FLEET_URL=https://your-fleet-server.com
+   FLEET_API_TOKEN=your-token-here
+   ```
+3. Run the extraction:
+   ```bash
+   python3 main.py
+   ```
+
+### Method B: Command Line Arguments
+You can also provide credentials directly:
+```bash
+python3 main.py --fleet-url https://your-fleet-url \
+               --email admin@example.com \
+               --password your-password
+```
+
+> [!TIP]
+> Use the `--insecure` flag if your Fleet server uses a self-signed certificate.
+
+### Advanced Extraction Options
+For fine-grained control over the data extraction process, `main.py` supports several advanced arguments:
+
+| Argument | Description |
+| :--- | :--- |
+| `--teams ID,ID` | Fetch only specific Team IDs (e.g., `--teams 1,5`). |
+| `--full-scan` | Ignore last run time and fetch ALL data (performs a full sync). |
+| `--complete-enrichment` | Enrich ALL software in the database with Wikidata (may take a long time). |
+| `--enrich-software NAME` | Comma-separated list of specific software names to enrich immediately. |
+| `--insecure` | Disable TLS verification (useful for self-signed certificates). |
+| `--debug-auth` | Enable verbose authentication diagnostics. |
+| `--dump-host-sample` | Write a sample host object to `hosts_sample.json` and exit. |
+
+**Example: Syncing specific teams with a full scan:**
+```bash
+python3 main.py --teams 1,2 --full-scan
+```
+
+---
+
+## 📁 Technical Architecture
+
+### Backend (Flask)
+- Provides APIs for graph data (`/api/graph/full`), host-specific software, and more.
+- Optimized for performance with 2K+ assets.
+
+### Frontend (D3.js)
+- Physics-based interactive graph visualization.
+- Type-aware node expansion and lazy loading for large datasets.
+
+### Database (Memgraph)
+- High-performance graph database compatible with Neo4j Bolt protocol.
+
+---
+
+## 🔧 Troubleshooting
+
+### View Service Logs
+```bash
+docker compose logs -f
+```
+
+### Reset the Database
+If you need to clear all ingested data:
+```bash
+python3 clear_db.py --yes
+```
+
+### Common Connectivity Issues
+- Ensure `fleet-webviz` and `fleet-memgraph` are running: `docker compose ps`
+- Verify network connectivity: `docker network inspect fleet-network`
+
+---
+
+## 📄 License
+This project is licensed under the MIT License - see the `LICENSE` file for details.
+
