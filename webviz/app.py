@@ -1807,7 +1807,7 @@ def get_shadow_it():
         if db_uses: all_metadata.extend([u.lower() for u in db_uses])
 
         # Browser Extensions
-        if any(x in name_lower for x in ['-extension', 'chrome extension', 'firefox addon', 'safari extension', 'edge extension']):
+        if any(x in name_lower for x in ['chrome extension', 'firefox addon', 'safari extension', 'edge extension']):
             return 'Browser Extension'
         
         # VSCode Extensions  
