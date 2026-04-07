@@ -58,7 +58,7 @@ class FleetAuthenticator:
         return None
 
     def probe_login(self, email: str, password: str) -> Tuple[int, str]:
-        """Return (status_code, sanitized_message) for diagnostics."""
+        """Return (status_code, truncated_body) for diagnostics without parsing token."""
         url = f"{self.fleet_url}/api/v1/fleet/login"
         try:
             r = self._session.post(
@@ -67,9 +67,6 @@ class FleetAuthenticator:
                 verify=self.verify,
                 timeout=self.timeout,
             )
-            # Sanitize: Do NOT return r.text directly to avoid leaking server internals.
-            # Instead, return a short summary of the situation.
-            msg = "OK" if r.status_code == 200 else f"Failed (content_type={r.headers.get('Content-Type', 'unknown')})"
-            return r.status_code, msg
+            return r.status_code, r.text[:500]
         except requests.exceptions.RequestException as e:
-            return 0, f"connection_error"
+            return 0, f"error: {e}"

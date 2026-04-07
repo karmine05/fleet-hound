@@ -1,26 +1,25 @@
 from neo4j import GraphDatabase
 from neo4j.exceptions import TransientError
 import time
-from typing import Any, Dict, List, Optional
 
 class MemgraphIngestion:
-    def __init__(self, uri: str = "bolt://localhost:7687") -> None:
+    def __init__(self, uri="bolt://localhost:7687"):
         self.driver = GraphDatabase.driver(uri)
-        self.batch_size: int = 5000  # Optimized batch size
-        self.max_retries: int = 3
+        self.batch_size = 5000  # Optimized batch size
+        self.max_retries = 3
 
-    def close(self) -> None:
+    def close(self):
         """Close the underlying database driver."""
         self.driver.close()
 
-    def __enter__(self) -> 'MemgraphIngestion':
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+    def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
 
-    def create_constraints(self) -> None:
+    def create_constraints(self):
         """Create unique constraints on graph nodes."""
         with self.driver.session() as session:
             # Try to create constraints, ignore if they already exist
@@ -36,7 +35,7 @@ class MemgraphIngestion:
                     # Constraint already exists, ignore
                     pass
 
-    def create_graph_relationships(self, hosts_data: List[Dict[str, Any]], extractor: Any, global_users: Optional[List[Dict[str, Any]]] = None) -> None:
+    def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
         Ingest hosts, users, software, and relationships into Memgraph.
 
@@ -65,7 +64,7 @@ class MemgraphIngestion:
                     if uname:
                         user_lookup[uname] = user
                         user_batch.append({
-                            'username': uname.lower(),
+                            'username': uname,
                             'email': user.get('email'),
                             'fullname': user.get('name') or user.get('full_name')
                         })
@@ -97,7 +96,7 @@ class MemgraphIngestion:
 
                 # Host Data
                 host_batch.append({
-                    'hostname': hostname.lower(),
+                    'hostname': hostname,
                     'os_version': host.get('os_version'),
                     'platform': host.get('platform'),
                     'ip': host.get('primary_ip'),
@@ -112,10 +111,10 @@ class MemgraphIngestion:
                      # Simple lookup for enrichment
                      user = user_lookup.get(uname)
                      user_rel_batch.append({
-                        'username': uname.lower(),
+                        'username': uname,
                         'email': user.get('email') if user else None,
                         'fullname': (user.get('name') or user.get('full_name')) if user else None,
-                        'hostname': hostname.lower()
+                        'hostname': hostname
                     })
 
                 # Software Data (Grouped)
@@ -130,7 +129,7 @@ class MemgraphIngestion:
                             })
                     if cleaned_software:
                         software_grouped_batch.append({
-                            'hostname': hostname.lower(),
+                            'hostname': hostname,
                             'software_list': cleaned_software
                         })
 
@@ -294,10 +293,9 @@ class MemgraphIngestion:
         seen = set()
         deduped = []
         for u in users_out:
-            u_lower = u.lower()
-            if u_lower not in seen:
-                seen.add(u_lower)
-                deduped.append(u_lower)
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
         return deduped
 
     def _batch_create_software_grouped(self, session, software_grouped_batch):

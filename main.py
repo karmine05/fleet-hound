@@ -4,7 +4,7 @@ import sys
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional
 
 # Suppress SSL warnings when using --insecure flag
 import urllib3
@@ -15,12 +15,11 @@ from src.ingestion import MemgraphIngestion
 from categorize_software import run_categorization
 import json
 import datetime
-from neo4j import GraphDatabase
 
 STATE_FILE = '.state.json'
 
 
-def load_env_file(env_path: str = '.env') -> Dict[str, str]:
+def load_env_file(env_path: str = '.env') -> dict:
     """Load environment variables from .env file."""
     env_vars = {}
     env_file = Path(env_path)
@@ -57,10 +56,7 @@ def str_to_bool(value: str) -> bool:
     return value.lower() in ('true', '1', 'yes', 'on')
 
 
-from typing import Optional, Dict, Any, List, Tuple
-
-
-def load_state() -> Dict[str, Any]:
+def load_state() -> dict:
     """Load the state file."""
     if Path(STATE_FILE).exists():
         try:
@@ -73,7 +69,7 @@ def load_state() -> Dict[str, Any]:
     return {}
 
 
-def save_state(state: Dict[str, Any]) -> None:
+def save_state(state: dict):
     """Save the state file."""
     tmp_path = None
     try:
@@ -136,6 +132,8 @@ Examples:
     # Make arguments optional - fallback to .env
     parser.add_argument('--fleet-url', help='Fleet server URL (default: from .env)')
     parser.add_argument('--email', help='Fleet user email (default: from .env)')
+    parser.add_argument('--password', help='Fleet user password (default: from .env)')
+    parser.add_argument('--api-token', help='Fleet API token (alternative to email/password, for production)')
     parser.add_argument('--memgraph-uri', help='Memgraph URI (default: from .env or bolt://localhost:7687)')
     parser.add_argument('--insecure', action='store_true', help='Disable TLS verification for self-signed certs (development only)')
     parser.add_argument('--debug-auth', action='store_true', help='Print auth response diagnostics')
@@ -144,16 +142,14 @@ Examples:
     parser.add_argument('--full-scan', action='store_true', help='Ignore last run time and fetch ALL data.')
     parser.add_argument('--complete-enrichment', action='store_true', help='Enrich ALL software in database with Wikidata (warning: may take long)')
     parser.add_argument('--enrich-software', help='Comma-separated list of specific software names to enrich immediately')
-    parser.add_argument('--force', action='store_true', help='Force enrichment limit to exceed 250 (uses 3% of total hosts)')
 
     args = parser.parse_args()
 
     # Get configuration from args or .env (args take precedence)
     fleet_url = args.fleet_url or env_vars.get('FLEET_URL')
     email = args.email or env_vars.get('FLEET_EMAIL')
-    # Secrets MUST come from .env or environment variables, not CLI arguments
-    password = env_vars.get('FLEET_PASSWORD')
-    api_token = env_vars.get('FLEET_API_TOKEN')
+    password = args.password or env_vars.get('FLEET_PASSWORD')
+    api_token = args.api_token or env_vars.get('FLEET_API_TOKEN')
     memgraph_uri = args.memgraph_uri or env_vars.get('MEMGRAPH_URI', 'bolt://localhost:7687')
     insecure = args.insecure or str_to_bool(env_vars.get('INSECURE', 'false'))
     debug_auth = args.debug_auth or str_to_bool(env_vars.get('DEBUG', 'false'))
@@ -185,8 +181,9 @@ Examples:
         if not token:
             print("❌ Login failed. Check credentials or use --debug-auth / --insecure if self-signed cert.")
             if debug_auth:
-                status, msg = auth.probe_login(email, password)
-                print(f"Auth probe status={status} diagnostic_msg='{msg}'")
+                status, body = auth.probe_login(email, password)
+                safe_body = body[:300].replace("\n", " ")
+                print(f"Auth probe status={status} body_snippet='{safe_body}'")
             sys.exit(1)
         print("✅ Login successful.")
     else:
@@ -279,40 +276,8 @@ Examples:
     try:
         # Prioritize rare software (outliers) to enrich Shadow IT detections
         # If --enrich-software is provided, we prioritize those.
-        target_names = [n.strip() for n in args.enrich_software.split(',') if n.strip()] if args.enrich_software and args.enrich_software.strip() else None
-        
-        limit = None
-        if args.complete_enrichment:
-            limit = None
-            print("🚀 Full enrichment requested (no limit).")
-        else:
-            # Calculate dynamic limit: 3% of total hosts, capped at 250 (unless forced)
-            try:
-                # We need a quick driver check to get total hosts. 
-                # (Ingestion just closed its driver, categorize opens its own, checking here is safe)
-                with GraphDatabase.driver(memgraph_uri) as driver:
-                    with driver.session() as session:
-                        result = session.run("MATCH (h:Host) RETURN count(h) as count")
-                        record = result.single()
-                        total_hosts = record['count'] if record else 0
-                        
-                        # 3% threshold
-                        target_limit = int(total_hosts * 0.03)
-                        # Ensure at least minimal enrichment happens (e.g. top 10) if fleet is tiny
-                        target_limit = max(10, target_limit) 
-                        
-                        if args.force:
-                            limit = target_limit
-                            print(f"🎯 Auto-calculated enrichment limit: {limit} (3% of {total_hosts} hosts) -- FORCE ENABLED (ignoring 250 cap)")
-                        else:
-                            limit = min(target_limit, 250)
-                            cap_msg = "(capped at 250)" if target_limit > 250 else ""
-                            print(f"🎯 Auto-calculated enrichment limit: {limit} (3% of {total_hosts} hosts) {cap_msg}")
-                            
-            except Exception as e:
-                print(f"⚠️  Could not query total hosts for limit calculation, defaulting to 250. Error: {e}")
-                limit = 250
-
+        target_names = [n.strip() for n in args.enrich_software.split(',')] if args.enrich_software else None
+        limit = None if args.complete_enrichment else 250
         run_categorization(memgraph_uri=memgraph_uri, limit=limit, target_names=target_names)
     except Exception as e:
         print(f"⚠️  WARNING: Software categorization failed: {e}")
