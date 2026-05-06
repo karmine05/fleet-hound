@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import requests
 
+
 class FleetAuthenticator:
     def __init__(
         self,

@@ -1,4 +1,5 @@
 flask==3.0.2
 requests==2.31.0
+urllib3==2.3.0
 neo4j==5.22.0
 gunicorn==21.2.0

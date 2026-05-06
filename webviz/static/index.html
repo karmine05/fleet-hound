@@ -62,13 +62,16 @@
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'SF Mono', 'Consolas', 'Monaco', monospace;
 
-            --text-xs: 0.6875rem;
-            --text-sm: 0.75rem;
-            --text-base: 0.8125rem;
-            --text-md: 0.875rem;
-            --text-lg: 1rem;
-            --text-xl: 1.25rem;
-            --text-2xl: 1.75rem;
+            /* Typography scale (tightened in Phase 4 for legibility — old base
+               was 13px which fails comfortable reading on 1440px+ screens). */
+            --text-xs: 0.75rem;     /* 12px — captions, metric subtitles */
+            --text-sm: 0.8125rem;   /* 13px — secondary controls, table cells */
+            --text-base: 0.875rem;  /* 14px — body */
+            --text-md: 0.9375rem;   /* 15px — sidebar headings */
+            --text-lg: 1.0625rem;   /* 17px */
+            --text-xl: 1.375rem;    /* 22px */
+            --text-2xl: 1.875rem;   /* 30px — hero metric values */
+            --line-height-base: 1.5;
 
             --font-normal: 400;
             --font-medium: 500;
@@ -130,11 +133,41 @@
         body {
             font-family: var(--font-sans);
             font-size: var(--text-base);
+            line-height: var(--line-height-base);
             background: var(--bg-primary);
             color: var(--text-primary);
             overflow: hidden;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* Honor a user's reduced-motion preference. The D3 force simulation tick
+           still runs (it has to in order to lay out the graph) but every CSS-driven
+           transition collapses to instant, which makes the dashboard usable for
+           folks with vestibular sensitivity. */
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
+
+        /* Visible focus ring for every interactive control — a11y baseline.
+           The original sheet only highlighted text inputs on focus, which left
+           keyboard users on buttons/tabs without any indication of where they were. */
+        a:focus-visible,
+        button:focus-visible,
+        [role="tab"]:focus-visible,
+        [role="button"]:focus-visible,
+        select:focus-visible,
+        input:focus-visible,
+        textarea:focus-visible,
+        .entity-item:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+            border-radius: var(--radius-sm);
         }
 
         /* ========================================
@@ -204,6 +237,21 @@
             display: flex;
             align-items: center;
             gap: var(--space-2);
+        }
+
+        .topbar-meta {
+            font-size: var(--text-xs);
+            color: var(--text-tertiary);
+            padding: 4px var(--space-2);
+            border-radius: var(--radius-sm);
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            white-space: nowrap;
+            font-variant-numeric: tabular-nums;
+        }
+        .topbar-meta strong {
+            color: var(--text-secondary);
+            font-weight: var(--font-medium);
         }
 
         .theme-toggle {
@@ -499,6 +547,219 @@
             stroke: var(--node-highlight);
             stroke-width: 4px;
             stroke-opacity: 1;
+        }
+
+        /* Pathfinder mode + correlation pulse */
+        .pathfinder-status {
+            font-size: 12px;
+            color: var(--text-tertiary);
+            padding: 0 8px;
+            align-self: center;
+        }
+        #pathfinder-toggle.active,
+        #clusters-toggle.active {
+            background: var(--accent-muted);
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+        /* Pathfinder highlight rules — qualified with #graph so they win
+           against [data-theme="light"] .link (equal specificity but declared
+           later in the file). See debug/pathfinder-broken.md cycle 2. */
+        #graph .node.dim circle,
+        #graph .node.dim text { opacity: 0.15; }
+        #graph .link.dim { stroke-opacity: 0.06; }
+        #graph .link.path-edge {
+            stroke: var(--accent);
+            stroke-width: 3px;
+            stroke-opacity: 1;
+            stroke-dasharray: 12 6;
+            animation: path-march 1.8s linear infinite;
+        }
+        #graph .node.path-pick circle {
+            stroke: var(--accent);
+            stroke-width: 4px;
+            filter: drop-shadow(0 0 6px var(--accent));
+        }
+        /* Top-layer pathfinder overlay — fresh <line>/<circle>/<text>
+           drawn ABOVE everything, decoupled from base .link DOM lifecycle. */
+        #graph .path-overlay-edge {
+            fill: none;
+            stroke: var(--accent);
+            stroke-width: 4.5px;
+            stroke-opacity: 1;
+            stroke-linecap: round;
+            stroke-dasharray: 14 6;
+            animation: path-march 1.8s linear infinite;
+            filter: drop-shadow(0 0 4px var(--accent));
+            pointer-events: none;
+        }
+        #graph .path-overlay-hop-badge {
+            fill: var(--accent);
+            stroke: var(--bg-primary);
+            stroke-width: 2px;
+            pointer-events: none;
+        }
+        #graph .path-overlay-hop-badge-text {
+            fill: var(--bg-primary);
+            font-size: 10px;
+            font-weight: 700;
+            text-anchor: middle;
+            pointer-events: none;
+            user-select: none;
+        }
+        @keyframes path-march {
+            from { stroke-dashoffset: 0; }
+            to { stroke-dashoffset: -36; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            #graph .link.path-edge,
+            #graph .path-overlay-edge { animation: none; stroke-dasharray: none; }
+        }
+        .pulse-ring {
+            fill: none;
+            stroke: var(--accent);
+            stroke-width: 2px;
+            opacity: 0.7;
+            transform-origin: center;
+            animation: pulse-ring 1.6s ease-out infinite;
+        }
+        @keyframes pulse-ring {
+            0%   { r: 12; opacity: 0.7; }
+            80%  { r: 36; opacity: 0; }
+            100% { r: 36; opacity: 0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .pulse-ring { animation: none; r: 22; opacity: 0.4; }
+        }
+        .cluster-hull {
+            fill: var(--accent-muted);
+            stroke: var(--accent);
+            stroke-opacity: 0.45;
+            stroke-width: 1.5;
+            stroke-linejoin: round;
+            pointer-events: none;
+        }
+        .cluster-label {
+            font-size: 11px;
+            font-weight: 600;
+            fill: var(--text-tertiary);
+            pointer-events: none;
+            text-anchor: middle;
+        }
+
+        /* Enricher pill + popover */
+        .enricher-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: var(--accent-muted);
+            border: 1px solid transparent;
+            color: var(--text-secondary, var(--text-tertiary));
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .enricher-pill:hover { border-color: var(--accent); }
+        .enricher-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--text-tertiary);
+            display: inline-block;
+        }
+        .enricher-pill.is-running .enricher-dot { background: #22c55e; }
+        .enricher-pill.is-error .enricher-dot { background: #f59e0b; }
+        .enricher-pill.is-disabled .enricher-dot { background: #6b7280; }
+        .enricher-popover {
+            position: absolute;
+            top: 56px;
+            right: 16px;
+            min-width: 260px;
+            padding: 12px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border, var(--text-tertiary));
+            border-radius: 8px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+            z-index: 100;
+            font-size: 12px;
+        }
+        .enricher-popover-row {
+            display: flex; justify-content: space-between; gap: 12px;
+            margin-bottom: 6px;
+        }
+        .enricher-popover-row.enricher-error { color: var(--danger, #ef4444); }
+        .enricher-popover .btn { margin-top: 6px; width: 100%; }
+
+        /* Changes tab */
+        .changes-layout {
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            gap: 16px;
+            padding: 16px;
+            height: 100%;
+            overflow: hidden;
+        }
+        .changes-sidebar {
+            background: var(--bg-secondary, var(--accent-muted));
+            border-radius: 8px;
+            padding: 16px;
+            overflow-y: auto;
+        }
+        .changes-main {
+            overflow-y: auto;
+            padding-right: 8px;
+        }
+        .changes-section {
+            margin-bottom: 18px;
+            border: 1px solid var(--border, transparent);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .changes-section header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 14px;
+            background: var(--accent-muted);
+            font-weight: 600;
+        }
+        .changes-section .badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge-added { background: rgba(34,197,94,0.15); color: #16a34a; }
+        .badge-removed { background: rgba(239,68,68,0.15); color: #dc2626; }
+        .badge-changed { background: rgba(245,158,11,0.15); color: #b45309; }
+        .changes-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            max-height: 360px;
+            overflow-y: auto;
+        }
+        .changes-list li {
+            padding: 8px 14px;
+            border-top: 1px solid var(--border, rgba(127,127,127,0.15));
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 12px;
+        }
+        .changes-list li:first-child { border-top: none; }
+        .changes-list .id-badge {
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 11px;
+            color: var(--text-tertiary);
+        }
+        .changes-list .view-link {
+            font-size: 11px;
+            color: var(--accent);
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .changes-empty {
+            padding: 18px 14px;
+            color: var(--text-tertiary);
+            font-style: italic;
+            font-size: 12px;
         }
 
         [data-theme="light"] .link {
@@ -1212,21 +1473,46 @@
 
 <body>
     <!-- Top Bar: Title + Tabs + Actions -->
-    <div class="topbar">
+    <header class="topbar" role="banner">
         <div class="topbar-title">Fleet Hound</div>
-        <nav class="topbar-nav">
-            <button class="tab-btn active" onclick="switchView('graph')">Graph</button>
-            <button class="tab-btn" onclick="switchView('blast-radius')">Blast Radius</button>
-            <button class="tab-btn" onclick="switchView('shadow-it')">Shadow IT</button>
+        <nav class="topbar-nav" role="tablist" aria-label="Primary">
+            <button class="tab-btn active" role="tab" aria-selected="true" aria-controls="graph-view"
+                    id="tab-graph" data-view="graph">Graph</button>
+            <button class="tab-btn" role="tab" aria-selected="false" aria-controls="blast-radius-view"
+                    id="tab-blast-radius" data-view="blast-radius">Blast Radius</button>
+            <button class="tab-btn" role="tab" aria-selected="false" aria-controls="shadow-it-view"
+                    id="tab-shadow-it" data-view="shadow-it">Shadow IT</button>
+            <button class="tab-btn" role="tab" aria-selected="false" aria-controls="changes-view"
+                    id="tab-changes" data-view="changes">Changes</button>
         </nav>
         <div class="topbar-actions">
-            <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <span id="topbar-meta" class="topbar-meta" hidden></span>
+            <button id="enricher-pill" class="enricher-pill" type="button"
+                    aria-label="Enricher status" aria-haspopup="dialog" hidden>
+                <span class="enricher-dot" id="enricher-dot"></span>
+                <span id="enricher-pill-text">enricher…</span>
+            </button>
+            <div id="enricher-popover" class="enricher-popover" role="dialog"
+                 aria-label="Enricher details" hidden>
+                <div class="enricher-popover-row"><strong>Last tick:</strong>
+                    <span id="enricher-last-tick">—</span></div>
+                <div class="enricher-popover-row"><strong>Categorized total:</strong>
+                    <span id="enricher-total">0</span></div>
+                <div class="enricher-popover-row"><strong>Queue remaining:</strong>
+                    <span id="enricher-queue">0</span></div>
+                <div class="enricher-popover-row enricher-error" id="enricher-error-row" hidden>
+                    <strong>Last error:</strong>
+                    <span id="enricher-error">—</span>
+                </div>
+                <button class="btn btn-primary btn-sm" id="enricher-run-now-btn" type="button">Run now</button>
+            </div>
+            <button class="theme-toggle" type="button" aria-label="Toggle theme" id="theme-toggle-btn">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false">
                     <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1ZM8 13V3a5 5 0 0 1 0 10Z" fill="currentColor"/>
                 </svg>
             </button>
         </div>
-    </div>
+    </header>
 
     <!-- Graph Toolbar (visible only on Graph view) -->
     <div id="graph-toolbar" class="toolbar">
@@ -1264,6 +1550,20 @@
             <button class="btn btn-ghost" onclick="centerGraph()">Center</button>
             <button class="btn btn-ghost" onclick="resetPositions()">Reset</button>
             <button class="btn btn-ghost" onclick="loadGraph()">Refresh</button>
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group">
+            <button id="pathfinder-toggle" class="btn btn-ghost"
+                    onclick="togglePathfinder()" title="Click two nodes to animate the shortest path">
+                Pathfinder
+            </button>
+            <button id="clusters-toggle" class="btn btn-ghost"
+                    onclick="toggleClusters()" title="Group hosts by team and software by category">
+                Clusters
+            </button>
+            <span id="pathfinder-status" class="pathfinder-status" hidden></span>
         </div>
 
         <div class="toolbar-separator"></div>
@@ -1328,22 +1628,22 @@
                     <div class="metric">
                         <div class="metric-label">Host Reach</div>
                         <div class="metric-value" id="metric-host-reach">-</div>
-                        <div class="metric-subtitle">Hosts impacted</div>
+                        <div class="metric-subtitle" id="metric-host-reach-sub">Hosts impacted</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">User Impact</div>
                         <div class="metric-value" id="metric-user-impact">-</div>
-                        <div class="metric-subtitle">Users affected</div>
+                        <div class="metric-subtitle" id="metric-user-impact-sub">Users affected</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">Lateral Movement</div>
                         <div class="metric-value" id="metric-lateral-movement">-</div>
-                        <div class="metric-subtitle">2nd-degree hosts</div>
+                        <div class="metric-subtitle" id="metric-lateral-movement-sub">2nd-degree hosts</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">Platform Spread</div>
                         <div class="metric-value" id="metric-platform-diversity">-</div>
-                        <div class="metric-subtitle">OS Platforms</div>
+                        <div class="metric-subtitle" id="metric-platform-diversity-sub">OS Platforms</div>
                     </div>
                 </div>
 
@@ -1473,7 +1773,12 @@
                 <div class="detections-container">
                     <div class="detections-header">
                         <h3>Detection Results</h3>
-                        <span class="hint">Click a row for details</span>
+                        <div class="inline-row">
+                            <span class="hint">Click a row for details</span>
+                            <button id="shadow-export-csv-btn" type="button" class="btn btn-secondary btn-sm" disabled>
+                                Export CSV
+                            </button>
+                        </div>
                     </div>
                     <div id="detections-table-container" style="max-height: 600px; overflow-y: auto;">
                         <table class="detections-table" id="shadow-detections-table">
@@ -1545,9 +1850,143 @@
         </div>
     </div>
 
+    <!-- Changes View -->
+    <div id="changes-view" class="view-container">
+        <div class="changes-layout">
+            <aside class="changes-sidebar">
+                <h3 style="margin-top:0">Snapshot Diff</h3>
+                <div class="control-group">
+                    <label for="diff-from-select">From</label>
+                    <select id="diff-from-select"></select>
+                </div>
+                <div class="control-group">
+                    <label for="diff-to-select">To</label>
+                    <select id="diff-to-select"></select>
+                </div>
+                <button class="btn btn-primary btn-block" id="diff-run-btn" type="button">Compute diff</button>
+                <p class="hint" style="margin-top:12px">
+                    Snapshots are written automatically after each ETL run.
+                    Run <code>python3 main.py</code> twice to populate.
+                </p>
+            </aside>
+            <section class="changes-main" id="changes-main">
+                <div class="changes-empty">Pick two snapshots and run diff.</div>
+            </section>
+        </div>
+    </div>
+
     <div id="status" class="status" style="display: none;"></div>
 
     <script>
+        // ========================================
+        // API AUTH WRAPPER
+        // ========================================
+        // Backend optionally requires an API token (Bearer / X-Api-Token).
+        // We wrap window.fetch so every same-origin /api/* call attaches whatever
+        // token the user has entered. Three properties this needs to handle:
+        //
+        //   1. Persistence across reloads + tabs — store in localStorage so a
+        //      page refresh doesn't re-prompt.
+        //   2. Single-flight prompt — when the dashboard fires N concurrent
+        //      requests on first load and all N hit 401, only ONE prompt should
+        //      appear; the rest queue on the same in-flight token promise.
+        //   3. Surface a 401 once and stop prompting if the user cancels —
+        //      otherwise we'd loop forever.
+        (function () {
+            const TOKEN_KEY = 'webvizApiToken';
+            const origFetch = window.fetch.bind(window);
+
+            const isApiUrl = (input) => {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                return url.indexOf('/api/') === 0;
+            };
+
+            const readToken = () =>
+                (localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || '').trim();
+
+            const writeToken = (value) => {
+                if (!value) {
+                    localStorage.removeItem(TOKEN_KEY);
+                    sessionStorage.removeItem(TOKEN_KEY);
+                    return;
+                }
+                localStorage.setItem(TOKEN_KEY, value);
+                sessionStorage.setItem(TOKEN_KEY, value);
+            };
+
+            const attachToken = (init, token) => {
+                init = init || {};
+                init.headers = new Headers(init.headers || {});
+                if (token && !init.headers.has('Authorization')) {
+                    init.headers.set('Authorization', 'Bearer ' + token);
+                }
+                return init;
+            };
+
+            // Single-flight prompt. Concurrent 401s all await the same promise
+            // instead of stacking up `window.prompt` dialogs.
+            let pendingPrompt = null;
+            // If the user cancels, remember it for this page lifetime so further
+            // 401s pass through cleanly and let the caller's UI render its error.
+            let promptCancelled = false;
+
+            const promptForToken = () => {
+                if (promptCancelled) return Promise.resolve('');
+                if (pendingPrompt) return pendingPrompt;
+                pendingPrompt = new Promise((resolve) => {
+                    // Defer so the prompt doesn't compete with the current micro-task
+                    // (avoids weird stacking when 4 fetches all hit 401 simultaneously).
+                    setTimeout(() => {
+                        const entered = (window.prompt(
+                            'Enter Fleet Hound API token (WEBVIZ_API_TOKEN). Leave blank to cancel.'
+                        ) || '').trim();
+                        if (entered) {
+                            writeToken(entered);
+                        } else {
+                            promptCancelled = true;
+                        }
+                        pendingPrompt = null;
+                        resolve(entered);
+                    }, 0);
+                });
+                return pendingPrompt;
+            };
+
+            window.fetch = function (input, init) {
+                if (!isApiUrl(input)) return origFetch(input, init);
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                const token = readToken();
+                const initWithToken = attachToken(init, token);
+
+                return origFetch(input, initWithToken).then((response) => {
+                    if (response.status !== 401 || (init && init.__webvizAuthRetry)) {
+                        return response;
+                    }
+                    // /api/health is always public; a 401 there means something
+                    // genuinely broke — surface it instead of prompting.
+                    if (url.indexOf('/api/health') === 0) return response;
+                    if (promptCancelled) return response;
+
+                    return promptForToken().then((entered) => {
+                        if (!entered) return response;
+                        const retryInit = attachToken(
+                            { ...(init || {}), __webvizAuthRetry: true },
+                            entered,
+                        );
+                        retryInit.headers.set('Authorization', 'Bearer ' + entered);
+                        return origFetch(input, retryInit);
+                    });
+                });
+            };
+
+            // Expose a "forget token" hook so admins can reset from devtools.
+            window.fleetHoundClearToken = () => {
+                writeToken('');
+                promptCancelled = false;
+                console.log('Fleet Hound token cleared. Reload to be re-prompted.');
+            };
+        })();
+
         // ========================================
         // CSS VAR HELPER
         // ========================================
@@ -1646,10 +2085,20 @@
                 })
                 .then(data => {
                     if (data.error) throw new Error(data.message || data.error);
-                    currentData = data;
                     allGraphData = data;
-                    showStatus(`Loaded ${data.nodes.length} nodes, ${data.links.length} relationships`);
-                    renderGraph(data);
+                    // Performance guardrail: SVG-based force layouts melt at ~800
+                    // nodes. Beyond that we render the most-connected slice and
+                    // surface a clear status so the user knows it's a partial view.
+                    const RENDER_BUDGET = 800;
+                    let renderData = data;
+                    if (data.nodes.length > RENDER_BUDGET) {
+                        renderData = capGraphForRender(data, RENDER_BUDGET);
+                        showStatus(`Loaded ${data.nodes.length} nodes — showing top ${renderData.nodes.length} by connections. Use search to drill in.`, false);
+                    } else {
+                        showStatus(`Loaded ${data.nodes.length} nodes, ${data.links.length} relationships`);
+                    }
+                    currentData = renderData;
+                    renderGraph(renderData);
                 })
                 .catch(error => {
                     console.error('Error loading graph:', error);
@@ -1659,6 +2108,30 @@
                     }
                     showStatus('Error loading data: ' + errorMsg, true);
                 });
+        }
+
+        /**
+         * Reduce a graph to its `budget` most-connected nodes plus the links
+         * between them. Used as a soft cap for the initial overview render so
+         * SVG force layouts stay smooth on real-world fleets (≥1k nodes).
+         */
+        function capGraphForRender(data, budget) {
+            const degree = new Map();
+            data.links.forEach(l => {
+                const src = typeof l.source === 'object' ? l.source.id : l.source;
+                const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+                degree.set(src, (degree.get(src) || 0) + 1);
+                degree.set(tgt, (degree.get(tgt) || 0) + 1);
+            });
+            const ranked = [...data.nodes].sort((a, b) => (degree.get(b.id) || 0) - (degree.get(a.id) || 0));
+            const keep = new Set(ranked.slice(0, budget).map(n => n.id));
+            const nodes = data.nodes.filter(n => keep.has(n.id));
+            const links = data.links.filter(l => {
+                const src = typeof l.source === 'object' ? l.source.id : l.source;
+                const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+                return keep.has(src) && keep.has(tgt);
+            });
+            return { nodes, links, capped: true, original_count: data.nodes.length };
         }
 
         function renderGraph(data, filterDisconnected = true) {
@@ -1778,9 +2251,21 @@
                 d.fx = event.x;
                 d.fy = event.y;
             }
+
+            // Re-attach pathfinder click binding after re-render so the
+            // click.pathfinder namespace stays alive across legitimate
+            // re-renders (cluster toggle, host expand outside pick mode,
+            // etc.). See debug/pathfinder-broken.md.
+            if (typeof pathfinder !== 'undefined' && pathfinder.active) {
+                _bindPathfinderClicks();
+            }
         }
 
         function expandNodeConnections(clickedNode) {
+            // Pathfinder mode owns node clicks — don't re-render the graph
+            // mid-pick or the .click.pathfinder binding gets wiped along
+            // with the old DOM. See debug/pathfinder-broken.md.
+            if (typeof pathfinder !== 'undefined' && pathfinder.active) return;
             d3.selectAll('.node').classed('highlight-node', false);
             d3.selectAll('.link').classed('highlight-link', false);
 
@@ -2211,8 +2696,8 @@
                 item.className = 'entity-item';
                 item.innerHTML = `
                     <div class="flex-1">
-                        <div class="entity-name">${entity.name}</div>
-                        <div class="entity-meta">${entity.details || ''}</div>
+                        <div class="entity-name">${escapeHtml(entity.name)}</div>
+                        <div class="entity-meta">${escapeHtml(entity.details || '')}</div>
                     </div>
                 `;
                 item.onclick = () => selectBlastEntity(entity, item);
@@ -2379,10 +2864,21 @@
         }
 
         function updateBlastMetrics(data) {
-            document.getElementById('metric-host-reach').textContent = data.metrics.host_reach;
-            document.getElementById('metric-user-impact').textContent = data.metrics.user_impact;
-            document.getElementById('metric-lateral-movement').textContent = data.metrics.lateral_movement || 0;
-            document.getElementById('metric-platform-diversity').textContent = data.metrics.platform_diversity;
+            const metrics = data.metrics || {};
+            const totals = (data.scope && data.scope.totals) || {};
+            const setMetric = (id, value, denom, unit) => {
+                document.getElementById(id).textContent = value;
+                const sub = document.getElementById(id + '-sub');
+                if (sub && denom !== undefined) {
+                    sub.textContent = `${value} of ${denom} ${unit}`;
+                }
+            };
+            setMetric('metric-host-reach', metrics.host_reach || 0, totals.hosts, 'hosts impacted');
+            setMetric('metric-user-impact', metrics.user_impact || 0, totals.users, 'users affected');
+            // Lateral movement uses GLOBAL host count for normalization (cross-team danger).
+            setMetric('metric-lateral-movement', metrics.lateral_movement || 0, totals.hosts, '2nd-degree hosts');
+            // Platform diversity caps at 3 conceptually (windows/darwin/linux).
+            setMetric('metric-platform-diversity', metrics.platform_diversity || 0, 3, 'OS platforms');
         }
 
         function updateBlastDetails(data) {
@@ -2574,6 +3070,72 @@
             }
         }
 
+        // ========================================
+        // SHADOW IT — CSV export of currently-loaded detections
+        // ========================================
+        function _csvCell(value) {
+            if (value === null || value === undefined) return '';
+            const s = Array.isArray(value) ? value.join('; ') : String(value);
+            // RFC 4180 quoting: every cell wrapped in quotes, embedded quotes doubled.
+            return '"' + s.replace(/"/g, '""') + '"';
+        }
+
+        function exportShadowDetectionsCsv() {
+            if (!shadowITData || !Array.isArray(shadowITData.detections) || shadowITData.detections.length === 0) {
+                showStatus('Nothing to export.', true);
+                return;
+            }
+            // Honor any per-column filtering the user applied (filterShadowTable hides rows).
+            const tbody = document.getElementById('shadow-detections-tbody');
+            const visibleSoftware = new Set();
+            if (tbody) {
+                tbody.querySelectorAll('tr').forEach((tr) => {
+                    if (tr.style.display === 'none') return;
+                    const cell = tr.querySelector('td strong');
+                    if (cell && cell.textContent) visibleSoftware.add(cell.textContent.trim());
+                });
+            }
+            const rows = visibleSoftware.size > 0
+                ? shadowITData.detections.filter(d => visibleSoftware.has(d.software_name))
+                : shadowITData.detections;
+
+            const headers = [
+                'software_name', 'software_type', 'risk_level', 'category',
+                'detection_type', 'host_count', 'user_count', 'version',
+                'recommendation', 'affected_hosts', 'affected_users', 'platforms',
+            ];
+            const lines = [headers.join(',')];
+            rows.forEach((d) => {
+                lines.push([
+                    _csvCell(d.software_name),
+                    _csvCell(d.software_type),
+                    _csvCell(d.risk_level),
+                    _csvCell(d.category),
+                    _csvCell(d.detection_type),
+                    _csvCell(d.host_count),
+                    _csvCell((d.affected_users || []).length),
+                    _csvCell(d.version),
+                    _csvCell(d.recommendation),
+                    _csvCell(d.affected_hosts),
+                    _csvCell(d.affected_users),
+                    _csvCell(d.platforms),
+                ].join(','));
+            });
+            const csv = lines.join('\r\n');
+            // BOM so Excel detects UTF-8 correctly on first open.
+            const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const today = new Date().toISOString().slice(0, 10);
+            a.href = url;
+            a.download = `fleet-hound-shadow-it-${today}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showStatus(`Exported ${rows.length} detection${rows.length === 1 ? '' : 's'} to CSV`);
+        }
+
         async function loadShadowITDetections() {
             const teamFilter = document.getElementById('shadow-team-filter-new').value;
 
@@ -2616,9 +3178,13 @@
 
                 renderShadowITTable(data.detections);
                 filterShadowTable();
+                const exportBtn = document.getElementById('shadow-export-csv-btn');
+                if (exportBtn) exportBtn.disabled = !(data.detections && data.detections.length > 0);
             } catch (error) {
                 console.error('Error loading Shadow IT detections:', error);
                 showEmptyState('Error loading detections. Please try again.');
+                const exportBtn = document.getElementById('shadow-export-csv-btn');
+                if (exportBtn) exportBtn.disabled = true;
             }
         }
 
@@ -2664,15 +3230,16 @@
             detections.forEach(detection => {
                 const row = document.createElement('tr');
                 row.onclick = () => showDetectionDetails(detection);
+                const riskClass = ['high','medium','low'].includes(detection.risk_level) ? detection.risk_level : 'low';
                 row.innerHTML = `
                     <td><strong>${escapeHtml(detection.software_name)}</strong></td>
                     <td class="text-sm" style="color: var(--text-secondary);">${escapeHtml(detection.software_type || 'Unknown')}</td>
-                    <td><span class="badge badge-${detection.risk_level}">${detection.risk_level.toUpperCase()}</span></td>
-                    <td><span class="detection-category">${detection.category}</span></td>
-                    <td class="text-sm">${detection.detection_type.replace('_', ' ').toUpperCase()}</td>
-                    <td>${detection.host_count}</td>
-                    <td>${detection.affected_users.length}</td>
-                    <td class="text-sm">${truncateText(detection.version, 30)}</td>
+                    <td><span class="badge badge-${riskClass}">${escapeHtml((detection.risk_level || '').toUpperCase())}</span></td>
+                    <td><span class="detection-category">${escapeHtml(detection.category || '')}</span></td>
+                    <td class="text-sm">${escapeHtml((detection.detection_type || '').replace('_', ' ').toUpperCase())}</td>
+                    <td>${Number(detection.host_count) || 0}</td>
+                    <td>${(detection.affected_users || []).length}</td>
+                    <td class="text-sm">${escapeHtml(truncateText(detection.version, 30))}</td>
                 `;
                 tbody.appendChild(row);
             });
@@ -2705,6 +3272,14 @@
             const modal = document.getElementById('detection-details-modal');
             const body = document.getElementById('detection-details-body');
 
+            const safeRiskClass = ['high','medium','low'].includes(detection.risk_level) ? detection.risk_level : 'low';
+            const platforms = (detection.platforms || []).filter(Boolean).map(escapeHtml).join(', ');
+            const hostsHtml = (detection.affected_hosts || []).map(h => `<div style="padding: 1px 0;">&#8226; ${escapeHtml(h)}</div>`).join('');
+            const usersList = detection.affected_users || [];
+            const usersHtml = usersList.length > 0
+                ? usersList.map(u => `<div style="padding: 1px 0;">&#8226; ${escapeHtml(u)}</div>`).join('')
+                : '<span style="color: var(--text-tertiary);">No user data</span>';
+
             body.innerHTML = `
                 <div class="detail-row">
                     <div class="detail-label">Software Name</div>
@@ -2712,7 +3287,7 @@
                 </div>
                 <div class="detail-row">
                     <div class="detail-label">Risk Level</div>
-                    <div class="detail-value"><span class="badge badge-${detection.risk_level}">${detection.risk_level.toUpperCase()}</span></div>
+                    <div class="detail-value"><span class="badge badge-${safeRiskClass}">${escapeHtml((detection.risk_level || '').toUpperCase())}</span></div>
                 </div>
                 <div class="detail-row">
                     <div class="detail-label">Risk Reason</div>
@@ -2720,7 +3295,7 @@
                 </div>
                 <div class="detail-row">
                     <div class="detail-label">Detection Category</div>
-                    <div class="detail-value">${detection.category}</div>
+                    <div class="detail-value">${escapeHtml(detection.category || '')}</div>
                 </div>
                 ${detection.db_category && detection.db_category.length > 0 ? `
                 <div class="detail-row">
@@ -2736,30 +3311,24 @@
                 </div>` : ''}
                 <div class="detail-row">
                     <div class="detail-label">Detection Type</div>
-                    <div class="detail-value">${detection.detection_type.replace('_', ' ')}</div>
+                    <div class="detail-value">${escapeHtml((detection.detection_type || '').replace('_', ' '))}</div>
                 </div>
                 <div class="detail-row">
                     <div class="detail-label">Version</div>
                     <div class="detail-value">${escapeHtml(detection.version)}</div>
                 </div>
                 <div class="detail-row">
-                    <div class="detail-label">Affected Hosts (${detection.host_count})</div>
-                    <div class="detail-value scroll-y">
-                        ${detection.affected_hosts.map(h => `<div style="padding: 1px 0;">&#8226; ${escapeHtml(h)}</div>`).join('')}
-                    </div>
+                    <div class="detail-label">Affected Hosts (${Number(detection.host_count) || 0})</div>
+                    <div class="detail-value scroll-y">${hostsHtml}</div>
                 </div>
                 <div class="detail-row">
-                    <div class="detail-label">Affected Users (${detection.affected_users.length})</div>
-                    <div class="detail-value scroll-y">
-                        ${detection.affected_users.length > 0
-                            ? detection.affected_users.map(u => `<div style="padding: 1px 0;">&#8226; ${escapeHtml(u)}</div>`).join('')
-                            : '<span style="color: var(--text-tertiary);">No user data</span>'}
-                    </div>
+                    <div class="detail-label">Affected Users (${usersList.length})</div>
+                    <div class="detail-value scroll-y">${usersHtml}</div>
                 </div>
-                ${detection.platforms && detection.platforms.length > 0 ? `
+                ${platforms ? `
                 <div class="detail-row">
                     <div class="detail-label">Platforms</div>
-                    <div class="detail-value">${detection.platforms.join(', ')}</div>
+                    <div class="detail-value">${platforms}</div>
                 </div>` : ''}
                 <div class="detail-row">
                     <div class="detail-label">Details</div>
@@ -2770,7 +3339,7 @@
                     <div>${escapeHtml(detection.recommendation)}</div>
                 </div>
                 <div style="margin-top: var(--space-5); text-align: right;">
-                    <button class="btn btn-success" onclick="authorizeSoftware('${escapeHtml(detection.software_name).replace(/'/g, "\\'")}')">
+                    <button class="btn btn-success" id="authorize-btn">
                         Authorize Software
                     </button>
                     <div style="font-size: var(--text-xs); color: var(--text-tertiary); margin-top: var(--space-1);">
@@ -2778,6 +3347,13 @@
                     </div>
                 </div>
             `;
+
+            // Attach the click handler programmatically so the software name is
+            // never spliced into a JS string literal (no inline-handler injection).
+            const authorizeBtn = body.querySelector('#authorize-btn');
+            if (authorizeBtn) {
+                authorizeBtn.onclick = () => authorizeSoftware(detection.software_name);
+            }
 
             modal.classList.add('visible');
         }
@@ -2813,11 +3389,730 @@
         }
 
         // ========================================
+        // TAB / NAV — accessible click + keyboard handling
+        // ========================================
+        function wireTabs() {
+            const tabs = Array.from(document.querySelectorAll('[role="tab"][data-view]'));
+            tabs.forEach((tab, idx) => {
+                tab.addEventListener('click', () => switchView(tab.dataset.view));
+                tab.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        const dir = e.key === 'ArrowRight' ? 1 : -1;
+                        const next = tabs[(idx + dir + tabs.length) % tabs.length];
+                        next.focus();
+                        switchView(next.dataset.view);
+                    }
+                });
+            });
+        }
+
+        // Keep aria-selected in sync whenever switchView runs.
+        const _origSwitchView = typeof switchView === 'function' ? switchView : null;
+        function _syncTabAria(viewName) {
+            document.querySelectorAll('[role="tab"][data-view]').forEach((tab) => {
+                const active = tab.dataset.view === viewName;
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                tab.setAttribute('tabindex', active ? '0' : '-1');
+            });
+        }
+        if (_origSwitchView) {
+            window.switchView = function (name) {
+                _origSwitchView(name);
+                _syncTabAria(name);
+            };
+        }
+
+        // ========================================
+        // SYNC METADATA PILL — total nodes + last health-check time
+        // ========================================
+        async function refreshTopbarMeta() {
+            const pill = document.getElementById('topbar-meta');
+            if (!pill) return;
+            try {
+                const r = await fetch('/api/meta');
+                if (!r.ok) { pill.hidden = true; return; }
+                const data = await r.json();
+                if (!data || typeof data.hosts !== 'number') { pill.hidden = true; return; }
+                pill.innerHTML = `
+                    <strong>${escapeHtml(String(data.hosts))}</strong> hosts ·
+                    <strong>${escapeHtml(String(data.users))}</strong> users ·
+                    <strong>${escapeHtml(String(data.software))}</strong> software`;
+                pill.hidden = false;
+            } catch (_e) {
+                pill.hidden = true;
+            }
+        }
+
+        // ========================================
+        // PATHFINDER + CLUSTERS + HOVER CORRELATION
+        // ========================================
+        const _reduceMotion = window.matchMedia
+            ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            : false;
+
+        const pathfinder = {
+            active: false,
+            pickedFrom: null,
+            pickedTo: null,
+        };
+        let _pathfinderClickHandler = null;
+        let _hoverDebounceTimer = null;
+        let _correlationFetchToken = 0;
+        let _clustersOn = false;
+
+        function _pathStatus(msg) {
+            const el = document.getElementById('pathfinder-status');
+            if (!el) return;
+            if (!msg) { el.hidden = true; el.textContent = ''; return; }
+            el.hidden = false;
+            el.textContent = msg;
+        }
+
+        function togglePathfinder() {
+            pathfinder.active = !pathfinder.active;
+            pathfinder.pickedFrom = null;
+            pathfinder.pickedTo = null;
+            const btn = document.getElementById('pathfinder-toggle');
+            if (btn) btn.classList.toggle('active', pathfinder.active);
+            if (pathfinder.active) {
+                _pathStatus('Click two nodes to animate the shortest path (Esc to cancel)');
+                _bindPathfinderClicks();
+                _bindPathfinderEsc();
+            } else {
+                _pathStatus(null);
+                _unbindPathfinderClicks();
+                _unbindPathfinderEsc();
+                _clearPathHighlights();
+                d3.selectAll('#graph .node').classed('path-pick', false);
+            }
+        }
+
+        function _bindPathfinderClicks() {
+            _unbindPathfinderClicks();
+            _pathfinderClickHandler = function (event, d) {
+                if (!pathfinder.active || !d || !d.id) return;
+                event.stopPropagation();
+                event.preventDefault();
+                // No pick yet → set first.
+                if (!pathfinder.pickedFrom) {
+                    pathfinder.pickedFrom = d;
+                    d3.selectAll('#graph .node')
+                        .classed('path-pick', n => n.id === d.id);
+                    _pathStatus(`From: ${d.name} — pick destination (click again or Esc to cancel)`);
+                    return;
+                }
+                // Re-click same node → cancel selection.
+                if (d.id === pathfinder.pickedFrom.id) {
+                    pathfinder.pickedFrom = null;
+                    pathfinder.pickedTo = null;
+                    d3.selectAll('#graph .node').classed('path-pick', false);
+                    _pathStatus('Click two nodes to animate the shortest path (Esc to cancel)');
+                    return;
+                }
+                // Different node → second pick → run pathfinder.
+                if (!pathfinder.pickedTo) {
+                    pathfinder.pickedTo = d;
+                    _runPathfinder(pathfinder.pickedFrom, pathfinder.pickedTo);
+                }
+            };
+            d3.selectAll('#graph .node').on('click.pathfinder', _pathfinderClickHandler);
+        }
+
+        function _unbindPathfinderClicks() {
+            d3.selectAll('#graph .node').on('click.pathfinder', null);
+            _pathfinderClickHandler = null;
+        }
+
+        let _pathfinderEscHandler = null;
+        function _bindPathfinderEsc() {
+            _unbindPathfinderEsc();
+            _pathfinderEscHandler = function (e) {
+                if (e.key !== 'Escape' || !pathfinder.active) return;
+                pathfinder.pickedFrom = null;
+                pathfinder.pickedTo = null;
+                d3.selectAll('#graph .node').classed('path-pick', false);
+                _clearPathHighlights();
+                _pathStatus('Click two nodes to animate the shortest path (Esc to cancel)');
+            };
+            document.addEventListener('keydown', _pathfinderEscHandler);
+        }
+
+        function _unbindPathfinderEsc() {
+            if (_pathfinderEscHandler) {
+                document.removeEventListener('keydown', _pathfinderEscHandler);
+                _pathfinderEscHandler = null;
+            }
+        }
+
+        async function _runPathfinder(a, b) {
+            _pathStatus(`Querying path: ${a.name} → ${b.name}…`);
+            try {
+                const url = `/api/path?from=${encodeURIComponent(a.id)}&to=${encodeURIComponent(b.id)}&max_hops=4`;
+                const r = await fetch(url);
+                if (!r.ok) {
+                    _pathStatus('No path found');
+                    return;
+                }
+                const data = await r.json();
+                if (!data.ordered_ids || data.ordered_ids.length < 2) {
+                    _pathStatus('No path between selected nodes');
+                    return;
+                }
+                _animatePath(data);
+                _pathStatus(`Path: ${data.ordered_ids.length} nodes, ${data.links.length} edges`);
+            } catch (e) {
+                console.error('pathfinder error', e);
+                _pathStatus('Path lookup failed');
+            } finally {
+                pathfinder.pickedFrom = null;
+                pathfinder.pickedTo = null;
+            }
+        }
+
+        // Top-layer pathfinder overlay — drawn as fresh elements ABOVE base
+        // links so the highlight is unaffected by base-link CSS lifecycle,
+        // theme-overrides, or cluster-mode renders. Tick handler keeps the
+        // overlay aligned with the moving simulation. See debug/pathfinder-broken.md.
+        function _animatePath(data) {
+            _clearPathHighlights();
+            const orderedIds = (data.ordered_ids || []).slice();
+            if (orderedIds.length < 2) return;
+            const orderedSet = new Set(orderedIds);
+
+            // Backdrop: dim everything off-path so the overlay reads clearly.
+            d3.selectAll('#graph .node').classed('dim', d => !orderedSet.has(d.id));
+            d3.selectAll('#graph .link').classed('dim', true);
+            // Mark ALL path nodes (including intermediate hops) with path-pick
+            // so the entire chain glows red, not just the picked endpoints.
+            d3.selectAll('#graph .node').classed('path-pick', d => orderedSet.has(d.id));
+
+            // Resolve ordered_ids -> rendered node objects (carries .x/.y from sim).
+            const nodeById = new Map();
+            d3.selectAll('#graph .node').each(function (d) {
+                if (d && d.id) nodeById.set(d.id, d);
+            });
+            const orderedNodes = orderedIds.map(id => nodeById.get(id)).filter(Boolean);
+            if (orderedNodes.length < 2) {
+                // Couldn't resolve at least two endpoints in current view; fall
+                // back to status only — no overlay possible without coords.
+                return;
+            }
+
+            const svg = d3.select('#graph svg');
+            if (svg.empty()) return;
+            // Insert overlay LAST so it sits on top of <g class="links"> and
+            // <g class="nodes">. d3 append on the svg root achieves this.
+            const overlay = svg.append('g').attr('class', 'path-overlay');
+
+            // Edges between consecutive path nodes.
+            const edges = [];
+            for (let i = 0; i < orderedNodes.length - 1; i++) {
+                edges.push({ a: orderedNodes[i], b: orderedNodes[i + 1] });
+            }
+            const edgeSel = overlay.selectAll('line.path-overlay-edge')
+                .data(edges)
+                .enter().append('line')
+                .attr('class', 'path-overlay-edge');
+
+            // Numeric hop badges on intermediate nodes (skip endpoints — they
+            // already have the .path-pick glow + are visually anchored by the user's clicks).
+            const intermediates = orderedNodes.slice(1, -1).map((n, idx) => ({ node: n, order: idx + 1 }));
+            const badgeG = overlay.selectAll('g.path-overlay-hop-badge-g')
+                .data(intermediates)
+                .enter().append('g')
+                .attr('class', 'path-overlay-hop-badge-g');
+            badgeG.append('circle')
+                .attr('class', 'path-overlay-hop-badge')
+                .attr('r', 9);
+            badgeG.append('text')
+                .attr('class', 'path-overlay-hop-badge-text')
+                .attr('dy', '0.35em')
+                .text(d => String(d.order));
+
+            const _positionOverlay = () => {
+                edgeSel
+                    .attr('x1', d => d.a.x || 0)
+                    .attr('y1', d => d.a.y || 0)
+                    .attr('x2', d => d.b.x || 0)
+                    .attr('y2', d => d.b.y || 0);
+                badgeG.attr('transform', d => {
+                    // Offset badge slightly up-right of the node so it doesn't
+                    // sit on top of the node label.
+                    const x = (d.node.x || 0) + 14;
+                    const y = (d.node.y || 0) - 14;
+                    return `translate(${x},${y})`;
+                });
+            };
+
+            // Initial paint and ongoing tick alignment.
+            _positionOverlay();
+            if (typeof simulation !== 'undefined' && simulation) {
+                simulation.on('tick.path-overlay', _positionOverlay);
+            }
+        }
+
+        function _clearPathHighlights() {
+            d3.selectAll('#graph .node').classed('dim', false).classed('path-pick', false);
+            d3.selectAll('#graph .link').classed('dim', false).classed('path-edge', false);
+            d3.selectAll('#graph .pulse-ring').remove();
+            d3.select('#graph svg .path-overlay').remove();
+            if (typeof simulation !== 'undefined' && simulation) {
+                simulation.on('tick.path-overlay', null);
+            }
+        }
+
+        // ---- Hover correlation overlay ----
+        function _wireHoverCorrelation() {
+            d3.selectAll('#graph .node')
+                .on('mouseenter.correlate', function (event, d) {
+                    if (pathfinder.active) return;
+                    if (_hoverDebounceTimer) clearTimeout(_hoverDebounceTimer);
+                    const token = ++_correlationFetchToken;
+                    _hoverDebounceTimer = setTimeout(() => _fetchCorrelation(d, token), 250);
+                    _addPulseRing(d);
+                })
+                .on('mouseleave.correlate', function () {
+                    if (_hoverDebounceTimer) {
+                        clearTimeout(_hoverDebounceTimer);
+                        _hoverDebounceTimer = null;
+                    }
+                    _correlationFetchToken++;
+                    d3.selectAll('#graph .pulse-ring').remove();
+                    if (!pathfinder.active && !_clustersOn) {
+                        d3.selectAll('#graph .node').classed('highlight-node', false);
+                        d3.selectAll('#graph .link').classed('highlight-link', false);
+                    }
+                });
+        }
+
+        function _addPulseRing(d) {
+            d3.selectAll('#graph .pulse-ring').remove();
+            const svg = d3.select('#graph svg');
+            if (svg.empty()) return;
+            svg.append('circle')
+                .attr('class', 'pulse-ring')
+                .attr('cx', d.x || 0)
+                .attr('cy', d.y || 0)
+                .attr('r', 12);
+        }
+
+        async function _fetchCorrelation(d, token) {
+            if (!d || !d.id) return;
+            try {
+                const r = await fetch(`/api/correlate?id=${encodeURIComponent(d.id)}&depth=2`);
+                if (!r.ok) return;
+                if (token !== _correlationFetchToken) return; // stale hover
+                const data = await r.json();
+                const ids = new Set((data.nodes || []).map(n => n.id));
+                d3.selectAll('#graph .node').classed('highlight-node', n => ids.has(n.id));
+                d3.selectAll('#graph .link').classed('highlight-link', l => {
+                    const sId = (l.source && l.source.id) || l.source;
+                    const tId = (l.target && l.target.id) || l.target;
+                    return ids.has(sId) && ids.has(tId);
+                });
+            } catch (_e) { /* swallow */ }
+        }
+
+        // ---- Cluster grouping ----
+        function toggleClusters() {
+            _clustersOn = !_clustersOn;
+            const btn = document.getElementById('clusters-toggle');
+            if (btn) btn.classList.toggle('active', _clustersOn);
+            if (!simulation || !currentData) return;
+            if (_clustersOn) {
+                _applyClusterForces(currentData);
+            } else {
+                _removeClusterForces();
+            }
+            simulation.alpha(0.6).restart();
+        }
+
+        function _clusterKey(node) {
+            if (node.type === 'host') {
+                return `team:${node.team_name || node.team_id || 'no-team'}`;
+            }
+            if (node.type === 'software') {
+                const cat = Array.isArray(node.category) && node.category.length ? node.category[0] : 'uncategorized';
+                return `cat:${cat}`;
+            }
+            return 'users';
+        }
+
+        function _applyClusterForces(data) {
+            const groups = new Map();
+            (data.nodes || []).forEach(n => {
+                const k = _clusterKey(n);
+                if (!groups.has(k)) groups.set(k, []);
+                groups.get(k).push(n);
+            });
+            const groupKeys = Array.from(groups.keys());
+            const cols = Math.ceil(Math.sqrt(groupKeys.length || 1));
+            const container = document.getElementById('graph');
+            const w = container ? container.clientWidth : 1000;
+            const h = container ? container.clientHeight : 700;
+            const cellW = w / cols;
+            const cellH = h / Math.ceil((groupKeys.length || 1) / cols);
+
+            const centroids = new Map();
+            groupKeys.forEach((k, idx) => {
+                const cx = (idx % cols) * cellW + cellW / 2;
+                const cy = Math.floor(idx / cols) * cellH + cellH / 2;
+                centroids.set(k, { x: cx, y: cy });
+            });
+
+            simulation
+                .force('clusterX', d3.forceX(d => (centroids.get(_clusterKey(d)) || { x: w / 2 }).x).strength(0.15))
+                .force('clusterY', d3.forceY(d => (centroids.get(_clusterKey(d)) || { y: h / 2 }).y).strength(0.15));
+
+            // Hulls + labels — recomputed on tick but throttled to ~10fps so the
+            // O(N + group_count * pts log pts) hull pass doesn't shadow the main
+            // d3 simulation tick at 60fps. Reduced-motion: render hulls once,
+            // skip subsequent recomputes to avoid jitter.
+            const svg = d3.select('#graph svg');
+            svg.selectAll('.cluster-hull-layer').remove();
+            svg.selectAll('.cluster-label-layer').remove();
+            const hullLayer = svg.insert('g', ':first-child').attr('class', 'cluster-hull-layer');
+            const labelLayer = svg.append('g').attr('class', 'cluster-label-layer');
+
+            const _renderHulls = () => {
+                const polygons = [];
+                groups.forEach((nodes, key) => {
+                    const pts = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y))
+                                     .map(n => [n.x, n.y]);
+                    if (pts.length < 2) return;
+                    const hull = pts.length >= 3 ? d3.polygonHull(pts) : null;
+                    polygons.push({ key, hull, pts });
+                });
+                const sel = hullLayer.selectAll('path.cluster-hull').data(polygons.filter(p => p.hull), p => p.key);
+                sel.exit().remove();
+                sel.enter().append('path').attr('class', 'cluster-hull')
+                    .merge(sel)
+                    .attr('d', p => 'M' + p.hull.map(c => c.join(',')).join('L') + 'Z');
+
+                const lblSel = labelLayer.selectAll('text.cluster-label').data(polygons, p => p.key);
+                lblSel.exit().remove();
+                lblSel.enter().append('text').attr('class', 'cluster-label')
+                    .merge(lblSel)
+                    .attr('x', p => d3.mean(p.pts, c => c[0]))
+                    .attr('y', p => d3.min(p.pts, c => c[1]) - 8)
+                    .text(p => p.key);
+            };
+
+            // Initial render so hulls are visible immediately.
+            _renderHulls();
+
+            if (_reduceMotion) {
+                // Reduced-motion: don't re-render hulls during simulation, only on demand.
+                simulation.on('tick.cluster', null);
+            } else {
+                let _lastHullTick = 0;
+                const _hullThrottleMs = 100; // ~10fps
+                simulation.on('tick.cluster', () => {
+                    const now = (typeof performance !== 'undefined' && performance.now)
+                        ? performance.now()
+                        : Date.now();
+                    if (now - _lastHullTick < _hullThrottleMs) return;
+                    _lastHullTick = now;
+                    _renderHulls();
+                });
+            }
+        }
+
+        function _removeClusterForces() {
+            if (!simulation) return;
+            simulation.force('clusterX', null);
+            simulation.force('clusterY', null);
+            simulation.on('tick.cluster', null);
+            const svg = d3.select('#graph svg');
+            svg.selectAll('.cluster-hull-layer').remove();
+            svg.selectAll('.cluster-label-layer').remove();
+        }
+
+        // Re-wire correlation hover after every renderGraph(); patch the global.
+        const _origRenderGraph = renderGraph;
+        renderGraph = function (data, filterDisconnected) {
+            _origRenderGraph(data, filterDisconnected);
+            _wireHoverCorrelation();
+            if (pathfinder.active) _bindPathfinderClicks();
+            if (_clustersOn) {
+                _applyClusterForces(data);
+                if (simulation) simulation.alpha(0.4).restart();
+            }
+        };
+
+        // ========================================
+        // CHANGES TAB — snapshot diff
+        // ========================================
+        async function loadSnapshots() {
+            try {
+                const r = await fetch('/api/snapshots');
+                if (!r.ok) return [];
+                return await r.json();
+            } catch (_e) { return []; }
+        }
+
+        function _populateSnapshotPickers(snaps) {
+            const fromSel = document.getElementById('diff-from-select');
+            const toSel = document.getElementById('diff-to-select');
+            if (!fromSel || !toSel) return;
+            fromSel.innerHTML = '';
+            toSel.innerHTML = '';
+            if (!snaps || snaps.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = 'No snapshots yet';
+                fromSel.appendChild(opt.cloneNode(true));
+                toSel.appendChild(opt);
+                return;
+            }
+            snaps.forEach(s => {
+                const o = document.createElement('option');
+                o.value = s.slug || s.ts;
+                o.textContent = `${s.ts} — ${s.hosts}h ${s.users}u ${s.software}s`;
+                fromSel.appendChild(o.cloneNode(true));
+                toSel.appendChild(o);
+            });
+            // Default: from = previous (idx 1), to = latest (idx 0).
+            toSel.selectedIndex = 0;
+            fromSel.selectedIndex = Math.min(1, snaps.length - 1);
+        }
+
+        async function runDiff() {
+            const fromSel = document.getElementById('diff-from-select');
+            const toSel = document.getElementById('diff-to-select');
+            const main = document.getElementById('changes-main');
+            if (!fromSel || !toSel || !main) return;
+            const from = fromSel.value;
+            const to = toSel.value;
+            if (!from || !to) {
+                main.innerHTML = '<div class="changes-empty">Pick two snapshots first.</div>';
+                return;
+            }
+            main.innerHTML = '<div class="changes-empty">Computing diff…</div>';
+            try {
+                const r = await fetch(`/api/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+                if (!r.ok) {
+                    main.innerHTML = `<div class="changes-empty">Diff failed (${r.status})</div>`;
+                    return;
+                }
+                const data = await r.json();
+                _renderDiff(data);
+            } catch (e) {
+                console.error(e);
+                main.innerHTML = '<div class="changes-empty">Diff request failed</div>';
+            }
+        }
+
+        function _renderDiff(data) {
+            const main = document.getElementById('changes-main');
+            const sections = [
+                { key: 'added', label: 'Added', badge: 'badge-added' },
+                { key: 'removed', label: 'Removed', badge: 'badge-removed' },
+            ];
+            let html = '';
+            sections.forEach(({ key, label, badge }) => {
+                const bucket = data[key] || {};
+                const totalNodes = ['hosts', 'users', 'software'].reduce(
+                    (acc, k) => acc + ((bucket[k] || []).length), 0);
+                const totalEdges = (bucket.edges || []).length;
+                html += `<section class="changes-section">
+                    <header>${label}
+                        <span class="badge ${badge}">${totalNodes} nodes · ${totalEdges} edges</span>
+                    </header>`;
+                ['hosts', 'users', 'software'].forEach(k => {
+                    const items = bucket[k] || [];
+                    if (!items.length) return;
+                    html += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">${k} (${items.length})</div>`;
+                    html += '<ul class="changes-list">';
+                    items.slice(0, 200).forEach(id => {
+                        html += `<li>
+                            <span class="id-badge">${escapeHtml(id)}</span>
+                            <span class="view-link" data-jump-id="${escapeHtml(id)}">View on graph →</span>
+                        </li>`;
+                    });
+                    if (items.length > 200) {
+                        html += `<li><span class="id-badge">… ${items.length - 200} more</span></li>`;
+                    }
+                    html += '</ul>';
+                });
+                if ((bucket.edges || []).length) {
+                    html += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">edges</div>`;
+                    html += '<ul class="changes-list">';
+                    (bucket.edges || []).slice(0, 200).forEach(e => {
+                        html += `<li><span class="id-badge">${escapeHtml(e.label)}: ${escapeHtml(e.from)} → ${escapeHtml(e.to)}</span></li>`;
+                    });
+                    html += '</ul>';
+                }
+                if (totalNodes + totalEdges === 0) {
+                    html += '<div class="changes-empty">Nothing.</div>';
+                }
+                html += '</section>';
+            });
+
+            const changed = data.changed || [];
+            html += `<section class="changes-section">
+                <header>Property drift <span class="badge badge-changed">${changed.length} nodes</span></header>`;
+            if (changed.length) {
+                html += '<ul class="changes-list">';
+                changed.slice(0, 200).forEach(c => {
+                    const propKeys = Object.keys(c.props_changed || {});
+                    const summary = propKeys.slice(0, 3).map(k => {
+                        const v = c.props_changed[k];
+                        return `${k}: ${escapeHtml(JSON.stringify(v.old))} → ${escapeHtml(JSON.stringify(v.new))}`;
+                    }).join(' · ');
+                    html += `<li>
+                        <div>
+                            <div class="id-badge">${escapeHtml(c.id)}</div>
+                            <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">${summary}</div>
+                        </div>
+                        <span class="view-link" data-jump-id="${escapeHtml(c.id)}">View on graph →</span>
+                    </li>`;
+                });
+                html += '</ul>';
+            } else {
+                html += '<div class="changes-empty">No property drift detected.</div>';
+            }
+            html += '</section>';
+
+            main.innerHTML = html;
+
+            main.querySelectorAll('[data-jump-id]').forEach(el => {
+                el.addEventListener('click', () => {
+                    const id = el.getAttribute('data-jump-id');
+                    if (typeof switchView === 'function') switchView('graph');
+                    setTimeout(() => _jumpToCorrelation(id), 60);
+                });
+            });
+        }
+
+        async function _jumpToCorrelation(typedId) {
+            try {
+                const r = await fetch(`/api/correlate?id=${encodeURIComponent(typedId)}&depth=1`);
+                if (!r.ok) return;
+                const data = await r.json();
+                if (!data.nodes || !data.nodes.length) return;
+                currentData = data;
+                renderGraph(data);
+                setTimeout(() => {
+                    d3.selectAll('#graph .node').classed('highlight-node', d => d.id === typedId);
+                }, 80);
+            } catch (_e) { /* swallow */ }
+        }
+
+        // ========================================
+        // ENRICHER STATUS PILL
+        // ========================================
+        let _enricherTimer = null;
+
+        async function refreshEnricherStatus() {
+            const pill = document.getElementById('enricher-pill');
+            if (!pill) return;
+            try {
+                const r = await fetch('/api/enricher/status');
+                if (!r.ok) { pill.hidden = true; return; }
+                const s = await r.json();
+                pill.hidden = false;
+                pill.classList.remove('is-running', 'is-error', 'is-disabled');
+                if (!s.enabled) pill.classList.add('is-disabled');
+                else if (s.last_error) pill.classList.add('is-error');
+                else if (s.running) pill.classList.add('is-running');
+                const text = document.getElementById('enricher-pill-text');
+                if (text) {
+                    const total = s.items_categorized_total || 0;
+                    const queue = s.queue_remaining || 0;
+                    text.textContent = `${total.toLocaleString()} enriched · ${queue.toLocaleString()} left`;
+                }
+                document.getElementById('enricher-last-tick').textContent = s.last_tick_iso || '—';
+                document.getElementById('enricher-total').textContent = (s.items_categorized_total || 0).toLocaleString();
+                document.getElementById('enricher-queue').textContent = (s.queue_remaining || 0).toLocaleString();
+                const errRow = document.getElementById('enricher-error-row');
+                const errSpan = document.getElementById('enricher-error');
+                if (s.last_error) {
+                    errRow.hidden = false;
+                    errSpan.textContent = s.last_error;
+                } else {
+                    errRow.hidden = true;
+                }
+            } catch (_e) {
+                pill.hidden = true;
+            }
+        }
+
+        function _wireEnricherUI() {
+            const pill = document.getElementById('enricher-pill');
+            const popover = document.getElementById('enricher-popover');
+            const runBtn = document.getElementById('enricher-run-now-btn');
+            if (!pill || !popover || !runBtn) return;
+            pill.addEventListener('click', (e) => {
+                e.stopPropagation();
+                popover.hidden = !popover.hidden;
+            });
+            document.addEventListener('click', (e) => {
+                if (popover.hidden) return;
+                if (e.target === pill || pill.contains(e.target)) return;
+                if (!popover.contains(e.target)) popover.hidden = true;
+            });
+            runBtn.addEventListener('click', async () => {
+                runBtn.disabled = true;
+                runBtn.textContent = 'Triggering…';
+                try {
+                    const r = await fetch('/api/enricher/trigger', { method: 'POST' });
+                    if (r.status === 204) {
+                        runBtn.textContent = 'Triggered';
+                        setTimeout(refreshEnricherStatus, 800);
+                    } else if (r.status === 429) {
+                        runBtn.textContent = 'Cooldown — try later';
+                    } else {
+                        runBtn.textContent = `Failed (${r.status})`;
+                    }
+                } catch (_e) {
+                    runBtn.textContent = 'Failed';
+                }
+                setTimeout(() => {
+                    runBtn.disabled = false;
+                    runBtn.textContent = 'Run now';
+                }, 4000);
+            });
+        }
+
+        // Hook into switchView so Changes tab loads on demand.
+        const _switchViewBeforeChanges = window.switchView;
+        window.switchView = function (name) {
+            if (typeof _switchViewBeforeChanges === 'function') _switchViewBeforeChanges(name);
+            else _origSwitchView(name);
+            const graphToolbar = document.getElementById('graph-toolbar');
+            if (graphToolbar && name === 'changes') {
+                graphToolbar.style.display = 'none';
+            }
+            // Original switchView only knows about graph/blast-radius/shadow-it for
+            // the active-class lookup. Reapply for any tab via data-view.
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            const newBtn = document.querySelector(`[data-view="${name}"]`);
+            if (newBtn) newBtn.classList.add('active');
+            _syncTabAria(name);
+            if (name === 'changes' && !window._changesLoaded) {
+                window._changesLoaded = true;
+                loadSnapshots().then(_populateSnapshotPickers);
+                const btn = document.getElementById('diff-run-btn');
+                if (btn) btn.addEventListener('click', runDiff);
+            }
+        };
+
+        // ========================================
         // INIT
         // ========================================
         document.addEventListener('DOMContentLoaded', function () {
             loadThemePreference();
             loadExclusionSettings();
+            wireTabs();
+            _syncTabAria('graph');
+
+            const themeBtn = document.getElementById('theme-toggle-btn');
+            if (themeBtn) themeBtn.addEventListener('click', toggleTheme);
+
+            const exportBtn = document.getElementById('shadow-export-csv-btn');
+            if (exportBtn) exportBtn.addEventListener('click', exportShadowDetectionsCsv);
 
             const searchInput = document.getElementById('search-input');
             if (searchInput) {
@@ -2833,9 +4128,41 @@
             if (platformFilter) platformFilter.addEventListener('change', searchNodes);
             if (teamFilter) teamFilter.addEventListener('change', searchNodes);
 
+            // Esc closes any open modal.
+            document.addEventListener('keydown', (e) => {
+                if (e.key !== 'Escape') return;
+                document.querySelectorAll('.modal-overlay.visible').forEach((m) => m.classList.remove('visible'));
+                const pop = document.getElementById('enricher-popover');
+                if (pop) pop.hidden = true;
+            });
+
             loadTeams();
             loadPlatforms();
             loadGraph();
+            refreshTopbarMeta();
+
+            _wireEnricherUI();
+            refreshEnricherStatus();
+            _enricherTimer = setInterval(refreshEnricherStatus, 30000);
+
+            // The original switchView() doesn't know about the Changes tab,
+            // so wire a direct click handler that reapplies the active class +
+            // populates the diff sidebar on first click.
+            const changesTabBtn = document.getElementById('tab-changes');
+            if (changesTabBtn) {
+                changesTabBtn.addEventListener('click', () => {
+                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                    changesTabBtn.classList.add('active');
+                    const graphToolbar = document.getElementById('graph-toolbar');
+                    if (graphToolbar) graphToolbar.style.display = 'none';
+                    if (!window._changesLoaded) {
+                        window._changesLoaded = true;
+                        loadSnapshots().then(_populateSnapshotPickers);
+                        const btn = document.getElementById('diff-run-btn');
+                        if (btn) btn.addEventListener('click', runDiff);
+                    }
+                });
+            }
         });
     </script>
 </body>

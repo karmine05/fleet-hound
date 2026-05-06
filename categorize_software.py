@@ -9,11 +9,12 @@ This script is intentionally "dev" scoped, but we still treat it as production-g
 import argparse
 import os
 import time
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import requests
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+
 
 # Load environment variables (simplified loader)
 def load_env(env_path='.env'):
@@ -32,7 +33,7 @@ def load_env(env_path='.env'):
 ENV = load_env()
 MEMGRAPH_URI = os.environ.get('MEMGRAPH_URI') or ENV.get('MEMGRAPH_URI', 'bolt://localhost:7687')
 WIKIDATA_URL = "https://query.wikidata.org/sparql"
-USER_AGENT = 'FleetBloodhoundSoftwareCategorizer/1.0 (+https://github.com/fleetdm/Fleet-Bloodhound)'
+USER_AGENT = 'FleetHoundSoftwareCategorizer/1.0'
 
 
 def _escape_sparql_string_literal(value: str) -> str:
@@ -131,11 +132,29 @@ def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, lengt
     if iteration == total:
         print()
 
+def _memgraph_auth():
+    """Resolve MEMGRAPH_USER/MEMGRAPH_PASSWORD (with _FILE indirection) to a Bolt auth tuple."""
+    user = os.environ.get("MEMGRAPH_USER", "").strip() or ENV.get("MEMGRAPH_USER", "").strip()
+    pwd_file = os.environ.get("MEMGRAPH_PASSWORD_FILE", "").strip() or ENV.get("MEMGRAPH_PASSWORD_FILE", "").strip()
+    pwd = ""
+    if pwd_file:
+        try:
+            with open(pwd_file, "r", encoding="utf-8") as fh:
+                pwd = fh.read().strip()
+        except OSError:
+            pwd = ""
+    if not pwd:
+        pwd = os.environ.get("MEMGRAPH_PASSWORD", "").strip() or ENV.get("MEMGRAPH_PASSWORD", "").strip()
+    if user and pwd:
+        return (user, pwd)
+    return None
+
+
 def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 500, target_names=None):
     print(f"🔗 Connecting to Memgraph at {memgraph_uri}...")
     driver = None
     try:
-        driver = GraphDatabase.driver(memgraph_uri)
+        driver = GraphDatabase.driver(memgraph_uri, auth=_memgraph_auth())
         with driver.session() as session:
             # Test connection
             session.run("RETURN 1")

@@ -1,12 +1,26 @@
-from flask import Flask, jsonify, send_from_directory, request
-from neo4j import GraphDatabase
-from neo4j.exceptions import TransientError, ClientError
 import atexit
-import os
-import logging
+import hmac
+import ipaddress
 import json
+import logging
+import os
+import re
+import sys
 import tempfile
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+from neo4j import GraphDatabase
+from neo4j.exceptions import AuthError, ClientError, ServiceUnavailable, TransientError
+
+# /app on the container has webviz/, src/, categorize_software.py side by side
+# (Dockerfile copies them all). Make /app importable so we can `from src.snapshot
+# import ...` and `from enrich_worker import ...`.
+sys.path.insert(0, "/app")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Configure logging
 logging.basicConfig(
@@ -16,15 +30,262 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static')
-MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://memgraph:7687")
+
+
+# ----------------------------------------------------------------------------
+# Configuration helpers
+# ----------------------------------------------------------------------------
+def _resolve_secret(name: str, default: str = "") -> str:
+    """Resolve a secret from <NAME>_FILE first, then <NAME>, both whitespace-trimmed.
+
+    Lets operators mount Docker / Kubernetes secrets as files without committing
+    plaintext values to env. Both branches trim trailing newlines so a token
+    copy-pasted into an env var still compares cleanly against bearer headers.
+    """
+    file_var = name + "_FILE"
+    file_path = os.environ.get(file_var, "").strip()
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip()
+                if value:
+                    return value
+        except OSError as exc:
+            logger.warning("Failed to read %s=%s: %s", file_var, file_path, exc)
+    return os.environ.get(name, default).strip()
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# ----------------------------------------------------------------------------
+# Memgraph + auth configuration
+# ----------------------------------------------------------------------------
+MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://memgraph:7687").strip()
+MEMGRAPH_USER = _resolve_secret("MEMGRAPH_USER")
+MEMGRAPH_PASSWORD = _resolve_secret("MEMGRAPH_PASSWORD")
 
 # Only include raw backend error details in API responses if explicitly enabled.
-# This keeps safer defaults for "production-ready" usage while still allowing debugging.
-DEBUG_ERROR_DETAILS = os.environ.get("WEBVIZ_DEBUG_ERRORS", "false").lower() == "true"
+# Keeps safer defaults for "production-ready" usage while still allowing debugging.
+DEBUG_ERROR_DETAILS = _bool_env("WEBVIZ_DEBUG_ERRORS", False)
+
+# API auth posture. Three knobs:
+#   WEBVIZ_API_TOKEN              required header value for /api/* (in Authorization
+#                                 or X-Api-Token). When set, every API call must
+#                                 present it.
+#   WEBVIZ_REQUIRE_AUTH=true      refuse to start unless WEBVIZ_API_TOKEN is set.
+#   WEBVIZ_ALLOW_ANONYMOUS_READ   when token is unset, opt in to anonymous GETs
+#                                 from any client. POST/PUT/DELETE always require
+#                                 a token (defense against drive-by writes / CSRF).
+# /api/health and / are always reachable so containers and browsers can load.
+WEBVIZ_API_TOKEN = _resolve_secret("WEBVIZ_API_TOKEN")
+WEBVIZ_REQUIRE_AUTH = _bool_env("WEBVIZ_REQUIRE_AUTH", False)
+WEBVIZ_ALLOW_ANONYMOUS_READ = _bool_env("WEBVIZ_ALLOW_ANONYMOUS_READ", False)
+
+if WEBVIZ_REQUIRE_AUTH and not WEBVIZ_API_TOKEN:
+    raise SystemExit(
+        "WEBVIZ_REQUIRE_AUTH=true but WEBVIZ_API_TOKEN/WEBVIZ_API_TOKEN_FILE is unset. "
+        "Set the token or unset WEBVIZ_REQUIRE_AUTH."
+    )
+if not WEBVIZ_API_TOKEN:
+    if WEBVIZ_ALLOW_ANONYMOUS_READ:
+        logger.warning(
+            "WEBVIZ_API_TOKEN is unset and WEBVIZ_ALLOW_ANONYMOUS_READ=true: "
+            "anyone with network access can read /api/* GETs. POST/PUT/DELETE still "
+            "require a token. Front this with an authenticated reverse proxy in production."
+        )
+    else:
+        logger.warning(
+            "WEBVIZ_API_TOKEN is unset. /api/* GET requests are restricted to loopback "
+            "clients. Set WEBVIZ_API_TOKEN for remote access, or "
+            "WEBVIZ_ALLOW_ANONYMOUS_READ=true behind a trusted proxy."
+        )
+
+# Routes always accessible (no auth required).
+PUBLIC_PATHS = {"/api/health", "/"}
 
 # Configuration for persistence
 WHITELIST_FILE = '/app/config/whitelist.json'
 AUDIT_FILE = '/app/config/audit.log'
+SNAPSHOT_DIR = '/app/config/snapshots'
+
+# Enricher worker tunables (read once at import time).
+ENRICHER_ENABLED = _bool_env("ENRICHER_ENABLED", True)
+try:
+    ENRICHER_INTERVAL_SEC = int(os.environ.get("ENRICHER_INTERVAL_SEC", "300"))
+except ValueError:
+    ENRICHER_INTERVAL_SEC = 300
+try:
+    ENRICHER_BATCH_SIZE = int(os.environ.get("ENRICHER_BATCH_SIZE", "25"))
+except ValueError:
+    ENRICHER_BATCH_SIZE = 25
+ENRICHER_LOCK_PATH = os.environ.get("ENRICHER_LOCK_PATH", "/tmp/fleet-hound-enricher.lock")
+ENRICHER_TRIGGER_PATH = os.environ.get("ENRICHER_TRIGGER_PATH", "/tmp/fleet-hound-enricher.trigger")
+# Status file lives under /app/config (the bind-mounted volume) so all 4
+# gunicorn workers see the same view AND items_categorized_total survives
+# container restarts.
+ENRICHER_STATUS_PATH = os.environ.get("ENRICHER_STATUS_PATH", "/app/config/enricher_status.json")
+# Manual /api/enricher/trigger rate limit (seconds between accepted triggers).
+# Enforced cross-worker via trigger-file mtime.
+ENRICHER_MANUAL_TRIGGER_COOLDOWN = 30.0
+
+# OODA supervisor tunables (read once at import time).
+OODA_ENABLED = _bool_env("OODA_ENABLED", False)
+try:
+    OODA_INTERVAL_SEC = int(os.environ.get("OODA_INTERVAL_SEC", "1800"))
+except ValueError:
+    OODA_INTERVAL_SEC = 1800
+try:
+    # Run a full-scan ETL every N delta cycles. 0 disables periodic full-scans.
+    OODA_FULL_SCAN_EVERY = int(os.environ.get("OODA_FULL_SCAN_EVERY", "24"))
+except ValueError:
+    OODA_FULL_SCAN_EVERY = 24
+OODA_LOCK_PATH = os.environ.get("OODA_LOCK_PATH", "/tmp/fleet-hound-ooda.lock")
+OODA_TRIGGER_PATH = os.environ.get("OODA_TRIGGER_PATH", "/tmp/fleet-hound-ooda.trigger")
+OODA_STATUS_PATH = os.environ.get("OODA_STATUS_PATH", "/app/config/ooda_status.json")
+OODA_CYCLES_PATH = os.environ.get("OODA_CYCLES_PATH", "/app/config/ooda_cycles.jsonl")
+OODA_FINDINGS_PATH = os.environ.get("OODA_FINDINGS_PATH", "/app/config/ooda_findings.json")
+# State watermark and snapshot dir live under the bind-mounted /app/config so
+# they survive restarts AND are writable under the read_only rootfs.
+OODA_STATE_PATH = os.environ.get("OODA_STATE_PATH", "/app/config/.state.json")
+OODA_SNAPSHOT_DIR = os.environ.get("OODA_SNAPSHOT_DIR", SNAPSHOT_DIR)
+OODA_MANUAL_TRIGGER_COOLDOWN = 60.0
+
+# ---------------------------------------------------------------------------
+# Shadow IT classification helpers
+#
+# Shadow IT = end-user-installed software that bypasses IT/security review:
+# personal communication apps, unsanctioned file-sync, remote-access tools,
+# privacy/anonymity tools, and crypto miners. It is NOT OS-managed system
+# libraries, kernel headers, language toolchain packages, or transitive
+# dependencies pulled in by the package manager. Treating those as Shadow IT
+# generates pure noise (libreadline8, python3.12-dev, tzdata-legacy, etc.).
+#
+# These helpers are used by /api/shadow-it to filter the candidate set before
+# running outlier / high-risk / version-sprawl detection.
+# ---------------------------------------------------------------------------
+
+# Names that are almost always installed by the OS package manager as
+# transitive deps or platform components — never user-chosen Shadow IT.
+_SYSTEM_PACKAGE_RE = re.compile(
+    r"^("
+    # Library packages (lib*, *-dev, *-doc, *-data, *-common, *-headers, *-dbg, *-dbgsym)
+    r"lib[a-z0-9].*"
+    r"|.*-(dev|dbg|dbgsym|doc|docs|data|common|headers|src|source|locale|locales|man|examples|utils|runtime|core|base|tiny|minimal)"
+    # Linux kernel / firmware / boot
+    r"|linux-(image|headers|libc|modules|tools|cloud|generic|signed|firmware|base|hwe|aws|azure|gcp|oracle|kvm|raspi|ibm|nvidia)([-.].*)?"
+    r"|kernel(-.*)?|firmware-.*|grub[-.].*|systemd([-.].*)?|initramfs.*|initrd.*"
+    # Package manager / distro plumbing
+    r"|debconf.*|dpkg.*|apt(-.*)?|aptitude.*|yum.*|dnf.*|rpm(-.*)?|alien.*|snapd.*|flatpak.*"
+    # Locale / timezone / console
+    r"|tzdata(-.*)?|locales(-.*)?|language-pack(-.*)?|console-(setup|data)(-.*)?"
+    # Language runtimes shipped as distro packages (transitive deps, not user installs)
+    r"|python3?(-.*|\.[0-9]+(-.*)?)?"
+    r"|perl(-.*|-base|-modules.*)?"
+    r"|ruby[0-9.]*(-.*)?|gem-.*"
+    r"|golang(-.*)?"
+    # Toolchain
+    r"|gcc(-.*)?|g\+\+(-.*)?|clang(-.*)?|llvm(-.*)?|binutils(-.*)?|make.*|cmake.*"
+    r"|automake.*|autoconf.*|libtool.*|pkg-config.*"
+    # Desktop / X11 / fonts
+    r"|gnome-.*|kde-.*|xfce4-.*|cinnamon-.*|mate-.*|x11-.*|xorg-.*|xserver-.*"
+    r"|fonts-.*|gtk[0-9.-]*|qt[0-9.-]*"
+    # Crypto / certs / shells
+    r"|openssl.*|ca-certificates.*|gnupg.*|gpg.*|gpgv.*|gnupg2.*"
+    # Core utils
+    r"|ucf|sensible-utils|lsb-.*|base-(files|passwd)|coreutils|util-linux.*"
+    r"|findutils|grep|sed|gawk|tar|gzip|xz-utils|bzip2|zstd|file|less|nano"
+    r"|vim-(common|tiny|runtime)|bash|dash|zsh|tmux|screen"
+    # Network plumbing
+    r"|cups(-.*)?|samba.*|smbclient.*|nfs-.*|rpcbind.*|netbase|iproute2|iputils-.*"
+    r")$"
+)
+
+# Wikidata category tokens that indicate "this is OS plumbing, not an app".
+_SYSTEM_CATEGORY_TOKENS = (
+    "software library", "shared library", "system library",
+    "free software library", "kernel module", "device driver",
+    "header file", "package manager package", "metapackage",
+    "init system", "system component", "operating system component",
+)
+
+# osquery `software` table source values. Sourced from the upstream osquery
+# spec: https://osquery.io/schema/current#software
+#
+# Sources we treat as NOT-shadow-IT-relevant for the main scan:
+#   * Language ecosystem packages (npm/pip/gem/cargo): always dev-environment
+#     transitive deps, never user-chosen end-user software. A pip-installed
+#     `requests` library is not Shadow IT.
+#   * Browser/IDE extensions: legitimate Shadow IT surface, but with a totally
+#     different risk taxonomy (privacy-affecting extensions, malicious tab
+#     hijackers, telemetry add-ons). Out of scope for the app-level scan; flag
+#     via a dedicated extension-shadow-IT view in the future.
+_DEV_LANGUAGE_SOURCES = frozenset({
+    "npm_packages", "python_packages", "gem_packages", "cargo_packages",
+    "pkg_packages", "portage_packages",
+})
+_EXTENSION_SOURCES = frozenset({
+    "chrome_extensions", "firefox_addons", "safari_extensions",
+    "ie_extensions", "vscode_extensions", "atom_packages",
+})
+# Sources that ARE the primary user-installable app surface — apps the user
+# actively chose to install. These are the highest-signal Shadow IT candidates.
+_USER_APP_SOURCES = frozenset({
+    "apps",                  # macOS .app bundles
+    "programs",              # Windows installed programs
+    "homebrew_packages",     # macOS user-installed
+    "chocolatey_packages",   # Windows user-installed
+})
+
+
+def _is_non_app_source(sources) -> bool:
+    """Return True if every recorded source for the software is a dev-language
+    package manager or a browser/IDE extension — i.e. not a user-installed app."""
+    if not sources:
+        return False
+    src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
+    if not src_set:
+        return False
+    return src_set.issubset(_DEV_LANGUAGE_SOURCES | _EXTENSION_SOURCES)
+
+
+def _is_system_package(name: str, db_categories, sources=None) -> bool:
+    """Return True if a Software node represents OS plumbing, dev-language
+    transitive deps, or a browser/IDE extension — anything that is NOT a
+    user-chosen end-user application. Used to suppress false-positive Shadow
+    IT hits on packages like libreadline8, python3.12-dev, tzdata-legacy,
+    npm-react, vscode-docker."""
+    if not name:
+        return False
+    # Source-based filter: highest-signal, deterministic.
+    if _is_non_app_source(sources):
+        return True
+    if _SYSTEM_PACKAGE_RE.match(name.lower().strip()):
+        return True
+    if db_categories:
+        cat_text = " ".join(c.lower() for c in db_categories if isinstance(c, str))
+        if any(tok in cat_text for tok in _SYSTEM_CATEGORY_TOKENS):
+            return True
+    return False
+
+
+def _word_match(pattern: str, text_lower: str) -> bool:
+    """Match a keyword against text using non-alphanumeric word boundaries.
+    `'line' in 'libreadline8'` returns True (substring match) — that is the
+    bug. This helper enforces that 'line' only matches the standalone word
+    'line', not 'readline'/'pipeline'/'command-line'. Multi-word patterns
+    like 'tor browser' are supported."""
+    if not pattern or not text_lower:
+        return False
+    return re.search(
+        r"(?<![a-z0-9])" + re.escape(pattern) + r"(?![a-z0-9])",
+        text_lower,
+    ) is not None
+
 
 def load_whitelist():
     """Load authorized software list"""
@@ -81,43 +342,214 @@ def audit_log(action, details):
         # Keep one action per line (avoid newlines in user-controlled details).
         safe_details = (details or "").replace("\n", "\\n").replace("\r", "\\r")
         with open(AUDIT_FILE, 'a', encoding='utf-8') as f:
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             f.write(f"{timestamp} - {action} - {safe_details}\n")
     except Exception as e:
         logger.error(f"Error writing audit log: {e}")
 
 
+# ----------------------------------------------------------------------------
+# Memgraph driver lifecycle
+# ----------------------------------------------------------------------------
+# The driver is created lazily, after Gunicorn has already forked workers, so
+# every worker gets its own Bolt connection pool (sharing one across forked
+# processes corrupts pool state). _get_driver() retries transparently when the
+# DB is unreachable; _reset_driver() lets request handlers force a fresh
+# connection on a transient failure mid-request.
+_driver = None
+_driver_lock = threading.Lock()
+_DRIVER_INIT_RETRIES = 5
+_DRIVER_INIT_BACKOFF_SEC = 2.0
+
+
+def _build_auth():
+    if MEMGRAPH_USER and MEMGRAPH_PASSWORD:
+        return (MEMGRAPH_USER, MEMGRAPH_PASSWORD)
+    return None
+
+
+def _get_driver():
+    """Return a connected driver, lazily creating one on first use.
+
+    Returns None when Memgraph is unreachable after the bounded retry budget;
+    callers should treat that as a 503/500 condition.
+    """
+    global _driver
+    if _driver is not None:
+        return _driver
+    with _driver_lock:
+        if _driver is not None:
+            return _driver
+        auth = _build_auth()
+        last_err = None
+        for attempt in range(1, _DRIVER_INIT_RETRIES + 1):
+            try:
+                drv = GraphDatabase.driver(MEMGRAPH_URI, auth=auth)
+                with drv.session() as session:
+                    session.run("RETURN 1").consume()
+                logger.info("Connected to Memgraph at %s", MEMGRAPH_URI)
+                _driver = drv
+                return _driver
+            except AuthError as exc:
+                logger.error("Memgraph auth failed: %s", exc)
+                return None
+            except Exception as exc:
+                last_err = exc
+                if attempt < _DRIVER_INIT_RETRIES:
+                    logger.warning(
+                        "Memgraph connect attempt %d/%d failed (%s), retrying in %.1fs",
+                        attempt, _DRIVER_INIT_RETRIES, exc, _DRIVER_INIT_BACKOFF_SEC,
+                    )
+                    time.sleep(_DRIVER_INIT_BACKOFF_SEC)
+        logger.error("Failed to connect to Memgraph after %d attempts: %s",
+                     _DRIVER_INIT_RETRIES, last_err)
+        return None
+
+
+def _reset_driver():
+    """Drop the cached driver so the next _get_driver() call rebuilds it."""
+    global _driver
+    with _driver_lock:
+        if _driver is not None:
+            try:
+                _driver.close()
+            except Exception:
+                pass
+            _driver = None
+
+
 @atexit.register
 def _close_memgraph_driver():
-    """Best-effort cleanup for the global Neo4j/Memgraph driver."""
-    global driver
-    try:
-        if driver:
-            driver.close()
-    except Exception:
-        pass
+    """Best-effort cleanup at process exit."""
+    _reset_driver()
 
-# Test connection to Memgraph with retry logic
-driver = None
-max_retries = 5
-retry_count = 0
 
-while retry_count < max_retries and not driver:
+# Backwards-compatible shim: existing handlers do `if not driver: ...`. We expose
+# `driver` as a property-like accessor that resolves through _get_driver().
+class _DriverProxy:
+    def __bool__(self):
+        return _get_driver() is not None
+
+    def session(self, *args, **kwargs):
+        drv = _get_driver()
+        if drv is None:
+            raise ServiceUnavailable("Memgraph driver is not connected")
+        return drv.session(*args, **kwargs)
+
+
+driver = _DriverProxy()
+
+
+# ----------------------------------------------------------------------------
+# Auth + safety middleware
+# ----------------------------------------------------------------------------
+_LOOPBACK_NETS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+)
+
+
+def _is_loopback(addr: str) -> bool:
+    if not addr:
+        return False
     try:
-        driver = GraphDatabase.driver(MEMGRAPH_URI)
-        with driver.session() as session:
-            session.run("RETURN 1")
-        logger.info(f"✓ Connected to Memgraph at {MEMGRAPH_URI}")
-        break
-    except Exception as e:
-        retry_count += 1
-        if retry_count < max_retries:
-            logger.warning(f"Connection attempt {retry_count} failed, retrying... ({e})")
-            import time
-            time.sleep(2)
-        else:
-            logger.error(f"✗ Failed to connect to Memgraph after {max_retries} attempts: {e}")
-            driver = None
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in _LOOPBACK_NETS)
+
+
+def _client_ip() -> str:
+    return (request.remote_addr or "").strip()
+
+
+def _extract_token_from_request() -> str:
+    auth_header = request.headers.get("Authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return request.headers.get("X-Api-Token", "").strip()
+
+
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@app.before_request
+def _enforce_auth():
+    path = request.path or ""
+    # Always allow the healthcheck and the static index entry-point.
+    if path in PUBLIC_PATHS:
+        return None
+    if not path.startswith("/api/"):
+        return None
+
+    is_write = request.method in _STATE_CHANGING_METHODS
+
+    if WEBVIZ_API_TOKEN:
+        supplied = _extract_token_from_request()
+        if not supplied or not hmac.compare_digest(supplied, WEBVIZ_API_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
+        return None
+
+    # Token unconfigured. State-changing routes are always denied without a token —
+    # this is the CSRF / drive-by-write defense (anyone could otherwise POST to
+    # /api/authorize-software from a browser they happen to load on the LAN).
+    if is_write:
+        return jsonify({
+            "error": "Unauthorized",
+            "message": "Set WEBVIZ_API_TOKEN to enable state-changing API calls.",
+        }), 401
+
+    # GETs: loopback always OK, others require explicit anonymous-read opt-in.
+    if _is_loopback(_client_ip()):
+        return None
+    if WEBVIZ_ALLOW_ANONYMOUS_READ:
+        return None
+    return jsonify({
+        "error": "Unauthorized",
+        "message": "Set WEBVIZ_API_TOKEN, or WEBVIZ_ALLOW_ANONYMOUS_READ=true for read-only access.",
+    }), 401
+
+
+@app.after_request
+def _security_headers(response):
+    # Conservative defaults safe for an SPA that serves a single inline-JS HTML.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
+
+
+# ----------------------------------------------------------------------------
+# ReDoS guard for /api/search?mode=regex
+# ----------------------------------------------------------------------------
+# Belt + suspenders. We refuse obviously catastrophic patterns BEFORE forwarding
+# to Memgraph and we cap the input length tighter than the wildcard mode. The
+# ultimate safety net is memgraph.conf's --query-execution-timeout-sec.
+_MAX_REGEX_LEN = 100
+# Heuristic ReDoS blocklist. Targets the canonical catastrophic-backtracking
+# shapes; we accept some false positives in exchange for not having to run a
+# regex pattern in a sandbox. The Memgraph query timeout is the safety net.
+_REDOS_BLOCKLIST = (
+    re.compile(r"[+*?]\s*\)\s*[+*?]"),         # nested quantifier — (a+)+, (a*)*
+    re.compile(r"\(.+\)\s*\{\d+,?\d*\}\s*[+*]"),  # quantified group with outer * / +
+    re.compile(r"(?:\.\*){2,}"),               # consecutive greedy .*
+    re.compile(r"(?:\.\+){2,}"),               # consecutive greedy .+
+)
+
+
+def _validate_user_regex(pattern: str) -> tuple[bool, str]:
+    if pattern is None:
+        return False, "regex required"
+    if len(pattern) > _MAX_REGEX_LEN:
+        return False, f"regex pattern must be <= {_MAX_REGEX_LEN} chars"
+    for blocked in _REDOS_BLOCKLIST:
+        if blocked.search(pattern):
+            return False, "regex pattern rejected for safety (potential ReDoS)"
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return False, f"invalid regex: {exc}"
+    return True, ""
 
 @app.route("/api/hosts")
 def get_hosts():
@@ -193,20 +625,18 @@ def search_all():
 
     Returns full relationship graph with matching nodes and their connections.
     """
-    if not driver:
-        return jsonify({"error": "Database connection failed"}), 500
-
     search_term = request.args.get('q', '').strip()
     node_type = request.args.get('type', 'all').strip().lower()
     platform_filter = request.args.get('platform', 'all').strip().lower()
     team_filter = request.args.get('team', 'all').strip()
-    
+
 
     # Advanced search parameters
     search_mode = request.args.get('mode', 'wildcard').strip().lower()  # wildcard, exact, regex
     case_sensitive = request.args.get('case', 'false').strip().lower() == 'true'
 
-    # Validate key inputs (keep permissive where possible for backwards compatibility)
+    # Validate key inputs BEFORE touching the database so callers get a 400 even
+    # when Memgraph is down — and so a malicious regex never reaches the DB.
     allowed_node_types = {'all', 'host', 'user', 'software'}
     if node_type not in allowed_node_types:
         return jsonify({
@@ -227,7 +657,17 @@ def search_all():
             "error": "Search term too long",
             "message": "q must be <= 200 characters",
         }), 400
-    
+
+    # ReDoS guard: when caller asked for regex mode, validate the pattern up-front
+    # so catastrophic-backtracking patterns never reach Memgraph.
+    if search_mode == "regex" and search_term:
+        ok, msg = _validate_user_regex(search_term)
+        if not ok:
+            return jsonify({"error": "Invalid regex", "message": msg}), 400
+
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
     # Limit parameter
     try:
         limit_param = int(request.args.get('limit', 0))
@@ -1188,16 +1628,23 @@ def get_full_graph_data():
             host_result = session.run("""
                 MATCH (h:Host)
                 WHERE EXISTS((h)<-[:USES]-(:User)) OR EXISTS((h)<-[:INSTALLED_ON]-(:Software))
-                RETURN h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform
+                RETURN h.hostname AS hostname, h.os_version AS os_version,
+                       h.platform AS platform, h.team_id AS team_id,
+                       h.team_name AS team_name
             """)
             for record in host_result:
                 node_id = f"host_{record['hostname']}"
-                nodes.append({
+                node_obj = {
                     "id": node_id,
                     "name": record['hostname'],
                     "type": "host",
-                    "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
-                })
+                    "details": f"{record['os_version'] or ''} ({record['platform'] or ''})",
+                }
+                if record['team_id'] is not None:
+                    node_obj['team_id'] = record['team_id']
+                if record['team_name']:
+                    node_obj['team_name'] = record['team_name']
+                nodes.append(node_obj)
                 node_ids.add(node_id)
 
             # User nodes
@@ -1220,19 +1667,27 @@ def get_full_graph_data():
             # This avoids expensive COLLECT operations on large datasets
             software_result = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WITH s.name AS name, s.last_version AS last_version, COUNT(DISTINCT h) AS host_count
+                WITH s, COUNT(DISTINCT h) AS host_count
                 ORDER BY host_count DESC
                 LIMIT 50
-                RETURN name, last_version, host_count
+                RETURN s.name AS name, s.last_version AS last_version,
+                       s.category AS category,
+                       s.wikidata_description AS description,
+                       host_count
             """)
             for record in software_result:
                 node_id = f"software_{record['name']}"
-                nodes.append({
+                node_obj = {
                     "id": node_id,
                     "name": record['name'],
                     "type": "software",
-                    "details": f"Latest: {record['last_version'] or 'unknown'} (on {record['host_count']} hosts)"
-                })
+                    "details": f"Latest: {record['last_version'] or 'unknown'} (on {record['host_count']} hosts)",
+                }
+                if record['category']:
+                    node_obj['category'] = record['category']
+                if record['description']:
+                    node_obj['description'] = record['description']
+                nodes.append(node_obj)
                 node_ids.add(node_id)
 
             # Get relationships - only for nodes that exist
@@ -1508,9 +1963,45 @@ def get_host_software(hostname):
         logger.info(f"Host {hostname}: Returning {len(nodes)} nodes and {len(links)} links")
         return jsonify({"nodes": nodes, "links": links})
 
+@app.route("/api/meta")
+def get_meta():
+    """Lightweight summary used by the dashboard's top-bar pill.
+
+    Returns total host / user / software counts. Cheap query — uses node-label
+    counts which Memgraph keeps O(1)-ish in IN_MEMORY_TRANSACTIONAL mode.
+    """
+    if not driver:
+        return jsonify({"hosts": 0, "users": 0, "software": 0, "connected": False}), 200
+    try:
+        with driver.session() as session:
+            result = session.run("""
+                MATCH (h:Host) WITH count(h) AS hosts
+                OPTIONAL MATCH (u:User)-[:USES]->(:Host) WITH hosts, count(DISTINCT u) AS users
+                OPTIONAL MATCH (s:Software) RETURN hosts, users, count(s) AS software
+            """).single()
+        if not result:
+            return jsonify({"hosts": 0, "users": 0, "software": 0, "connected": True}), 200
+        return jsonify({
+            "hosts": result["hosts"] or 0,
+            "users": result["users"] or 0,
+            "software": result["software"] or 0,
+            "connected": True,
+        }), 200
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("meta query failed: %s", exc)
+        return jsonify({"hosts": 0, "users": 0, "software": 0, "connected": False}), 200
+
+
 @app.route("/api/health")
 def health_check():
-    """Health check endpoint for monitoring"""
+    """Health check endpoint for monitoring.
+
+    Doubles as the autonomy bootstrap: the Docker healthcheck hits this
+    every 30s, so the enricher and OODA supervisor boot on the first
+    healthcheck after startup without requiring an operator request.
+    """
+    _ensure_enricher_started()
+    _ensure_ooda_started()
     if not driver:
         return jsonify({
             "status": "unhealthy",
@@ -1625,16 +2116,54 @@ def get_shadow_it():
         # Default
         return 'Application'
     
-    # High-risk software patterns (case-insensitive)
+    # High-risk Shadow IT patterns. Curated list of specific brand/binary names
+    # that are end-user-installable and bypass IT review. All matches are
+    # word-boundary, not substring (see _word_match).
+    #
+    # Deliberately excluded:
+    #   * Generic terms ('line', 'voip', 'vpn', 'remote desktop',
+    #     'instant messaging', 'videotelephony', 'cryptocurrency', 'bitcoin',
+    #     'anonymizing proxy', 'file sharing', 'penetration testing').
+    #     These match either OS components (readline -> 'line', RDP -> 'remote
+    #     desktop') or are too broad to drive a security action.
+    #   * Sanctioned dual-use dev/security tools (docker, virtualbox, vmware,
+    #     wireshark, burp suite, metasploit, nmap, aircrack). These are
+    #     legitimate engineering tools; an outlier check on non-engineering
+    #     teams is the right signal, not a blanket high-risk flag.
     HIGH_RISK_PATTERNS = {
-        'Remote Access Tools': ['teamviewer', 'anydesk', 'chrome remote desktop', 'vnc', 'logmein', 'gotomypc', 'remotepc', 'splashtop', 'remote desktop'],
-        'File Sharing': ['dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud', 'bittorrent', 'utorrent', 'qbittorrent', 'file sharing'],
-        'Communication Apps': ['telegram', 'signal', 'whatsapp', 'discord', 'wechat', 'line', 'viber', 'kik', 'instant messaging', 'voip', 'videotelephony'],
-        'Developer Tools': ['docker', 'virtualbox', 'vmware', 'wireshark', 'burp suite', 'metasploit', 'nmap', 'aircrack', 'packet analyzer', 'penetration testing'],
-	        # NOTE: Avoid overly-generic patterns like "miner" because they produce false positives
-	        # for legitimate software (e.g., GNOME Tracker components like "tracker-miner-fs").
-	        'Cryptocurrency': ['nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer', 'claymore', 'minergate', 'cryptocurrency', 'bitcoin'],
-        'Tor/Privacy Tools': ['tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear', 'nordvpn', 'expressvpn', 'anonymizing proxy', 'vpn'],
+        # Personal remote-access tools — data exfil risk, bypasses jump-host policy.
+        'Remote Access Tools': [
+            'teamviewer', 'anydesk', 'chrome remote desktop', 'logmein',
+            'gotomypc', 'remotepc', 'splashtop', 'realvnc', 'tightvnc',
+            'ultravnc', 'screenconnect', 'connectwise control', 'parsec',
+        ],
+        # Personal file-sync — DLP bypass, exfil risk.
+        'File Sharing': [
+            'dropbox', 'wetransfer', 'mega', 'sync.com', 'tresorit', 'pcloud',
+            'bittorrent', 'utorrent', 'qbittorrent', 'transmission',
+            'deluge', 'vuze', 'frostwire', 'limewire',
+        ],
+        # Personal messaging — bypasses corporate IM/DLP.
+        'Communication Apps': [
+            'telegram', 'telegram desktop',
+            'signal', 'signal desktop',
+            'whatsapp', 'whatsapp desktop',
+            'discord', 'wechat', 'viber', 'kik messenger', 'qq', 'skype',
+        ],
+        # Crypto miners — almost always shadow IT or compromise indicator.
+        'Cryptocurrency Mining': [
+            'nicehash', 'cgminer', 'ethminer', 'xmrig', 'phoenixminer',
+            'claymore miner', 'minergate', 'bfgminer', 'sgminer', 'lolminer',
+            't-rex miner', 'gminer', 'teamredminer',
+        ],
+        # Privacy / anonymity / personal VPNs (specific brands only — generic
+        # 'vpn' catches enterprise VPN clients).
+        'Tor/Privacy Tools': [
+            'tor browser', 'tails', 'proxifier', 'psiphon', 'tunnelbear',
+            'nordvpn', 'expressvpn', 'protonvpn', 'mullvad', 'surfshark',
+            'private internet access', 'cyberghost', 'ipvanish',
+            'hotspot shield',
+        ],
     }
     
     
@@ -1643,10 +2172,9 @@ def get_shadow_it():
         total_hosts_res = session.run("MATCH (h:Host) RETURN count(h) AS count")
         total_hosts_count = total_hosts_res.single()['count'] or 1
         
-        # Thresholds
-        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.05)) # 5% threshold, min 2
-        MANAGED_THRESHOLD = int(total_hosts_count * 0.30) # 30% threshold for "common" software
-        
+        # Outlier threshold: software installed on <=5% of fleet (min 2 hosts).
+        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.05))
+
         detections = []
         detection_id_counter = 1
         
@@ -1676,12 +2204,15 @@ def get_shadow_it():
             outlier_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
-                COUNT(DISTINCT h) AS host_count,
-                COLLECT(DISTINCT h.hostname) AS hosts,
-                COLLECT(DISTINCT h.platform) AS platforms
+                WITH s.name AS software_name, s.last_version AS version,
+                     s.category AS db_category, s.wikidata_description AS db_desc,
+                     s.sources AS db_sources,
+                     COUNT(DISTINCT h) AS host_count,
+                     COLLECT(DISTINCT h.hostname) AS hosts,
+                     COLLECT(DISTINCT h.platform) AS platforms
                 WHERE host_count <= $outlier_threshold
-                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
+                RETURN software_name, version, host_count, hosts, platforms,
+                       db_category, db_desc, db_sources
                 ORDER BY host_count ASC, software_name ASC
             """
             
@@ -1690,6 +2221,18 @@ def get_shadow_it():
             
             result = session.run(outlier_query, **filter_params)
             for record in result:
+                # Skip OS-managed system packages, dev-language transitive deps,
+                # and browser/IDE extensions — none are user-chosen apps. The
+                # `sources` field carries the osquery install channel
+                # (apps, programs, deb_packages, npm_packages, vscode_extensions
+                # ...) and is the strongest signal.
+                if _is_system_package(
+                    record['software_name'],
+                    record.get('db_category') or [],
+                    record.get('db_sources') or [],
+                ):
+                    continue
+
                 # Get users on affected hosts
                 users_query = """
                     MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
@@ -1698,27 +2241,19 @@ def get_shadow_it():
                 users_result = session.run(users_query, software_name=record['software_name'])
                 users_record = users_result.single()
                 users = users_record['users'] if users_record else []
-                
+
                 # Risk level based on install count
                 risk_level = "high" if record['host_count'] == 1 else "medium"
                 
                 # Apply host count filter
                 if host_count_filter != 'all':
-                    if host_count_filter == '1' and record['host_count'] != 1:
-                        continue
-                    elif host_count_filter == '2' and record['host_count'] != 2:
-                        continue
-                    elif host_count_filter == '3+' and record['host_count'] < 3:
+                    if host_count_filter == '1' and record['host_count'] != 1 or host_count_filter == '2' and record['host_count'] != 2 or host_count_filter == '3+' and record['host_count'] < 3:
                         continue
                 
                 # Apply user count filter
                 user_count = len(users)
                 if user_count_filter != 'all':
-                    if user_count_filter == '1' and user_count != 1:
-                        continue
-                    elif user_count_filter == '2' and user_count != 2:
-                        continue
-                    elif user_count_filter == '3+' and user_count < 3:
+                    if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                         continue
                 
                 # Detect software type
@@ -1755,46 +2290,56 @@ def get_shadow_it():
             all_software_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, s.last_version AS version, s.category AS db_category, s.wikidata_description AS db_desc,
-                COUNT(DISTINCT h) AS host_count,
-                COLLECT(DISTINCT h.hostname) AS hosts,
-                COLLECT(DISTINCT h.platform) AS platforms
-                RETURN software_name, version, host_count, hosts, platforms, db_category, db_desc
+                WITH s.name AS software_name, s.last_version AS version,
+                     s.category AS db_category, s.wikidata_description AS db_desc,
+                     s.sources AS db_sources,
+                     COUNT(DISTINCT h) AS host_count,
+                     COLLECT(DISTINCT h.hostname) AS hosts,
+                     COLLECT(DISTINCT h.platform) AS platforms
+                RETURN software_name, version, host_count, hosts, platforms,
+                       db_category, db_desc, db_sources
             """
             
             result = session.run(all_software_query, **filter_params)
-            
+
             for record in result:
                 software_lower = record['software_name'].lower()
-                matched_category = None
-                
-                # Check against dynamic categories first
                 db_categories = record.get('db_category') or []
+                db_sources = record.get('db_sources') or []
+
+                # Skip OS-managed system packages, dev-language transitive deps,
+                # and browser/IDE extensions outright — none of these are
+                # Shadow IT regardless of name overlap with high-risk patterns.
+                if _is_system_package(record['software_name'], db_categories, db_sources):
+                    continue
+
+                matched_category = None
+
+                # 1. Wikidata category-based matching first (highest signal:
+                # the enrichment job has already classified the software).
                 for db_cat in db_categories:
                     db_cat_lower = db_cat.lower()
                     for category, patterns in HIGH_RISK_PATTERNS.items():
-                        # Check if any high-risk pattern matches the dynamic category
-                        if any(p in db_cat_lower for p in patterns) or category.lower() in db_cat_lower:
+                        if _word_match(category.lower(), db_cat_lower) or any(
+                            _word_match(p, db_cat_lower) for p in patterns
+                        ):
                             matched_category = category
                             break
                     if matched_category:
                         break
-                
-                # Fallback to name pattern matching if no dynamic category match
+
+                # 2. Fallback: word-boundary match on software name. Plain
+                # substring match is unsafe (libreadline8 -> 'line').
                 if not matched_category:
                     for category, patterns in HIGH_RISK_PATTERNS.items():
                         for pattern in patterns:
-                            if pattern in software_lower:
+                            if _word_match(pattern, software_lower):
                                 matched_category = category
                                 break
                         if matched_category:
                             break
-                
+
                 if matched_category:
-                    # Skip flagged Developer Tools if they are widely deployed (>30%)
-                    if matched_category == 'Developer Tools' and record['host_count'] > MANAGED_THRESHOLD:
-                        continue
-                        
                     # Get users on affected hosts
                     users_query = """
                         MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
@@ -1809,21 +2354,13 @@ def get_shadow_it():
                     
                     # Apply host count filter
                     if host_count_filter != 'all':
-                        if host_count_filter == '1' and record['host_count'] != 1:
-                            continue
-                        elif host_count_filter == '2' and record['host_count'] != 2:
-                            continue
-                        elif host_count_filter == '3+' and record['host_count'] < 3:
+                        if host_count_filter == '1' and record['host_count'] != 1 or host_count_filter == '2' and record['host_count'] != 2 or host_count_filter == '3+' and record['host_count'] < 3:
                             continue
                     
                     # Apply user count filter
                     user_count = len(users)
                     if user_count_filter != 'all':
-                        if user_count_filter == '1' and user_count != 1:
-                            continue
-                        elif user_count_filter == '2' and user_count != 2:
-                            continue
-                        elif user_count_filter == '3+' and user_count < 3:
+                        if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                             continue
                     
                     # Detect software type
@@ -1834,13 +2371,13 @@ def get_shadow_it():
                         continue
                     
                     if risk_filter == 'all' or risk_filter == risk_level:
-                        # Category-specific recommendations
+                        # Category-specific recommendations. Keys must match
+                        # HIGH_RISK_PATTERNS exactly.
                         recommendations = {
                             'Remote Access Tools': "Verify authorization. Remote access tools can be used for data exfiltration. Replace with approved enterprise solution.",
                             'File Sharing': "Verify authorization. File sharing apps may lead to data leakage. Use approved enterprise file sharing.",
                             'Communication Apps': "Verify authorization. Unofficial communication apps may bypass DLP policies. Use approved enterprise messaging.",
-                            'Developer Tools': "Verify if host is authorized dev machine. Developer tools on production systems pose security risks.",
-                            'Cryptocurrency': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
+                            'Cryptocurrency Mining': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
                             'Tor/Privacy Tools': "CRITICAL: Investigate immediately. Privacy/anonymity tools may indicate malicious activity or policy violation.",
                         }
                         
@@ -1866,22 +2403,34 @@ def get_shadow_it():
         if detection_type_filter in ['all', 'version_sprawl']:
             version_sprawl_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE s.last_version IS NOT NULL 
-                  AND s.last_version <> '' 
+                WHERE s.last_version IS NOT NULL
+                  AND s.last_version <> ''
                   {team_clause} {platform_clause} {whitelist_clause}
-                WITH s.name AS software_name, 
+                WITH s.name AS software_name,
+                     s.category AS db_category,
+                     s.sources AS db_sources,
                      COUNT(DISTINCT s.last_version) AS version_count,
                      COLLECT(DISTINCT s.last_version) AS versions,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts
                 WHERE version_count > 2
-                RETURN software_name, version_count, versions, host_count, hosts
+                RETURN software_name, db_category, db_sources, version_count, versions, host_count, hosts
                 ORDER BY version_count DESC
                 LIMIT 20
             """
-            
+
             result = session.run(version_sprawl_query, **filter_params)
             for record in result:
+                # System packages, dev-language deps, and extensions routinely
+                # show many versions across distro releases / lockfile drift —
+                # that's package-manager state, not Shadow IT.
+                if _is_system_package(
+                    record['software_name'],
+                    record.get('db_category') or [],
+                    record.get('db_sources') or [],
+                ):
+                    continue
+
                 # Get users on affected hosts
                 users_query = """
                     MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
@@ -1901,21 +2450,13 @@ def get_shadow_it():
                 
                 # Apply host count filter
                 if host_count_filter != 'all':
-                    if host_count_filter == '1' and record['host_count'] != 1:
-                        continue
-                    elif host_count_filter == '2' and record['host_count'] != 2:
-                        continue
-                    elif host_count_filter == '3+' and record['host_count'] < 3:
+                    if host_count_filter == '1' and record['host_count'] != 1 or host_count_filter == '2' and record['host_count'] != 2 or host_count_filter == '3+' and record['host_count'] < 3:
                         continue
                 
                 # Apply user count filter
                 user_count = len(users)
                 if user_count_filter != 'all':
-                    if user_count_filter == '1' and user_count != 1:
-                        continue
-                    elif user_count_filter == '2' and user_count != 2:
-                        continue
-                    elif user_count_filter == '3+' and user_count < 3:
+                    if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                         continue
                 
                 # Detect software type
@@ -1974,19 +2515,623 @@ def get_shadow_it():
             }
         })
 
-@app.route("/api/relationships")
-def get_relationships():
+_TYPED_ID_RE = re.compile(r"^(host|user|software)_(.+)$")
+
+
+def _resolve_typed_id(typed_id: str):
+    """Parse `host_<hostname>` / `user_<username>` / `software_<name>` into (kind, name).
+
+    Returns (None, None) on bad input.
+    """
+    if not typed_id or len(typed_id) > 400:
+        return None, None
+    m = _TYPED_ID_RE.match(typed_id)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def _node_label_for_kind(kind: str) -> str:
+    return {"host": "Host", "user": "User", "software": "Software"}[kind]
+
+
+def _key_prop_for_kind(kind: str) -> str:
+    return {"host": "hostname", "user": "username", "software": "name"}[kind]
+
+
+def _serialize_graph_node(record_obj):
+    """Map a Memgraph node object to the same node shape as /api/graph/full."""
+    labels = list(record_obj.labels) if hasattr(record_obj, "labels") else []
+    props = dict(record_obj) if record_obj else {}
+
+    if "Host" in labels:
+        hostname = props.get("hostname")
+        if not hostname:
+            return None
+        node = {
+            "id": f"host_{hostname}",
+            "name": hostname,
+            "type": "host",
+            "details": f"{props.get('os_version') or ''} ({props.get('platform') or ''})",
+        }
+        if props.get("team_id") is not None:
+            node["team_id"] = props.get("team_id")
+        if props.get("team_name"):
+            node["team_name"] = props.get("team_name")
+        return node
+    if "User" in labels:
+        username = props.get("username")
+        if not username:
+            return None
+        return {
+            "id": f"user_{username}",
+            "name": username,
+            "type": "user",
+            "details": props.get("email") or props.get("fullname") or "",
+        }
+    if "Software" in labels:
+        name = props.get("name")
+        if not name:
+            return None
+        node = {
+            "id": f"software_{name}",
+            "name": name,
+            "type": "software",
+            "details": f"Latest: {props.get('last_version') or 'unknown'}",
+        }
+        if props.get("category"):
+            node["category"] = props["category"]
+        if props.get("wikidata_description"):
+            node["description"] = props["wikidata_description"]
+        return node
+    return None
+
+
+def _link_type_for_rel(rel_type: str) -> str:
+    return {"USES": "uses", "INSTALLED_ON": "installed"}.get(rel_type, rel_type.lower())
+
+
+@app.route("/api/path")
+def get_path():
+    """Shortest path between two typed-id nodes via USES / INSTALLED_ON edges.
+
+    Query: from=<typed-id>&to=<typed-id>&max_hops=<1..6>
+    Returns: {nodes, links, ordered_ids}
+    """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+
+    from_id = request.args.get("from", "").strip()
+    to_id = request.args.get("to", "").strip()
+    try:
+        max_hops = int(request.args.get("max_hops", 4))
+    except ValueError:
+        max_hops = 4
+    if max_hops < 1 or max_hops > 6:
+        return jsonify({"error": "max_hops must be between 1 and 6"}), 400
+
+    a_kind, a_name = _resolve_typed_id(from_id)
+    b_kind, b_name = _resolve_typed_id(to_id)
+    if not a_kind or not b_kind:
+        return jsonify({"error": "Invalid typed id; expected <type>_<name>"}), 400
+
+    # Identity case: same node both endpoints. Skip the DB roundtrip and return
+    # a degenerate "path" containing just that node so the client can render it.
+    if from_id == to_id:
+        a_label = _node_label_for_kind(a_kind)
+        a_key = _key_prop_for_kind(a_kind)
+        try:
+            with driver.session() as session:
+                rec = session.run(
+                    f"MATCH (n:{a_label} {{{a_key}: $name}}) RETURN n LIMIT 1",
+                    name=a_name,
+                ).single()
+        except Exception as exc:
+            logger.error("path identity lookup failed: %s", exc)
+            return jsonify({"error": "Internal server error"}), 500
+        if not rec:
+            return jsonify({"error": "Node not found"}), 404
+        node_obj = _serialize_graph_node(rec["n"])
+        if not node_obj:
+            return jsonify({"error": "Node not found"}), 404
+        return jsonify({
+            "nodes": [node_obj],
+            "links": [],
+            "ordered_ids": [node_obj["id"]],
+        })
+
+    a_label = _node_label_for_kind(a_kind)
+    b_label = _node_label_for_kind(b_kind)
+    a_key = _key_prop_for_kind(a_kind)
+    b_key = _key_prop_for_kind(b_kind)
+
+    # Strategy 1: Memgraph BFS extension — fastest, returns shortest path natively.
+    # Strategy 2: Standard variable-length pattern with manual ORDER BY length(p).
+    #             Used when the BFS syntax is rejected by older Memgraph versions.
+    cypher_bfs = (
+        f"MATCH (a:{a_label} {{{a_key}: $aname}}), (b:{b_label} {{{b_key}: $bname}}) "
+        f"MATCH p = (a)-[:USES|INSTALLED_ON *BFS 1..{max_hops}]-(b) "
+        f"RETURN nodes(p) AS ns, relationships(p) AS rs LIMIT 1"
+    )
+    cypher_varlen = (
+        f"MATCH (a:{a_label} {{{a_key}: $aname}}), (b:{b_label} {{{b_key}: $bname}}) "
+        f"MATCH p = (a)-[:USES|INSTALLED_ON *1..{max_hops}]-(b) "
+        f"RETURN nodes(p) AS ns, relationships(p) AS rs "
+        f"ORDER BY length(p) ASC LIMIT 1"
+    )
+
+    rec = None
+    strategy_used = None
+    try:
+        with driver.session() as session:
+            rec = session.run(cypher_bfs, aname=a_name, bname=b_name).single()
+        strategy_used = "bfs"
+    except TransientError as exc:
+        logger.warning("path BFS transient: %s", exc)
+        return jsonify({"error": "Database transient error"}), 503
+    except ClientError as exc:
+        logger.info("path BFS syntax not supported, falling back to variable-length: %s", exc)
+        try:
+            with driver.session() as session:
+                rec = session.run(cypher_varlen, aname=a_name, bname=b_name).single()
+            strategy_used = "varlen"
+        except (TransientError, ClientError) as exc2:
+            logger.warning("path varlen failed: %s", exc2)
+            return jsonify({"error": "Database transient error"}), 503
+        except Exception as exc2:
+            logger.error("path varlen unexpected error: %s", exc2, exc_info=True)
+            return jsonify({"error": "Path query failed"}), 500
+    except Exception as exc:
+        logger.error("path query unexpected error: %s", exc, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+    if not rec:
+        logger.info("path: no path between %s and %s within %d hops (strategy=%s)",
+                    from_id, to_id, max_hops, strategy_used or "?")
+        return jsonify({"nodes": [], "links": [], "ordered_ids": []})
+
+    logger.info("path: %s -> %s (strategy=%s)", from_id, to_id, strategy_used)
+
+    nodes_raw = rec["ns"] or []
+    rels_raw = rec["rs"] or []
+
+    nodes = []
+    seen_ids = set()
+    ordered_ids = []
+    for n in nodes_raw:
+        node_obj = _serialize_graph_node(n)
+        if not node_obj:
+            continue
+        ordered_ids.append(node_obj["id"])
+        if node_obj["id"] not in seen_ids:
+            nodes.append(node_obj)
+            seen_ids.add(node_obj["id"])
+
+    links = []
+    for idx, r in enumerate(rels_raw):
+        if idx >= len(ordered_ids) - 1:
+            break
+        links.append({
+            "source": ordered_ids[idx],
+            "target": ordered_ids[idx + 1],
+            "type": _link_type_for_rel(r.type if hasattr(r, "type") else "USES"),
+        })
+
+    return jsonify({"nodes": nodes, "links": links, "ordered_ids": ordered_ids})
+
+
+@app.route("/api/correlate")
+def get_correlate():
+    """Ego network for a typed-id node.
+
+    Query: id=<typed-id>&depth=<1..3>
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    typed_id = request.args.get("id", "").strip()
+    try:
+        depth = int(request.args.get("depth", 2))
+    except ValueError:
+        depth = 2
+    if depth < 1 or depth > 3:
+        return jsonify({"error": "depth must be between 1 and 3"}), 400
+
+    kind, name = _resolve_typed_id(typed_id)
+    if not kind:
+        return jsonify({"error": "Invalid typed id; expected <type>_<name>"}), 400
+
+    label = _node_label_for_kind(kind)
+    key = _key_prop_for_kind(kind)
+
+    cypher = (
+        f"MATCH (n:{label} {{{key}: $name}})-[r:USES|INSTALLED_ON *1..{depth}]-(m) "
+        f"RETURN n, m, r"
+    )
+
+    try:
+        with driver.session() as session:
+            recs = list(session.run(cypher, name=name))
+    except TransientError as exc:
+        logger.warning("correlate transient: %s", exc)
+        return jsonify({"error": "Database transient error"}), 503
+    except Exception as exc:
+        logger.error("correlate failed: %s", exc)
+        return jsonify({"error": "Correlate query failed"}), 500
+
+    nodes_by_id = {}
+    link_keys = set()
+    links = []
+
+    for rec in recs:
+        for graph_node in (rec.get("n"), rec.get("m")):
+            obj = _serialize_graph_node(graph_node)
+            if obj:
+                nodes_by_id[obj["id"]] = obj
+        rels = rec.get("r") or []
+        # Walk the relationship list — each rel has start_node / end_node / type.
+        for r in rels:
+            try:
+                start_obj = _serialize_graph_node(r.start_node)
+                end_obj = _serialize_graph_node(r.end_node)
+            except AttributeError:
+                continue
+            if not start_obj or not end_obj:
+                continue
+            nodes_by_id[start_obj["id"]] = start_obj
+            nodes_by_id[end_obj["id"]] = end_obj
+            # USES edges always go user -> host, INSTALLED_ON go software -> host.
+            # Normalise direction for the frontend.
+            if r.type == "USES":
+                src, tgt = (start_obj, end_obj) if start_obj["type"] == "user" else (end_obj, start_obj)
+            elif r.type == "INSTALLED_ON":
+                src, tgt = (start_obj, end_obj) if start_obj["type"] == "software" else (end_obj, start_obj)
+            else:
+                src, tgt = start_obj, end_obj
+            key_str = f"{r.type}::{src['id']}::{tgt['id']}"
+            if key_str in link_keys:
+                continue
+            link_keys.add(key_str)
+            links.append({
+                "source": src["id"],
+                "target": tgt["id"],
+                "type": _link_type_for_rel(r.type),
+            })
+
+    return jsonify({"nodes": list(nodes_by_id.values()), "links": links})
+
+
+@app.route("/api/snapshots")
+def list_snapshots_route():
+    """List available graph snapshots (newest first)."""
+    try:
+        from src.snapshot import list_snapshots as _ls
+    except Exception as exc:
+        logger.error("snapshot module unavailable: %s", exc)
+        return jsonify([])
+    items = _ls(Path(SNAPSHOT_DIR))
+    # Caller doesn't need the absolute path; expose ts + counts.
+    return jsonify([
+        {
+            "ts": item["ts"],
+            "slug": item["slug"],
+            "hosts": item["hosts"],
+            "users": item["users"],
+            "software": item["software"],
+            "edges": item["edges"],
+        }
+        for item in items
+    ])
+
+
+def _resolve_snapshot_path(token: str):
+    """Map a `ts` or `slug` from a query param to an on-disk path. Returns None if missing."""
+    if not token:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._\-]", "", token)[:100]
+    if not safe:
+        return None
+    candidate = Path(SNAPSHOT_DIR) / f"{safe}.jsonl.gz"
+    if candidate.is_file():
+        return candidate
+    # Fall back to a ts -> slug match against list_snapshots metadata.
+    try:
+        from src.snapshot import list_snapshots as _ls
+    except Exception:
+        return None
+    for item in _ls(Path(SNAPSHOT_DIR)):
+        if item["ts"] == token or item["slug"] == token:
+            p = Path(item["path"])
+            if p.is_file():
+                return p
+    return None
+
+
+@app.route("/api/diff")
+def get_diff():
+    """Diff between two snapshots: ?from=<ts>&to=<ts>."""
+    a_token = request.args.get("from", "").strip()
+    b_token = request.args.get("to", "").strip()
+    if not a_token or not b_token:
+        return jsonify({"error": "from and to are required"}), 400
+
+    a_path = _resolve_snapshot_path(a_token)
+    b_path = _resolve_snapshot_path(b_token)
+    if not a_path or not b_path:
+        return jsonify({"error": "snapshot not found"}), 404
+
+    try:
+        from src.snapshot import diff_snapshots as _diff
+    except Exception as exc:
+        logger.error("snapshot module unavailable: %s", exc)
+        return jsonify({"error": "snapshot subsystem unavailable"}), 500
+
+    try:
+        result = _diff(a_path, b_path)
+    except Exception as exc:
+        logger.error("diff failed: %s", exc, exc_info=True)
+        return jsonify({"error": "Diff failed", "message": str(exc) if DEBUG_ERROR_DETAILS else None}), 500
+    return jsonify(result)
+
+
+# ----------------------------------------------------------------------------
+# Continuous enrichment worker
+# ----------------------------------------------------------------------------
+# Each gunicorn worker tries to claim the lock at boot. Only the holder runs
+# the enrichment loop. Other workers fall through. Status is mirrored to a
+# JSON file under /app/config and triggers travel via a tmpfs file mtime, so
+# the four worker views are coherent regardless of which one handles a given
+# /api request.
+_ENRICHER_STOP = None
+_ENRICHER_INIT_DONE = False
+_ENRICHER_INIT_LOCK = threading.Lock()
+
+
+def _ensure_enricher_started():
+    """Start the enricher on first /api request. Idempotent."""
+    global _ENRICHER_STOP, _ENRICHER_INIT_DONE
+    if _ENRICHER_INIT_DONE:
+        return
+    with _ENRICHER_INIT_LOCK:
+        if _ENRICHER_INIT_DONE:
+            return
+        try:
+            from enrich_worker import start_worker
+        except Exception as exc:
+            logger.error("enricher import failed: %s", exc)
+            _ENRICHER_INIT_DONE = True
+            return
+        try:
+            _, stop_evt = start_worker(
+                _get_driver,
+                interval_sec=ENRICHER_INTERVAL_SEC,
+                batch_size=ENRICHER_BATCH_SIZE,
+                lock_path=ENRICHER_LOCK_PATH,
+                trigger_path=ENRICHER_TRIGGER_PATH,
+                status_path=ENRICHER_STATUS_PATH,
+                enabled=ENRICHER_ENABLED,
+            )
+            _ENRICHER_STOP = stop_evt
+        except Exception as exc:
+            logger.error("enricher start failed: %s", exc, exc_info=True)
+        _ENRICHER_INIT_DONE = True
+
+
+@app.route("/api/enricher/status")
+def enricher_status():
+    _ensure_enricher_started()
+    try:
+        from enrich_worker import read_status, queue_remaining as _qr
+        snap = read_status(ENRICHER_STATUS_PATH)
+        # Override `enabled` with the live config so a status file written
+        # in a previous run can't claim the worker is enabled when the env
+        # has flipped it off.
+        snap["enabled"] = ENRICHER_ENABLED
+        snap["queue_remaining"] = _qr(_get_driver)
+    except Exception as exc:
+        logger.error("enricher status failed: %s", exc)
+        snap = {
+            "enabled": ENRICHER_ENABLED, "running": False,
+            "last_tick_iso": None, "items_categorized_total": 0,
+            "last_error": str(exc) if DEBUG_ERROR_DETAILS else None,
+            "queue_remaining": 0,
+        }
+    return jsonify(snap)
+
+
+@app.route("/api/enricher/trigger", methods=["POST"])
+def enricher_trigger():
+    _ensure_enricher_started()
+    if not ENRICHER_ENABLED:
+        return jsonify({"error": "Enricher disabled"}), 503
+    try:
+        from enrich_worker import fire_trigger
+    except Exception as exc:
+        logger.error("enricher import failed at trigger time: %s", exc)
+        return jsonify({"error": "Enricher unavailable"}), 503
+    fired, retry_after = fire_trigger(ENRICHER_TRIGGER_PATH,
+                                      cooldown_sec=ENRICHER_MANUAL_TRIGGER_COOLDOWN)
+    if not fired:
+        return jsonify({
+            "error": "Rate limited",
+            "retry_after_sec": int(retry_after),
+        }), 429
+    return ("", 204)
+
+
+@atexit.register
+def _stop_enricher():
+    if _ENRICHER_STOP is not None:
+        try:
+            _ENRICHER_STOP.set()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# OODA supervisor — Observe → Orient → Decide → Act
+# ----------------------------------------------------------------------------
+# One worker holds the OODA lock and drives the cycle; others fall through.
+# Status, cycles, and findings are mirrored to /app/config so all workers
+# can serve the same view via /api/ooda/*.
+_OODA_STOP = None
+_OODA_INIT_DONE = False
+_OODA_INIT_LOCK = threading.Lock()
+
+
+def _ensure_ooda_started():
+    """Start the OODA supervisor on first /api request. Idempotent."""
+    global _OODA_STOP, _OODA_INIT_DONE
+    if _OODA_INIT_DONE:
+        return
+    with _OODA_INIT_LOCK:
+        if _OODA_INIT_DONE:
+            return
+        try:
+            from ooda_worker import start_worker as _ooda_start
+        except Exception as exc:
+            logger.error("ooda import failed: %s", exc)
+            _OODA_INIT_DONE = True
+            return
+        try:
+            _, stop_evt = _ooda_start(
+                _get_driver,
+                interval_sec=OODA_INTERVAL_SEC,
+                full_scan_every=OODA_FULL_SCAN_EVERY,
+                state_path=OODA_STATE_PATH,
+                snapshot_dir=OODA_SNAPSHOT_DIR,
+                lock_path=OODA_LOCK_PATH,
+                trigger_path=OODA_TRIGGER_PATH,
+                status_path=OODA_STATUS_PATH,
+                cycles_path=OODA_CYCLES_PATH,
+                findings_path=OODA_FINDINGS_PATH,
+                enricher_trigger_path=ENRICHER_TRIGGER_PATH,
+                audit_log_path=AUDIT_FILE,
+                enabled=OODA_ENABLED,
+            )
+            _OODA_STOP = stop_evt
+        except Exception as exc:
+            logger.error("ooda start failed: %s", exc, exc_info=True)
+        _OODA_INIT_DONE = True
+
+
+@app.route("/api/ooda/status")
+def ooda_status():
+    _ensure_ooda_started()
+    try:
+        from ooda_worker import read_status
+        snap = read_status(OODA_STATUS_PATH)
+        # Override `enabled` with the live config so a stale status file
+        # cannot claim the worker is enabled when env has flipped it off.
+        snap["enabled"] = OODA_ENABLED
+        snap["interval_sec"] = OODA_INTERVAL_SEC
+        snap["full_scan_every"] = OODA_FULL_SCAN_EVERY
+    except Exception as exc:
+        logger.error("ooda status failed: %s", exc)
+        snap = {
+            "enabled": OODA_ENABLED, "running": False,
+            "next_cycle_id": 1, "last_phase": None,
+            "last_error": str(exc) if DEBUG_ERROR_DETAILS else None,
+            "cycles_total": 0, "cycles_failed": 0, "last_cycle": None,
+            "interval_sec": OODA_INTERVAL_SEC,
+            "full_scan_every": OODA_FULL_SCAN_EVERY,
+        }
+    return jsonify(snap)
+
+
+@app.route("/api/ooda/trigger", methods=["POST"])
+def ooda_trigger():
+    _ensure_ooda_started()
+    if not OODA_ENABLED:
+        return jsonify({"error": "OODA disabled"}), 503
+    try:
+        from ooda_worker import fire_trigger as _fire
+    except Exception as exc:
+        logger.error("ooda import failed at trigger time: %s", exc)
+        return jsonify({"error": "OODA unavailable"}), 503
+    fired, retry_after = _fire(OODA_TRIGGER_PATH,
+                               cooldown_sec=OODA_MANUAL_TRIGGER_COOLDOWN)
+    if not fired:
+        return jsonify({"error": "Rate limited",
+                        "retry_after_sec": int(retry_after)}), 429
+    audit_log("ooda_trigger", "manual cycle requested")
+    return ("", 204)
+
+
+@app.route("/api/ooda/findings")
+def ooda_findings():
+    _ensure_ooda_started()
+    try:
+        from ooda_worker import read_findings
+        return jsonify(read_findings(OODA_FINDINGS_PATH))
+    except Exception as exc:
+        logger.error("ooda findings failed: %s", exc)
+        return jsonify({"error": "Findings unavailable",
+                        "message": str(exc) if DEBUG_ERROR_DETAILS else "internal error"}), 500
+
+
+@app.route("/api/ooda/cycles")
+def ooda_cycles():
+    _ensure_ooda_started()
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+    try:
+        from ooda_worker import read_cycles
+        return jsonify(read_cycles(OODA_CYCLES_PATH, limit=limit))
+    except Exception as exc:
+        logger.error("ooda cycles failed: %s", exc)
+        return jsonify({"error": "Cycles unavailable",
+                        "message": str(exc) if DEBUG_ERROR_DETAILS else "internal error"}), 500
+
+
+@atexit.register
+def _stop_ooda():
+    if _OODA_STOP is not None:
+        try:
+            _OODA_STOP.set()
+        except Exception:
+            pass
+
+
+@app.route("/api/relationships")
+def get_relationships():
+    """List all USES + INSTALLED_ON edges. Bounded so a multi-million-edge fleet
+    can't OOM the response. Use the per-entity endpoints for full traversals.
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    try:
+        limit = int(request.args.get("limit", 5000))
+    except ValueError:
+        limit = 5000
+    limit = max(1, min(limit, 10000))
+
+    half = max(1, limit // 2)
+    rows = []
     with driver.session() as session:
-        result = session.run("""
-            MATCH (u:User)-[r:USES]->(h:Host)
+        uses = session.run(
+            """
+            MATCH (u:User)-[:USES]->(h:Host)
             RETURN 'USES' AS type, u.username AS from_name, h.hostname AS to_host
-            UNION
-            MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
+            LIMIT $limit
+            """,
+            limit=half,
+        )
+        rows.extend(r.data() for r in uses)
+        installed = session.run(
+            """
+            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
             RETURN 'INSTALLED_ON' AS type, s.name AS from_name, h.hostname AS to_host
-        """)
-        return jsonify([r.data() for r in result])
+            LIMIT $limit
+            """,
+            limit=limit - half,
+        )
+        rows.extend(r.data() for r in installed)
+    return jsonify(rows)
 
 @app.route("/")
 def index():
@@ -2023,9 +3168,13 @@ def internal_error(error):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     debug_mode = os.environ.get("DEBUG", "False").lower() == "true"
+    # Default the dev server to loopback so a misconfigured machine doesn't expose
+    # the dashboard to the LAN. Production runs under Gunicorn (see Dockerfile)
+    # which binds 0.0.0.0 explicitly.
+    bind_host = os.environ.get("WEBVIZ_BIND_HOST", "127.0.0.1")
 
-    logger.info(f"Starting Fleet Hound Web Dashboard on port {port}")
+    logger.info(f"Starting Fleet Hound Web Dashboard on {bind_host}:{port}")
     logger.info(f"Debug mode: {debug_mode}")
     logger.info(f"Memgraph URI: {MEMGRAPH_URI}")
 
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    app.run(host=bind_host, port=port, debug=debug_mode)

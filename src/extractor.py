@@ -1,6 +1,7 @@
-import requests
 import time
-import concurrent.futures
+
+import requests
+
 
 class FleetGraphExtractor:
     def extract_all_users(self):
@@ -141,109 +142,67 @@ class FleetGraphExtractor:
                 s_label = f" (since {current_since})" if current_since else " (full scan)"
                 print(f"[extractor] Fetching hosts for: {t_label}{s_label}")
 
-            # Define base parameters (starting with page 0)
+            # Define base parameters
+            per_page = 500
             params = {
-                'page': 0,
-                'per_page': 500,
+                'per_page': per_page,
                 'populate_users': True,
                 'populate_software': True
             }
             if team_id is not None:
                 params['team_id'] = team_id
-            
+
             # If doing differential fetch, ensure we sort by updated_at desc
             if current_since:
                 params['order_key'] = 'updated_at'
                 params['order_direction'] = 'desc'
 
-            # 1. Fetch first page to get metadata and check initial data
-            first_page_params = params.copy()
-            first_page_params['page'] = 0
-            
-            if self.debug:
-                print(f"[extractor] Fetching first page for metadata...")
+            # Sequential pagination driven by meta.has_next_results.
+            # Fleet's PaginationMetadata does not serialize TotalResults
+            # (json tag "-"), so the only reliable signal that more pages
+            # exist is meta.has_next_results. Walk pages 0..N until that
+            # flag is false, the differential cutoff is crossed, or an
+            # error occurs.
+            page = 0
+            while True:
+                p_params = params.copy()
+                p_params['page'] = page
 
-            resp = self._get("/api/v1/fleet/hosts", params=first_page_params)
-            if not resp or resp.status_code != 200:
-                continue
-
-            try:
-                data = resp.json()
-            except ValueError:
                 if self.debug:
-                    print("[extractor] Failed to parse hosts JSON")
-                continue
+                    print(f"[extractor] Fetching hosts page {page}...")
 
-            # Process first page
-            hosts_p0 = data.get('hosts', [])
-            meta = data.get('meta', {})
-            total_count = meta.get('total', 0)
-            
-            # Initial filtering check on Page 0
-            # If we hit the age limit on page 0, we might stop immediately
-            valid_hosts_p0, stop_fetching_team = self._filter_hosts(hosts_p0, current_since)
-            hosts_data.extend(valid_hosts_p0)
+                resp = self._get("/api/v1/fleet/hosts", params=p_params)
+                if not resp or resp.status_code != 200:
+                    break
 
-            if stop_fetching_team:
-                if self.debug:
-                    print("[extractor] Stop condition met on Page 0.")
-                continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    if self.debug:
+                        print("[extractor] Failed to parse hosts JSON")
+                    break
 
-            # 2. Calculate remaining pages
-            # Fleet API uses 0-indexed pages? No, usually 0 is page 1?
-            # Code used 'page': page (starting 0).
-            # If total is 501, per_page 500. Page 0 = 0-499. Page 1 = 500.
-            # Total pages = ceil(total / per_page).
-            if total_count > 0:
-                 total_pages = (total_count + 499) // 500
-            else:
-                 total_pages = 0
-            
-            if total_pages <= 1:
-                continue
+                page_hosts = data.get('hosts', [])
+                valid_hosts, stop = self._filter_hosts(page_hosts, current_since)
+                hosts_data.extend(valid_hosts)
 
-            if self.debug:
-                print(f"[extractor] Total pages: {total_pages}. Fetching pages 1 to {total_pages-1} in parallel...")
+                if stop and current_since:
+                    if self.debug:
+                        print(f"[extractor] Differential cutoff reached on page {page}; stopping.")
+                    break
 
-            # 3. Parallel fetch for remaining pages
-            pages_to_fetch = range(1, total_pages)
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                pool_map = {executor.submit(self._fetch_host_page, p, params): p for p in pages_to_fetch}
-                
-                for future in concurrent.futures.as_completed(pool_map):
-                    page_num = pool_map[future]
-                    try:
-                        p_hosts = future.result()
-                        if p_hosts:
-                            valid_p, stop_p = self._filter_hosts(p_hosts, current_since)
-                            hosts_data.extend(valid_p)
-                            # Note: in parallel, 'stop_p' just means this page had old data.
-                            # We don't abort other in-flight requests (complexity adds up),
-                            # but we assume valid data is gathered.
-                    except Exception as exc:
-                        if self.debug:
-                            print(f"[extractor] Page {page_num} generated an exception: {exc}")
+                meta = data.get('meta', {})
+                if not meta.get('has_next_results', False):
+                    break
 
-            if self.debug:
-                print(f"[extractor] Finished fetching {total_pages} pages.")
+                page += 1
+                # Light pacing between pages to avoid hammering Fleet.
+                time.sleep(0.2)
 
         if self.debug:
             print(f"[extractor] Extracted {len(hosts_data)} hosts total (differential={bool(since)})")
 
         return hosts_data
-
-    def _fetch_host_page(self, page_num, base_params):
-        """Helper for parallel fetching"""
-        p_params = base_params.copy()
-        p_params['page'] = page_num
-        resp = self._get("/api/v1/fleet/hosts", params=p_params)
-        if resp and resp.status_code == 200:
-            try:
-                return resp.json().get('hosts', [])
-            except ValueError:
-                pass
-        return []
 
     def _filter_hosts(self, hosts, current_since):
         """Helper to filter hosts based on 'since'."""

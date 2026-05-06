@@ -1,0 +1,23 @@
+target-version = "py311"
+line-length = 110
+
+[lint]
+# Lean ruleset: pycodestyle errors, pyflakes, isort, bugbear, simplify.
+# Project intentionally uses some long lines and emoji-laden prints; we don't
+# bikeshed those.
+select = ["E", "F", "I", "B", "SIM"]
+ignore = [
+  "E501",   # line length is enforced by formatter, not linter, in this repo
+  "B008",   # default factory args
+  "B904",   # raise-from pedantry — out of scope for this refactor
+  "SIM102", # nested-if collapse triggers on legacy shadow-it filter ladder
+  "SIM105", # contextlib.suppress is fine but try/except/pass is clearer here
+  "SIM108", # ternary preference — readability over terseness
+  "SIM113", # enumerate-when-counting; fine as-is in legacy paths
+  "SIM114", # combine-if-with-or — same as above
+  "SIM117", # multiple-with-as is fine
+]
+exclude = ["benchmark_ingestion.py", "test_wikidata.py"]
+
+[lint.per-file-ignores]
+"tests/*" = ["B017"]

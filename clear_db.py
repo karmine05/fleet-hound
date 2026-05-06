@@ -4,7 +4,9 @@
 import argparse
 import os
 import sys
+
 from neo4j import GraphDatabase
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Clear all data from a Memgraph instance (DESTRUCTIVE).")
@@ -47,7 +49,20 @@ def clear_memgraph(memgraph_uri: str, *, assume_yes: bool, state_file: str) -> N
     print(f"Connecting to Memgraph at {memgraph_uri}...")
     driver = None
     try:
-        driver = GraphDatabase.driver(memgraph_uri)
+        # Pick up MEMGRAPH_USER/MEMGRAPH_PASSWORD (with _FILE) for authenticated instances.
+        user = os.environ.get("MEMGRAPH_USER", "").strip()
+        pwd_file = os.environ.get("MEMGRAPH_PASSWORD_FILE", "").strip()
+        pwd = ""
+        if pwd_file:
+            try:
+                with open(pwd_file, "r", encoding="utf-8") as fh:
+                    pwd = fh.read().strip()
+            except OSError:
+                pwd = ""
+        if not pwd:
+            pwd = os.environ.get("MEMGRAPH_PASSWORD", "").strip()
+        auth = (user, pwd) if (user and pwd) else None
+        driver = GraphDatabase.driver(memgraph_uri, auth=auth)
 
         with driver.session() as session:
             print("Clearing all data from Memgraph...")

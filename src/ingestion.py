@@ -1,10 +1,37 @@
-from neo4j import GraphDatabase
-from neo4j.exceptions import TransientError
+import os
 import time
 
+from neo4j import GraphDatabase
+from neo4j.exceptions import TransientError
+
+
+def _memgraph_auth():
+    """Build a (user, password) tuple from MEMGRAPH_USER/MEMGRAPH_PASSWORD env, or None.
+
+    MEMGRAPH_PASSWORD_FILE takes precedence over MEMGRAPH_PASSWORD so secrets can
+    be mounted as files instead of being committed in plaintext env vars.
+    """
+    user = os.environ.get("MEMGRAPH_USER", "").strip()
+    pwd_file = os.environ.get("MEMGRAPH_PASSWORD_FILE", "").strip()
+    pwd = ""
+    if pwd_file:
+        try:
+            with open(pwd_file, "r", encoding="utf-8") as fh:
+                pwd = fh.read().strip()
+        except OSError:
+            pwd = ""
+    if not pwd:
+        pwd = os.environ.get("MEMGRAPH_PASSWORD", "").strip()
+    if user and pwd:
+        return (user, pwd)
+    return None
+
+
 class MemgraphIngestion:
-    def __init__(self, uri="bolt://localhost:7687"):
-        self.driver = GraphDatabase.driver(uri)
+    def __init__(self, uri="bolt://localhost:7687", auth=None):
+        if auth is None:
+            auth = _memgraph_auth()
+        self.driver = GraphDatabase.driver(uri, auth=auth)
         self.batch_size = 5000  # Optimized batch size
         self.max_retries = 3
 
@@ -46,12 +73,12 @@ class MemgraphIngestion:
         """
         start_time = time.time()
         
-        # Optimize batch sizing for different data types
-        # Users/Hosts are light, can handle larger batches
-        # Software is heavy (many items per host), improved by grouping
+        # Optimize batch sizing for different data types.
+        # Users/Hosts are light, so larger batches amortize Bolt round-trips.
+        # Software is grouped per-host so the flush threshold is in HOSTS-with-bundles,
+        # not raw software rows — see software_grouped_batch flush below.
         HOST_BATCH_SIZE = 5000
         USER_BATCH_SIZE = 5000
-        SOFTWARE_BATCH_SIZE = 2000 # This effectively means 2000 *HOSTS* with software bundles, which is huge
 
         with self.driver.session() as session:
             # 1. Users
@@ -118,6 +145,12 @@ class MemgraphIngestion:
                     })
 
                 # Software Data (Grouped)
+                # `source` comes from osquery's `software` table union and tells us
+                # which package channel the install came through (apps, programs,
+                # deb_packages, rpm_packages, homebrew_packages, npm_packages,
+                # vscode_extensions, chrome_extensions, ...). It is the cleanest
+                # signal for separating "user-installed apps" (Shadow IT surface)
+                # from "OS / language / extension transitive deps".
                 software_list = host.get('software', [])
                 if software_list:
                     cleaned_software = []
@@ -125,7 +158,8 @@ class MemgraphIngestion:
                         if s.get('name'):
                             cleaned_software.append({
                                 'name': s.get('name'),
-                                'version': s.get('version') or 'unknown'
+                                'version': s.get('version') or 'unknown',
+                                'source': (s.get('source') or '').strip(),
                             })
                     if cleaned_software:
                         software_grouped_batch.append({
@@ -133,26 +167,35 @@ class MemgraphIngestion:
                             'software_list': cleaned_software
                         })
 
-                # Flush Batches
-                if len(host_batch) >= HOST_BATCH_SIZE:
-                    self._batch_create_hosts(session, host_batch)
-                    host_batch = []
-                
-                if len(user_rel_batch) >= USER_BATCH_SIZE:
+                # Flush Batches.
+                # Ordering invariant: HOSTS MUST FLUSH BEFORE user/software rels in
+                # the same iteration because the rel queries MATCH on Host (no
+                # implicit creation). Always flush hosts first when ANY downstream
+                # batch is ready.
+                hosts_full = len(host_batch) >= HOST_BATCH_SIZE
+                users_full = len(user_rel_batch) >= USER_BATCH_SIZE
+                software_full = len(software_grouped_batch) >= 200
+
+                if hosts_full or users_full or software_full:
+                    if host_batch:
+                        self._batch_create_hosts(session, host_batch)
+                        host_batch = []
+
+                if users_full:
                     self._batch_create_user_relationships(session, user_rel_batch)
                     user_rel_batch = []
 
-                if len(software_grouped_batch) >= 200: 
+                if software_full:
                     self._batch_create_software_grouped(session, software_grouped_batch)
                     software_grouped_batch = []
 
-            # Flush Remaining
+            # Final flush — hosts FIRST so the trailing rel batches can MATCH them.
             if host_batch:
                 self._batch_create_hosts(session, host_batch)
             if user_rel_batch:
                 self._batch_create_user_relationships(session, user_rel_batch)
             if software_grouped_batch:
-                 self._batch_create_software_grouped(session, software_grouped_batch)
+                self._batch_create_software_grouped(session, software_grouped_batch)
 
             elapsed = time.time() - start_time
             print(f"✅ Ingestion completed in {elapsed:.2f} seconds")
@@ -178,7 +221,7 @@ class MemgraphIngestion:
             try:
                 session.run(query, **params)
                 return True
-            except TransientError as e:
+            except TransientError:
                 if attempt < self.max_retries - 1:
                     wait_time = 0.1 * (2 ** attempt)
                     time.sleep(wait_time)
@@ -220,13 +263,18 @@ class MemgraphIngestion:
         self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch")
 
     def _batch_create_user_relationships(self, session, user_rel_batch):
-        """Batch create user-host relationships using UNWIND."""
+        """Batch create user-host relationships using UNWIND.
+
+        Uses MATCH on Host to avoid creating ghost host nodes (with no platform/
+        team metadata) when the host hasn't been ingested yet in this batch run.
+        Hosts must be created via _batch_create_hosts before this is called.
+        """
         if not user_rel_batch:
             return
 
         query = """
             UNWIND $rels AS rel
-            MERGE (h:Host {hostname: rel.hostname})
+            MATCH (h:Host {hostname: rel.hostname})
             MERGE (u:User {username: rel.username})
             SET u.email = rel.email, u.fullname = rel.fullname
             MERGE (u)-[:USES]->(h)
@@ -238,14 +286,17 @@ class MemgraphIngestion:
         if not software_batch:
             return
 
-        # 1. Deduplicate software nodes to minimize MERGE/SET operations
-        # We only need to update the Software node once per (name, version) pair in this batch
+        # 1. Deduplicate software nodes to minimize MERGE/SET operations.
+        # Key includes `source` so distinct install channels for the same
+        # (name, version) (e.g., python3 from deb_packages on one host and from
+        # homebrew_packages on another) all flow through and accumulate on the
+        # node's `sources` list.
         unique_software_map = {}
         for sw in software_batch:
-            key = (sw['name'], sw['version'])
+            key = (sw['name'], sw['version'], sw.get('source', ''))
             if key not in unique_software_map:
                 unique_software_map[key] = sw
-        
+
         unique_software_batch = list(unique_software_map.values())
 
         # 2. Efficiently update Software nodes and versions
@@ -254,42 +305,61 @@ class MemgraphIngestion:
             MERGE (s:Software {name: sw.name})
             ON CREATE SET s.versions = [sw.version],
                          s.first_version = sw.version,
-                         s.last_version = sw.version
+                         s.last_version = sw.version,
+                         s.sources = CASE
+                             WHEN sw.source IS NULL OR sw.source = '' THEN []
+                             ELSE [sw.source] END
             ON MATCH SET s.versions = CASE
                 WHEN s.versions IS NULL THEN [sw.version]
                 WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
                 ELSE s.versions END,
-                s.last_version = sw.version
+                s.last_version = sw.version,
+                s.sources = CASE
+                    WHEN sw.source IS NULL OR sw.source = '' THEN coalesce(s.sources, [])
+                    WHEN s.sources IS NULL THEN [sw.source]
+                    WHEN NOT sw.source IN s.sources THEN s.sources + [sw.source]
+                    ELSE s.sources END
         """
         self._execute_with_retry(session, query_nodes, {'software': unique_software_batch}, "create software nodes")
 
-        # 3. Create relationships (Lightweight, using MATCH)
+        # 3. Create relationships using MATCH on both endpoints to avoid ghost hosts.
+        # Hosts must be ingested via _batch_create_hosts before this runs.
         query_rels = """
             UNWIND $software AS sw
             MATCH (s:Software {name: sw.name})
-            MERGE (h:Host {hostname: sw.hostname})
+            MATCH (h:Host {hostname: sw.hostname})
             MERGE (s)-[:INSTALLED_ON]->(h)
         """
         self._execute_with_retry(session, query_rels, {'software': software_batch}, "create software rels")
 
     def _extract_user_identifiers(self, host):
-        """Extract user identifiers from host data."""
+        """Extract user identifiers from host data.
+
+        Only consider keys that are user identifiers. Do NOT fall back to host-level
+        keys like 'name' or 'user' (which on Fleet often hold the host display name)
+        because that pollutes the User node label with hostnames and creates spurious
+        USES edges.
+        """
         users_out = []
         raw_users = host.get('users')
         if isinstance(raw_users, list):
             for entry in raw_users:
                 if isinstance(entry, dict):
-                    cand = entry.get('username') or entry.get('email') or entry.get('name') or entry.get('display_name')
+                    cand = (
+                        entry.get('username')
+                        or entry.get('email')
+                        or entry.get('display_name')
+                    )
                     if cand:
                         users_out.append(cand)
                 elif isinstance(entry, str):
                     users_out.append(entry)
-        # Fallback singular fields
-        for k in ['primary_user', 'owner', 'user', 'name']:
+        # Fallback ONLY to fields that are unambiguously user identifiers.
+        for k in ('primary_user', 'owner'):
             v = host.get(k)
-            if isinstance(v, str):
+            if isinstance(v, str) and v:
                 users_out.append(v)
-        # Deduplicate while preserving order
+        # Deduplicate while preserving order.
         seen = set()
         deduped = []
         for u in users_out:
@@ -312,10 +382,10 @@ class MemgraphIngestion:
         unique_software_map = {}
         for entry in software_grouped_batch:
             for sw in entry['software_list']:
-                key = (sw['name'], sw['version'])
+                key = (sw['name'], sw['version'], sw.get('source', ''))
                 if key not in unique_software_map:
                     unique_software_map[key] = sw
-        
+
         unique_software_list = list(unique_software_map.values())
 
         # 2. Create/Update Software Nodes
@@ -324,12 +394,20 @@ class MemgraphIngestion:
             MERGE (s:Software {name: sw.name})
             ON CREATE SET s.versions = [sw.version],
                           s.first_version = sw.version,
-                          s.last_version = sw.version
+                          s.last_version = sw.version,
+                          s.sources = CASE
+                              WHEN sw.source IS NULL OR sw.source = '' THEN []
+                              ELSE [sw.source] END
             ON MATCH SET s.versions = CASE
                 WHEN s.versions IS NULL THEN [sw.version]
                 WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
                 ELSE s.versions END,
-                s.last_version = sw.version
+                s.last_version = sw.version,
+                s.sources = CASE
+                    WHEN sw.source IS NULL OR sw.source = '' THEN coalesce(s.sources, [])
+                    WHEN s.sources IS NULL THEN [sw.source]
+                    WHEN NOT sw.source IN s.sources THEN s.sources + [sw.source]
+                    ELSE s.sources END
         """
         self._execute_with_retry(session, query_nodes, {'software': unique_software_list}, "create software nodes")
 

@@ -27,11 +27,54 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fleet-webviz
+    # Bind the dashboard to the loopback interface by default so a fresh install
+    # is not LAN-reachable. Operators expose it via a reverse proxy (nginx /
+    # traefik) terminating TLS + auth, or override this mapping after setting
+    # WEBVIZ_API_TOKEN.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    # Container hardening — non-root user (Dockerfile), cap drops, read-only
+    # rootfs with explicit tmpfs for /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Pulls non-secret defaults from .env. Secrets (FLEET_API_TOKEN,
+    # WEBVIZ_API_TOKEN, MEMGRAPH_PASSWORD) should live in .env (chmod 600)
+    # or be supplied via *_FILE references to mounted secret files.
+    env_file:
+      - .env
     environment:
       - MEMGRAPH_URI=bolt://memgraph:7687
       - PORT=8080
+      # Optional Bolt auth — passes through from host env / .env file.
+      - MEMGRAPH_USER
+      - MEMGRAPH_PASSWORD
+      - MEMGRAPH_PASSWORD_FILE
+      # Optional API token for /api/* routes.
+      - WEBVIZ_API_TOKEN
+      - WEBVIZ_API_TOKEN_FILE
+      - WEBVIZ_REQUIRE_AUTH
+      - WEBVIZ_ALLOW_ANONYMOUS_READ
+      - WEBVIZ_DEBUG_ERRORS
+      # Wikidata enricher — autonomous Orient-phase categorizer.
+      - ENRICHER_ENABLED
+      - ENRICHER_INTERVAL_SEC
+      - ENRICHER_BATCH_SIZE
+      # OODA supervisor — autonomous Observe→Orient→Decide→Act cycles.
+      # Requires FLEET_URL + FLEET_API_TOKEN (or FLEET_EMAIL/FLEET_PASSWORD).
+      - OODA_ENABLED
+      - OODA_INTERVAL_SEC
+      - OODA_FULL_SCAN_EVERY
+      - OODA_TEAMS
+      - FLEET_URL
+      - FLEET_API_TOKEN
+      - FLEET_EMAIL
+      - FLEET_PASSWORD
+      - INSECURE
     volumes:
       - ./config:/app/config
     depends_on:
