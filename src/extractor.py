@@ -2,6 +2,28 @@ import time
 
 import requests
 
+# Built-in label names that duplicate `host.platform` / `host.os_version` and
+# carry no scoping signal beyond what those properties already encode. Fleet
+# reserves these names server-side per `server/fleet/labels.go` upstream;
+# attempting to redeclare them returns 422. We filter only by exact name match
+# so functional built-ins ("MDM enrolled", "Hosts with low disk space", etc.)
+# still flow through and become first-class scoping primitives.
+RESERVED_OS_LABEL_NAMES = frozenset({
+    "All Hosts",
+    "macOS",
+    "Ubuntu Linux",
+    "CentOS Linux",
+    "MS Windows",
+    "Red Hat Linux",
+    "All Linux",
+    "chrome",
+    "macOS 14+ (Sonoma+)",
+    "iOS",
+    "iPadOS",
+    "Fedora Linux",
+    "Android",
+})
+
 
 class FleetGraphExtractor:
     def extract_all_users(self):
@@ -232,6 +254,107 @@ class FleetGraphExtractor:
                 if self.debug:
                     print(f"[extractor] Failed to parse software JSON for host {host_id}")
         return []
+
+    def extract_labels(self, skip_all_builtins: bool = False):
+        """Fetch all labels from Fleet's /api/v1/fleet/labels endpoint.
+
+        Default behavior (skip_all_builtins=False) filters out only the
+        OS-name reserved built-ins (macOS, Ubuntu Linux, ...) that duplicate
+        `host.platform`. Functional built-ins (MDM enrolled, Hosts with low
+        disk space, etc.) flow through because they carry scoping signal
+        beyond what platform/os_version already encode.
+
+        skip_all_builtins=True drops every built-in regardless of name —
+        legacy posture if a deployment never wants any built-in surfaced.
+
+        Note: `/api/v1/fleet/labels` returns metadata + host_count only. The
+        member host list is NOT in this payload — call
+        `extract_label_host_membership(label_id)` per label to get members.
+        """
+        labels = []
+        page = 0
+        per_page = 100
+        while True:
+            resp = self._get(
+                "/api/v1/fleet/labels",
+                params={'page': page, 'per_page': per_page},
+            )
+            if not resp or resp.status_code != 200:
+                if self.debug:
+                    print(
+                        f"[extractor] /labels failed "
+                        f"status={resp.status_code if resp else 'no-resp'}"
+                    )
+                break
+            try:
+                data = resp.json()
+            except ValueError:
+                if self.debug:
+                    print("[extractor] Failed to parse /labels JSON")
+                break
+            page_labels = data.get('labels', [])
+            labels.extend(page_labels)
+            if len(page_labels) < per_page:
+                break
+            page += 1
+            time.sleep(0.2)
+
+        if skip_all_builtins:
+            labels = [
+                lbl for lbl in labels
+                if (lbl.get('label_type') or '').lower() != 'builtin'
+            ]
+        else:
+            labels = [
+                lbl for lbl in labels
+                if lbl.get('name') not in RESERVED_OS_LABEL_NAMES
+            ]
+
+        if self.debug:
+            print(f"[extractor] Extracted {len(labels)} labels (post-filter)")
+        return labels
+
+    def extract_label_host_membership(self, label_id):
+        """Fetch the full host membership of a single label.
+
+        Walks `/api/v1/fleet/labels/{id}/hosts` with `per_page=1000` (Fleet's
+        max) until the response is short. Returns a list of host dicts; each
+        contains at minimum `id` (Fleet's stable numeric host id), `hostname`,
+        and `display_name` when Fleet provides it. The caller hashes by `id`
+        (NOT hostname) so osquery host renames don't churn the membership
+        hash.
+
+        Returns an empty list on any HTTP failure; the caller should treat
+        that as "skip this label this cycle" and not propagate the failure.
+        """
+        members = []
+        page = 0
+        per_page = 1000
+        while True:
+            resp = self._get(
+                f"/api/v1/fleet/labels/{label_id}/hosts",
+                params={'page': page, 'per_page': per_page},
+            )
+            if not resp or resp.status_code != 200:
+                if self.debug:
+                    print(
+                        f"[extractor] /labels/{label_id}/hosts failed "
+                        f"status={resp.status_code if resp else 'no-resp'}"
+                    )
+                return []
+            try:
+                data = resp.json()
+            except ValueError:
+                if self.debug:
+                    print(f"[extractor] Failed to parse /labels/{label_id}/hosts JSON")
+                return []
+            page_hosts = data.get('hosts', [])
+            members.extend(page_hosts)
+            if len(page_hosts) < per_page:
+                break
+            page += 1
+            time.sleep(0.2)
+        return members
 
     def extract_users_for_host(self, host_id):
         """Attempt to retrieve per-host user list via detail endpoint.

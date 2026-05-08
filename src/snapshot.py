@@ -33,7 +33,24 @@ logger = logging.getLogger(__name__)
 # Properties excluded from node hash. These churn on every ETL even when the
 # logical node is unchanged, and including them would flood the property-drift
 # diff with noise.
-_NOISY_PROPS = {"last_seen", "last_categorized"}
+#
+# For Label nodes (added in v1.27): last_synced_iso, last_label_sync_status,
+# consecutive_failures, last_label_sync_error, and host_count all churn on
+# every cycle independent of label-definition drift, so they go in the noisy
+# set. last_member_hash is also noisy because it changes whenever membership
+# changes — but membership churn is tracked through HAS_LABEL edge add/remove
+# in the same snapshot, which is the right surface for that drift.
+_NOISY_PROPS = {
+    "last_seen",
+    "last_categorized",
+    "last_synced_iso",
+    "last_label_sync_status",
+    "consecutive_failures",
+    "last_label_sync_error",
+    "host_count",
+    "last_member_hash",
+    "last_members_compressed",
+}
 
 _RETAIN_DEFAULT = 30
 
@@ -63,10 +80,10 @@ def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
     """Pull the full graph as (lines, edge_count_by_label_dict).
 
     Returns a tuple of (json_lines, counts) where json_lines are dicts ready
-    to be JSON-encoded and counts is {hosts, users, software, edges}.
+    to be JSON-encoded and counts is {hosts, users, software, labels, edges}.
     """
     lines: List[dict] = []
-    counts = {"hosts": 0, "users": 0, "software": 0, "edges": 0}
+    counts = {"hosts": 0, "users": 0, "software": 0, "labels": 0, "edges": 0}
 
     with driver.session() as session:
         # --- Hosts ---
@@ -134,6 +151,46 @@ def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
                 "hash": _node_hash(props),
             })
             counts["software"] += 1
+
+        # --- Labels (added v1.27 — see plan section 1A) ---
+        label_keys = ["fleet_id", "name", "description", "label_type",
+                      "membership_type", "query"]
+        label_q = """
+            MATCH (l:Label)
+            RETURN l.fleet_id AS fleet_id, l.name AS name,
+                   l.description AS description,
+                   l.label_type AS label_type,
+                   l.membership_type AS membership_type,
+                   l.query AS query
+        """
+        for rec in session.run(label_q):
+            fleet_id = rec["fleet_id"]
+            if fleet_id is None:
+                continue
+            props = _coerce_props(label_keys, rec)
+            lines.append({
+                "type": "label",
+                "id": _typed_id("label", fleet_id),
+                "props": props,
+                "hash": _node_hash(props),
+            })
+            counts["labels"] += 1
+
+        # --- Edges: HAS_LABEL (Host -> Label) ---
+        has_label_q = """
+            MATCH (h:Host)-[:HAS_LABEL]->(l:Label)
+            RETURN h.hostname AS hname, l.fleet_id AS lfid
+        """
+        for rec in session.run(has_label_q):
+            if not rec["hname"] or rec["lfid"] is None:
+                continue
+            lines.append({
+                "type": "edge",
+                "label": "HAS_LABEL",
+                "from": _typed_id("host", rec["hname"]),
+                "to": _typed_id("label", rec["lfid"]),
+            })
+            counts["edges"] += 1
 
         # --- Edges: USES (User -> Host) ---
         uses_q = """
@@ -235,9 +292,11 @@ def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
 
     _prune_old(out_dir, retain=retain)
 
-    logger.info("snapshot written: %s (%d hosts, %d users, %d software, %d edges)",
-                snap_path, counts["hosts"], counts["users"],
-                counts["software"], counts["edges"])
+    logger.info(
+        "snapshot written: %s (%d hosts, %d users, %d software, %d labels, %d edges)",
+        snap_path, counts["hosts"], counts["users"],
+        counts["software"], counts.get("labels", 0), counts["edges"],
+    )
     return snap_path
 
 
@@ -285,6 +344,7 @@ def list_snapshots(out_dir: Path) -> List[dict]:
             "hosts": int(meta.get("hosts", 0)),
             "users": int(meta.get("users", 0)),
             "software": int(meta.get("software", 0)),
+            "labels": int(meta.get("labels", 0)),
             "edges": int(meta.get("edges", 0)),
         })
     items.sort(key=lambda x: x["ts"], reverse=True)

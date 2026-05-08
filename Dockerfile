@@ -18,8 +18,6 @@ COPY categorize_software.py ./categorize_software.py
 RUN mkdir -p /app/config /app/config/snapshots \
  && chown -R webviz:webviz /app
 
-WORKDIR /app/webviz
-
 USER webviz
 
 EXPOSE 8080
@@ -39,4 +37,4 @@ CMD ["gunicorn", \
      "--graceful-timeout", "30", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
-     "app:app"]
+     "webviz.app:app"]

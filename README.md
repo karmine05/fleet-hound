@@ -78,9 +78,8 @@ $EDITOR .env
 # 3. Pull data from Fleet → Memgraph (initial baseline)
 python3 main.py --full-scan
 
-# 4. Open the dashboard & run smoke test
+# 4. Open the dashboard
 open http://localhost:8080
-FH_BASE=http://127.0.0.1:8080 FH_TOKEN=$WEBVIZ_API_TOKEN ./scripts/smoke.sh
 ```
 
 The compose file binds webviz to `127.0.0.1:8080` by default — front it with a reverse proxy that terminates TLS and auth before exposing to non-loopback clients.

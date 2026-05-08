@@ -55,6 +55,9 @@ logs/
 *.tmp
 *.temp
 temp/
+.claude-flow/*
+graphify-out/*
+.planning/*
 
 # Database
 *.db
@@ -66,6 +69,7 @@ temp/
 .env.production
 config.local.py
 secrets.py
+config/*
 
 # Test files
 .pytest_cache/
@@ -78,3 +82,8 @@ benchmark_ingestion.py
 config/whitelist.json
 test_wikidata.py
 docs/*
+.state.json
+.etl.lock
+pytest.ini
+claude-flow.config.json
+DESIGN.md
