@@ -130,6 +130,19 @@
             box-sizing: border-box;
         }
 
+        /* HTML5 [hidden] attribute defense.
+           CSS classes with explicit `display: flex/grid/inline-block` override
+           the browser default `[hidden] { display: none }`, so `el.hidden = true`
+           silently fails for any element with such a class (banners, segmented
+           controls, popovers, count badges). This rule re-establishes the
+           expected behavior: any element with [hidden] is invisible regardless
+           of its other display rules. Without this, the active-scope banner +
+           graph-labels count badge + segmented control all stayed visible
+           after Clear scope was clicked. */
+        [hidden] {
+            display: none !important;
+        }
+
         body {
             font-family: var(--font-sans);
             font-size: var(--text-base);
@@ -1413,6 +1426,466 @@
         }
 
         /* ========================================
+           LABEL WIDGET — Variant C (plan-design-review approved 2026-05-07)
+           ========================================
+           Searchable checkbox list + segmented AND/OR + scope readout.
+           Replaces the previous <select multiple> pattern. Surfaces:
+             - which Fleet labels exist (live from /api/labels)
+             - per-label host count
+             - per-label sync freshness (stale dot)
+             - filter mode (AND/OR) via segmented control
+             - scope readout: "N of M selected, MODE" + host count pill
+             - first-time hint when zero selected
+           Reference doc: ~/.gstack/projects/karmine05-fleet-hound/designs/
+                          label-widget-20260507/comparison-board.html
+           ======================================== */
+
+        /* === LABEL LISTBOX =========================================
+           Scrollable list of selectable labels. ARIA: role="listbox"
+           aria-multiselectable="true". Each row is role="option" with
+           aria-selected. Single-line truncate with title attr for
+           full text on hover. Alphabetical order matches Fleet's own
+           labels admin page.
+           ============================================================ */
+        .label-widget {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-3);
+        }
+
+        .label-widget-header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+        }
+
+        .label-widget-title {
+            font-size: var(--text-base);
+            font-weight: var(--font-semibold);
+            color: var(--text-primary);
+        }
+
+        .label-widget-clear {
+            font-size: var(--text-xs);
+            color: var(--text-tertiary);
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            font-family: inherit;
+        }
+        .label-widget-clear:hover { color: var(--accent); }
+        .label-widget-clear:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+            border-radius: var(--radius-sm);
+        }
+
+        .label-list {
+            max-height: 168px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--bg-tertiary);
+            list-style: none;
+        }
+
+        .label-row {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+            padding: 8px 10px;
+            font-size: var(--text-sm);
+            cursor: pointer;
+            border-bottom: 1px solid var(--border);
+            user-select: none;
+            min-height: 32px;
+        }
+        .label-row:last-child { border-bottom: none; }
+        .label-row:hover { background: var(--bg-elevated); }
+        .label-row.selected { background: var(--accent-muted); }
+        .label-row:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
+        }
+
+        .label-cb {
+            width: 14px; height: 14px;
+            border: 1.5px solid var(--border-hover);
+            border-radius: 3px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            background: transparent;
+            transition: all var(--transition-fast);
+        }
+        .label-row.selected .label-cb {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+        .label-row.selected .label-cb::after {
+            content: '';
+            width: 7px; height: 4px;
+            border-left: 1.5px solid white;
+            border-bottom: 1.5px solid white;
+            transform: rotate(-45deg) translate(1px, -1px);
+        }
+
+        .label-name {
+            flex: 1;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+        .label-row:not(.selected) .label-name { color: var(--text-secondary); }
+
+        .label-count {
+            font-size: 11px;
+            color: var(--text-tertiary);
+            font-variant-numeric: tabular-nums;
+            flex-shrink: 0;
+        }
+
+        /* === STALE-DATA DOT ========================================
+           6px warning-colored dot signaling per-row data sync drift.
+           Use ONLY when one row's freshness is materially different
+           from siblings. Always paired with aria-label that names
+           the staleness reason + last-successful-sync timestamp.
+           ============================================================ */
+        .stale-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--warning);
+            margin-left: 4px;
+            flex-shrink: 0;
+        }
+
+        /* === IN-WIDGET SEARCH INPUT ================================
+           Search field that filters its containing list in place.
+           Use when a list of ≥10 items would benefit from typed
+           filtering. Same height/padding as other inputs in the
+           sidebar; doesn't grow on focus to avoid layout shift.
+           ============================================================ */
+        .label-search {
+            width: 100%;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: var(--text-sm);
+            padding: 6px 10px;
+            outline: none;
+            min-height: 32px;
+        }
+        .label-search:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px var(--accent-muted);
+        }
+        .label-search::placeholder { color: var(--text-tertiary); }
+
+        /* === SEGMENTED CONTROL =====================================
+           Two-mode toggle with both options always visible. Use for
+           AND/OR-style binary mode picks where the choice is itself
+           a primary action (NOT a configuration setting).
+           ARIA: role="radiogroup" wrapping role="radio" buttons.
+           Arrow Left/Right switches active button.
+           ============================================================ */
+        .segmented {
+            display: flex;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 2px;
+        }
+        .segmented button {
+            flex: 1;
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-family: inherit;
+            font-size: var(--text-xs);
+            font-weight: var(--font-medium);
+            padding: 6px 0;
+            cursor: pointer;
+            border-radius: var(--radius-sm);
+            transition: all var(--transition-fast);
+            min-height: 26px;
+        }
+        .segmented button:hover { color: var(--text-primary); }
+        .segmented button.active {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            box-shadow: var(--shadow-sm);
+        }
+        .segmented button:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
+        }
+
+        /* === SCOPE READOUT =========================================
+           Filter-state summary box. Use to show what a complex filter
+           actually does ("N of M selected, MODE | X hosts") with a
+           count pill on the right. Doubles as the empty-state hint
+           container when nothing is selected.
+           ============================================================ */
+        .scope-readout {
+            padding: var(--space-3);
+            background: var(--accent-muted);
+            border-radius: var(--radius-md);
+            font-size: var(--text-xs);
+            color: var(--accent);
+            line-height: 1.5;
+        }
+        .scope-readout.empty {
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+        .scope-readout strong {
+            color: var(--accent);
+            font-weight: var(--font-semibold);
+        }
+        .scope-readout.empty strong { color: var(--text-primary); }
+        .scope-readout .count-pill {
+            display: inline-block;
+            background: var(--accent);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: var(--font-semibold);
+            margin-left: 4px;
+            font-variant-numeric: tabular-nums;
+        }
+        .scope-readout .switch-cta {
+            display: block;
+            margin-top: var(--space-2);
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 6px 10px;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: var(--text-xs);
+            font-weight: var(--font-medium);
+            cursor: pointer;
+            width: 100%;
+        }
+        .scope-readout .switch-cta:hover { background: var(--accent-hover); }
+
+        .label-search-empty {
+            padding: var(--space-3);
+            font-size: var(--text-sm);
+            color: var(--text-secondary);
+            text-align: center;
+        }
+        .label-search-empty button {
+            display: block;
+            margin: var(--space-2) auto 0;
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--accent);
+            padding: 4px 10px;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: var(--text-xs);
+            cursor: pointer;
+        }
+        .label-search-empty button:hover { border-color: var(--accent); }
+
+        /* Loading skeleton rows */
+        .label-skeleton {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-2);
+        }
+        .label-skeleton-row {
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            height: 28px;
+            position: relative;
+            overflow: hidden;
+        }
+        .label-skeleton-row::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(
+                90deg,
+                transparent,
+                rgba(255, 255, 255, 0.04),
+                transparent
+            );
+            animation: label-shimmer 1.4s infinite;
+        }
+        @keyframes label-shimmer {
+            from { transform: translateX(-100%); }
+            to   { transform: translateX(100%); }
+        }
+
+        /* Empty state (no labels in graph) + global stale banner */
+        .label-empty {
+            padding: var(--space-3);
+            font-size: var(--text-sm);
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+        .label-empty strong {
+            display: block;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }
+        .label-empty .empty-cta {
+            margin-top: var(--space-3);
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: var(--text-xs);
+            font-weight: var(--font-medium);
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .label-empty .empty-cta:hover { background: var(--accent-hover); }
+
+        .label-stale-banner {
+            background: var(--warning-muted);
+            border-left: 3px solid var(--warning);
+            padding: var(--space-3);
+            border-radius: var(--radius-sm);
+            font-size: var(--text-sm);
+            color: var(--text-primary);
+            line-height: 1.5;
+        }
+        .label-stale-banner strong { color: var(--warning); }
+
+        /* Visually-hidden live region for screen-reader announcements
+           of selection changes. Drives the "Critical Infrastructure
+           selected, 2 of 13 labels selected, AND mode, 8 hosts in scope"
+           audio feedback. */
+        .sr-only {
+            position: absolute;
+            width: 1px; height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        /* === ACTIVE-SCOPE BANNER (TODO-3) ==========================
+           Cross-view label scope indicator. Renders when the session has
+           ≥1 label selected on any view, so when the user switches from
+           Shadow IT → Blast Radius they don't lose track of an inherited
+           filter. Uses var(--accent) to clearly indicate "active filter
+           applied" without competing with destructive (danger) banners.
+           ============================================================ */
+        .active-scope-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: var(--space-3);
+            padding: var(--space-3) var(--space-5);
+            background: var(--accent-muted);
+            border-bottom: 1px solid var(--accent);
+            color: var(--text-primary);
+            font-size: var(--text-sm);
+        }
+        /* Empty state: muted background + tertiary text; toolbar position
+           stays identical to active state (no layout shift on clear). */
+        .active-scope-banner.empty {
+            background: var(--bg-secondary);
+            border-bottom-color: var(--border);
+            color: var(--text-secondary);
+        }
+        .active-scope-banner.empty .active-scope-label-prefix {
+            color: var(--text-tertiary);
+        }
+        .active-scope-text strong {
+            color: var(--accent);
+            font-weight: var(--font-semibold);
+        }
+        .active-scope-mode {
+            color: var(--text-tertiary);
+            font-size: var(--text-xs);
+            margin-left: var(--space-2);
+        }
+        .active-scope-clear {
+            background: none;
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            padding: 4px 12px;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: var(--text-xs);
+            font-weight: var(--font-medium);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+        .active-scope-clear:hover {
+            background: var(--accent);
+            color: white;
+        }
+        .active-scope-clear:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        /* === GRAPH-VIEW LABELS POPOVER =============================
+           Click the toolbar "Labels" button to drop down a panel with the
+           same .label-widget that the sidebars use. Cross-view scope (via
+           SessionLabelScope) keeps every instance in lockstep, so picks
+           here also reflect on Blast Radius and Shadow IT views.
+           ============================================================ */
+        .graph-labels-count {
+            display: inline-block;
+            margin-left: 4px;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 6px;
+            background: var(--accent);
+            color: white;
+            font-size: 11px;
+            font-weight: var(--font-semibold);
+            line-height: 18px;
+            text-align: center;
+            border-radius: 9px;
+        }
+        .graph-labels-popover {
+            position: absolute;
+            top: 56px;
+            right: 16px;
+            width: 360px;
+            max-height: 70vh;
+            overflow-y: auto;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
+            padding: var(--space-4);
+            z-index: 100;
+        }
+
+        /* === RESPONSIVE TOUCH BUMP =================================
+           Plan-design-review Pass 6 6A: bump tappable targets to 44px
+           on viewports ≤900px (tablets, phones, on-call from a phone).
+           Desktop keeps the 32px sidebar density. Apple HIG / Material
+           / WCAG 2.5.5 spec 44px minimum touch target.
+           ============================================================ */
+        @media (max-width: 900px) {
+            .label-row { min-height: 44px; padding: 12px 10px; }
+            .segmented button { min-height: 44px; padding: 12px 0; }
+            .label-search { min-height: 44px; padding: 10px 12px; }
+            .label-widget-clear { min-height: 32px; padding: 0 8px; }
+        }
+
+        /* ========================================
            UTILITY
            ======================================== */
         .inline-row {
@@ -1514,6 +1987,19 @@
         </div>
     </header>
 
+    <!-- Active label scope (TODO-3: cross-view persistence). Always visible
+         so layout doesn't shift when scope is added/removed (which the user
+         was reading as "all filters reset"). Empty state shows muted text;
+         active state highlights labels + mode + Clear button. -->
+    <div id="active-scope-banner" class="active-scope-banner" role="status" aria-live="polite">
+        <span class="active-scope-text">
+            <span class="active-scope-label-prefix">Active scope:</span>
+            <strong id="active-scope-labels"></strong>
+            <span class="active-scope-mode" id="active-scope-mode"></span>
+        </span>
+        <button type="button" id="active-scope-clear" class="active-scope-clear" hidden>Clear scope</button>
+    </div>
+
     <!-- Graph Toolbar (visible only on Graph view) -->
     <div id="graph-toolbar" class="toolbar">
         <div class="toolbar-group">
@@ -1569,8 +2055,38 @@
         <div class="toolbar-separator"></div>
 
         <div class="toolbar-group">
+            <button id="graph-labels-toggle" class="btn btn-ghost"
+                    onclick="toggleGraphLabelsPopover()"
+                    aria-haspopup="dialog" aria-expanded="false"
+                    title="Filter the graph by Fleet labels (cross-view scope)">
+                Labels
+                <span id="graph-labels-count" class="graph-labels-count" hidden>0</span>
+            </button>
             <button class="btn btn-ghost btn-sm" onclick="exportAsJSON()" title="Export as JSON">JSON</button>
             <button class="btn btn-ghost btn-sm" onclick="exportAsCSV()" title="Export as CSV">CSV</button>
+        </div>
+    </div>
+
+    <!-- Graph view label-picker popover. Mounted next to the toolbar via
+         absolute positioning. Uses the same .label-widget structure as
+         Blast Radius / Shadow IT so the same createLabelWidget() module
+         binds it. SessionLabelScope keeps all three widgets in lockstep. -->
+    <div id="graph-labels-popover" class="graph-labels-popover" role="dialog"
+         aria-label="Filter graph by Fleet labels" hidden>
+        <div class="label-widget" data-view="graph">
+            <div class="label-widget-header">
+                <span class="label-widget-title">Labels</span>
+                <button class="label-widget-clear" type="button" hidden>Clear</button>
+            </div>
+            <input type="search" class="label-search" placeholder="Search labels…" aria-label="Search Fleet labels">
+            <div class="label-stale-banner" hidden></div>
+            <ul class="label-list" role="listbox" aria-multiselectable="true" aria-label="Filter graph by Fleet labels"></ul>
+            <div class="segmented" role="radiogroup" aria-label="Match mode" hidden>
+                <button type="button" role="radio" aria-checked="true" data-op="AND">Match all</button>
+                <button type="button" role="radio" aria-checked="false" data-op="OR" tabindex="-1">Match any</button>
+            </div>
+            <div class="scope-readout empty"></div>
+            <span class="sr-only" aria-live="polite"></span>
         </div>
     </div>
 
@@ -1590,6 +2106,24 @@
                     <select id="blast-team-filter" onchange="calculateBlastRadius()">
                         <option value="all">All Teams</option>
                     </select>
+                </div>
+
+                <div class="control-group">
+                    <div class="label-widget" data-view="blast">
+                        <div class="label-widget-header">
+                            <span class="label-widget-title">Labels</span>
+                            <button class="label-widget-clear" type="button" hidden>Clear</button>
+                        </div>
+                        <input type="search" class="label-search" placeholder="Search labels…" aria-label="Search Fleet labels">
+                        <div class="label-stale-banner" hidden></div>
+                        <ul class="label-list" role="listbox" aria-multiselectable="true" aria-label="Filter by Fleet labels"></ul>
+                        <div class="segmented" role="radiogroup" aria-label="Match mode" hidden>
+                            <button type="button" role="radio" aria-checked="true" data-op="AND">Match all</button>
+                            <button type="button" role="radio" aria-checked="false" data-op="OR" tabindex="-1">Match any</button>
+                        </div>
+                        <div class="scope-readout empty"></div>
+                        <span class="sr-only" aria-live="polite"></span>
+                    </div>
                 </div>
 
                 <div class="control-group">
@@ -1676,6 +2210,24 @@
                     <select id="shadow-platform-filter-new">
                         <option value="all">All Platforms</option>
                     </select>
+                </div>
+
+                <div class="control-group">
+                    <div class="label-widget" data-view="shadow">
+                        <div class="label-widget-header">
+                            <span class="label-widget-title">Labels</span>
+                            <button class="label-widget-clear" type="button" hidden>Clear</button>
+                        </div>
+                        <input type="search" class="label-search" placeholder="Search labels…" aria-label="Search Fleet labels">
+                        <div class="label-stale-banner" hidden></div>
+                        <ul class="label-list" role="listbox" aria-multiselectable="true" aria-label="Filter by Fleet labels"></ul>
+                        <div class="segmented" role="radiogroup" aria-label="Match mode" hidden>
+                            <button type="button" role="radio" aria-checked="true" data-op="AND">Match all</button>
+                            <button type="button" role="radio" aria-checked="false" data-op="OR" tabindex="-1">Match any</button>
+                        </div>
+                        <div class="scope-readout empty"></div>
+                        <span class="sr-only" aria-live="polite"></span>
+                    </div>
                 </div>
 
                 <div class="control-group">
@@ -2069,10 +2621,34 @@
         // ========================================
         // GRAPH
         // ========================================
+        // Build the URL params for /api/graph/full from the visible Graph view
+        // controls (team filter dropdown) + the cross-view SessionLabelScope.
+        // The graph view doesn't have its own label widget; it inherits the
+        // scope from whatever the user picked on Blast Radius / Shadow IT,
+        // surfaced via the Active Scope banner. This is how the "the apps
+        // shown aren't part of the label" bug got fixed (May 2026).
+        function _buildGraphScopeParams() {
+            const params = new URLSearchParams();
+            const teamEl = document.getElementById('team-filter');
+            if (teamEl && teamEl.value && teamEl.value !== 'all') {
+                params.set('team', teamEl.value);
+            }
+            const scope = SessionLabelScope.get();
+            if (scope.labels && scope.labels.length > 0) {
+                params.set('labels', scope.labels.join(','));
+                params.set('label_op', scope.label_op || 'AND');
+            }
+            return params;
+        }
+
         function loadGraph() {
             showStatus('Loading data...');
 
-            fetch('/api/graph/full')
+            const params = _buildGraphScopeParams();
+            const qs = params.toString();
+            const url = qs ? `/api/graph/full?${qs}` : '/api/graph/full';
+
+            fetch(url)
                 .then(response => {
                     if (!response.ok) {
                         return response.json().then(errorData => {
@@ -2371,16 +2947,27 @@
             const platformFilter = document.getElementById('platform-filter').value;
             const teamFilter = document.getElementById('team-filter').value;
 
-            if (!searchTerm && nodeTypeFilter === 'all' && platformFilter === 'all' && teamFilter === 'all') {
+            // Cross-view label scope. Read FIRST so the early-return below
+            // can include it — otherwise a user with active label scope
+            // but no other filter would hit clearSearch and lose the scope.
+            const _scope = SessionLabelScope.get();
+            const _hasLabelScope = _scope.labels && _scope.labels.length > 0;
+
+            if (!searchTerm && nodeTypeFilter === 'all'
+                && platformFilter === 'all' && teamFilter === 'all'
+                && !_hasLabelScope) {
                 clearSearch();
                 return;
             }
 
-            if (nodeTypeFilter !== 'all' || searchTerm || teamFilter !== 'all') {
+            if (nodeTypeFilter !== 'all' || searchTerm || teamFilter !== 'all' || _hasLabelScope) {
                 const searchParam = searchTerm ? `q=${encodeURIComponent(searchTerm)}` : 'q=';
                 const typeParam = `&type=${encodeURIComponent(nodeTypeFilter)}`;
                 const platformParam = platformFilter !== 'all' ? `&platform=${encodeURIComponent(platformFilter)}` : '';
                 const teamParam = teamFilter !== 'all' ? `&team=${encodeURIComponent(teamFilter)}` : '';
+                const labelsParam = _hasLabelScope
+                    ? `&labels=${encodeURIComponent(_scope.labels.join(','))}&label_op=${encodeURIComponent(_scope.label_op || 'AND')}`
+                    : '';
                 const modeParam = `&mode=${searchMode}`;
                 const caseParam = `&case=${caseSensitive}`;
 
@@ -2389,9 +2976,10 @@
                 if (caseSensitive) statusMsg += ` (case sensitive)`;
                 if (nodeTypeFilter !== 'all' && searchTerm) statusMsg += ` in ${nodeTypeFilter}s`;
                 if (platformFilter !== 'all') statusMsg += ` on ${platformFilter}`;
+                if (_hasLabelScope) statusMsg += ` (scoped to ${_scope.labels.length} label${_scope.labels.length === 1 ? '' : 's'})`;
                 showStatus(statusMsg + '...');
 
-                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${modeParam}${caseParam}`)
+                fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${labelsParam}${modeParam}${caseParam}`)
                     .then(response => response.json())
                     .then(data => {
                         if (data.error) {
@@ -2642,9 +3230,25 @@
                 graphToolbar.style.display = 'flex';
                 document.getElementById('graph-view').classList.add('with-toolbar');
                 if (simulation) simulation.alpha(0.1).restart();
+                // If the cross-view label scope changed while the user was
+                // on a different tab, _graphScopeStale was set but no
+                // refresh fired. Flush it now that Graph is active so the
+                // user sees the scope-filtered view immediately on switch.
+                if (typeof _graphScopeStale !== 'undefined' && _graphScopeStale) {
+                    _graphScopeStale = false;
+                    if (typeof loadGraph === 'function') loadGraph();
+                }
             } else {
                 graphToolbar.style.display = 'none';
                 document.getElementById('graph-view').classList.remove('with-toolbar');
+                // Flush stale entity-list when entering Blast Radius after
+                // a cross-view scope change.
+                if (view === 'blast-radius'
+                    && typeof _blastEntitiesStale !== 'undefined'
+                    && _blastEntitiesStale) {
+                    _blastEntitiesStale = false;
+                    if (typeof loadBlastEntities === 'function') loadBlastEntities();
+                }
                 if (view === 'blast-radius') {
                     if (document.getElementById('blast-entity-list').children.length <= 1) loadBlastEntities();
                 } else if (view === 'shadow-it') {
@@ -2662,13 +3266,37 @@
         let blastEntities = [];
         let searchTimeout;
 
+        // Build the team + label scope params shared by both
+        // loadBlastEntities and filterBlastEntities. Without this the
+        // Blast Radius sidebar listed every software/user in the graph
+        // even when the operator had scoped to "Domain Controllers" —
+        // making the list useless for picking entities that are actually
+        // in the active scope. (May 2026 fix.)
+        function _blastScopeQS() {
+            const params = new URLSearchParams();
+            const teamEl = document.getElementById('blast-team-filter');
+            if (teamEl && teamEl.value && teamEl.value !== 'all') {
+                params.set('team', teamEl.value);
+            }
+            const scope = SessionLabelScope.get();
+            if (scope.labels && scope.labels.length > 0) {
+                params.set('labels', scope.labels.join(','));
+                params.set('label_op', scope.label_op || 'AND');
+            }
+            return params;
+        }
+
         function loadBlastEntities() {
             const type = document.getElementById('blast-type-selector').value;
             const listContainer = document.getElementById('blast-entity-list');
             listContainer.innerHTML = '<div class="loading-state">Loading...</div>';
             document.getElementById('blast-search').value = '';
 
-            fetch(`/api/search?type=${type}&limit=1000`)
+            const scopeQs = _blastScopeQS();
+            scopeQs.set('type', type);
+            scopeQs.set('limit', '1000');
+
+            fetch(`/api/search?${scopeQs.toString()}`)
                 .then(res => res.json())
                 .then(data => {
                     blastEntities = data.nodes.filter(n => n.type === type);
@@ -2716,7 +3344,11 @@
                 const listContainer = document.getElementById('blast-entity-list');
                 listContainer.innerHTML = '<div class="loading-state">Searching...</div>';
 
-                fetch(`/api/search?type=${type}&q=${encodeURIComponent(term)}&limit=100`)
+                const scopeQs = _blastScopeQS();
+                scopeQs.set('type', type);
+                scopeQs.set('q', term);
+                scopeQs.set('limit', '100');
+                fetch(`/api/search?${scopeQs.toString()}`)
                     .then(res => res.json())
                     .then(data => {
                         const results = data.nodes.filter(n => n.type === type);
@@ -2746,6 +3378,8 @@
 
             const teamFilter = document.getElementById('blast-team-filter').value;
             const ignoreDefaults = document.getElementById('ignore-defaults-toggle').checked;
+            const blastWidget = document.querySelector('.label-widget[data-view="blast"]');
+            const labelScope = readLabelFilter(blastWidget);
 
             showStatus(`Calculating blast radius for ${id}...`);
 
@@ -2755,7 +3389,11 @@
                 if (allExcluded.length > 0) exclusionParams = `&excluded_users=${encodeURIComponent(allExcluded.join(','))}`;
             }
 
-            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}`)
+            const labelParams = labelScope.labels
+                ? `&labels=${encodeURIComponent(labelScope.labels)}&label_op=${encodeURIComponent(labelScope.label_op)}`
+                : '';
+
+            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}${labelParams}`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) throw new Error(data.error);
@@ -2828,6 +3466,741 @@
                     });
                 })
                 .catch(error => console.error('Error loading teams:', error));
+        }
+
+        // ========================================
+        // LABELS — Variant C widget (plan-design-review approved 2026-05-07)
+        // ========================================
+        // Searchable checkbox list + segmented AND/OR + scope readout with
+        // pre-flight host count. Replaces the prior <select multiple> impl.
+        //
+        // The module exports:
+        //   - createLabelWidget(container, opts)  — bind one widget to a
+        //     `.label-widget` container; returns an instance with getScope()
+        //     and refresh() methods.
+        //   - readLabelFilter(widget)             — backward-compat helper
+        //     used by calculateBlastRadius / loadShadowITDetections to
+        //     produce the {labels, label_op} pair for URL params.
+        //   - loadLabels()                        — fetches /api/labels and
+        //     refreshes every widget on the page.
+        //
+        // State per widget instance: { labels[], selected:Set, mode, search,
+        // hostCount, altCount, altMode, lastLabelLoad }. State is local —
+        // selection does NOT persist cross-view (per existing team/platform
+        // pattern; cross-view persistence is TODO-3).
+        // ========================================
+
+        const _labelWidgetRegistry = new Map();
+        let _labelDataCache = null;
+        let _labelDataLoadedAt = 0;
+
+        // ========================================
+        // SessionLabelScope (TODO-3) — cross-view label selection
+        // ========================================
+        // Single source of truth for the active label scope across views.
+        // Backed by sessionStorage so the scope survives in-SPA tab switches
+        // but resets on a fresh page load (intentional — full reload =
+        // clean slate). Each `.label-widget` reads on mount, writes on
+        // change, and subscribes to changes from sibling widgets so all
+        // instances stay in lockstep.
+        // ========================================
+        const SessionLabelScope = (function () {
+            const KEY = 'fleethound.labelScope';
+            let listeners = [];
+            function read() {
+                try {
+                    const raw = sessionStorage.getItem(KEY);
+                    if (raw) {
+                        const parsed = JSON.parse(raw);
+                        if (parsed && Array.isArray(parsed.labels)) {
+                            return {
+                                labels: parsed.labels,
+                                label_op: parsed.label_op === 'OR' ? 'OR' : 'AND',
+                            };
+                        }
+                    }
+                } catch (e) { /* ignore — fall through to default */ }
+                return { labels: [], label_op: 'AND' };
+            }
+            function write(scope) {
+                try {
+                    if (!scope.labels || scope.labels.length === 0) {
+                        sessionStorage.removeItem(KEY);
+                    } else {
+                        sessionStorage.setItem(KEY, JSON.stringify(scope));
+                    }
+                } catch (e) { /* sessionStorage may be disabled — degrade gracefully */ }
+                notify(scope);
+            }
+            function notify(scope) {
+                listeners.forEach(fn => {
+                    try { fn(scope); } catch (e) { console.warn('SessionLabelScope listener:', e); }
+                });
+            }
+            return {
+                get() { return read(); },
+                set(scope) { write(scope); },
+                clear() { write({ labels: [], label_op: 'AND' }); },
+                subscribe(fn) {
+                    listeners.push(fn);
+                    return () => { listeners = listeners.filter(l => l !== fn); };
+                },
+            };
+        })();
+
+        // ========================================
+        // ActiveScopeBanner (TODO-3) — visible cross-view scope indicator
+        // ========================================
+        function _initActiveScopeBanner() {
+            const banner = document.getElementById('active-scope-banner');
+            const labelsEl = document.getElementById('active-scope-labels');
+            const modeEl = document.getElementById('active-scope-mode');
+            const clearBtn = document.getElementById('active-scope-clear');
+            if (!banner || !labelsEl || !modeEl || !clearBtn) return;
+
+            function render(scope) {
+                const hasScope = scope && scope.labels && scope.labels.length > 0;
+                if (!hasScope) {
+                    // Empty state — banner stays in DOM with muted styling
+                    // so toolbar position stays stable (no layout shift on
+                    // clear, which was reading as "everything reset").
+                    banner.classList.add('empty');
+                    labelsEl.textContent = 'none';
+                    modeEl.textContent = 'pick labels on Graph / Blast Radius / Shadow IT to scope this view';
+                    clearBtn.hidden = true;
+                    return;
+                }
+                banner.classList.remove('empty');
+                clearBtn.hidden = false;
+                const previewMax = 3;
+                const display = scope.labels.length <= previewMax
+                    ? scope.labels.join(', ')
+                    : `${scope.labels.slice(0, previewMax).join(', ')} +${scope.labels.length - previewMax} more`;
+                labelsEl.textContent = display;
+                const modeText = scope.label_op === 'OR' ? 'Match any' : 'Match all';
+                modeEl.textContent = `(${modeText} · ${scope.labels.length} label${scope.labels.length === 1 ? '' : 's'})`;
+            }
+            clearBtn.addEventListener('click', () => {
+                // CONTRACT: Clear scope removes LABEL scope only.
+                // Team / platform / type / search filters in the toolbar
+                // are independent and stay exactly as the user set them.
+                // The cascade fetches (loadGraph, loadBlastEntities,
+                // calculateBlastRadius, loadShadowITDetections) all read
+                // the toolbar values fresh on each call.
+                SessionLabelScope.clear();
+                if (typeof showStatus === 'function') {
+                    showStatus('Label scope cleared. Team / platform / type filters preserved.');
+                }
+            });
+            SessionLabelScope.subscribe(render);
+            render(SessionLabelScope.get());
+        }
+        // Wire the banner once at module-load time. Safe to call multiple times
+        // — early-returns when DOM is not yet present.
+        if (document.readyState !== 'loading') {
+            _initActiveScopeBanner();
+        } else {
+            document.addEventListener('DOMContentLoaded', _initActiveScopeBanner);
+        }
+
+        // Graph view auto-refresh: when the cross-view label scope changes
+        // (e.g., user picks labels on Shadow IT, switches to Graph), re-fetch
+        // the graph so node/edge visibility matches the active scope.
+        //
+        // The visibility check uses .classList.contains('active') because
+        // the view-container hide mechanism is CSS-class-based (`.active`
+        // toggles `display: block`). The earlier `style.display === 'none'`
+        // check read inline style — which is empty regardless — so it always
+        // reported "visible" and refreshed even when the user wasn't on the
+        // Graph view. Worse, when the user later SWITCHED to Graph, no
+        // refresh fired because the scope-change event was already
+        // consumed. Result: stale unfiltered graph.
+        //
+        // Fix is two-fold:
+        //   1. Use the right visibility check.
+        //   2. Track a `_graphScopeStale` flag when scope changes while
+        //      Graph view is hidden, and force a reload on switchView('graph').
+        let _graphRefreshTimer = null;
+        let _graphScopeStale = false;
+        function _isGraphViewActive() {
+            const graphView = document.getElementById('graph-view');
+            return !!(graphView && graphView.classList.contains('active'));
+        }
+        function _scheduleGraphRefresh(reason) {
+            if (typeof loadGraph !== 'function') return;
+            if (!_isGraphViewActive()) {
+                // Defer: mark stale so the next switch-to-Graph picks it up.
+                _graphScopeStale = true;
+                return;
+            }
+            if (_graphRefreshTimer) clearTimeout(_graphRefreshTimer);
+            _graphRefreshTimer = setTimeout(() => {
+                _graphRefreshTimer = null;
+                _graphScopeStale = false;
+                loadGraph();
+            }, 250);
+        }
+        // Subscribe Graph-view refresh to SessionLabelScope changes.
+        // SessionLabelScope is defined earlier in this module; safe to call
+        // at module load time.
+        SessionLabelScope.subscribe(() => _scheduleGraphRefresh('label-scope-change'));
+
+        // Graph view label picker — popover toggled from the toolbar
+        // "Labels" button. Closes on outside click and Escape.
+        function toggleGraphLabelsPopover(forceState) {
+            const pop = document.getElementById('graph-labels-popover');
+            const btn = document.getElementById('graph-labels-toggle');
+            if (!pop || !btn) return;
+            const willOpen = (forceState !== undefined)
+                ? !!forceState
+                : pop.hidden;
+            pop.hidden = !willOpen;
+            btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        }
+        document.addEventListener('click', e => {
+            const pop = document.getElementById('graph-labels-popover');
+            const btn = document.getElementById('graph-labels-toggle');
+            if (!pop || pop.hidden) return;
+            if (pop.contains(e.target) || (btn && btn.contains(e.target))) return;
+            toggleGraphLabelsPopover(false);
+        });
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') toggleGraphLabelsPopover(false);
+        });
+
+        // Toolbar count badge — shows the active label count next to the
+        // "Labels" button so the user sees scope state at a glance even
+        // when the popover is closed.
+        function _updateGraphLabelsCount(scope) {
+            const badge = document.getElementById('graph-labels-count');
+            if (!badge) return;
+            const n = (scope && scope.labels && scope.labels.length) || 0;
+            if (n === 0) {
+                badge.hidden = true;
+            } else {
+                badge.hidden = false;
+                badge.textContent = String(n);
+            }
+        }
+        SessionLabelScope.subscribe(_updateGraphLabelsCount);
+        if (document.readyState !== 'loading') {
+            _updateGraphLabelsCount(SessionLabelScope.get());
+        } else {
+            document.addEventListener('DOMContentLoaded', () =>
+                _updateGraphLabelsCount(SessionLabelScope.get()));
+        }
+
+        // Blast Radius sidebar: reload the entity list when label scope or
+        // team filter changes so the picker reflects only entities actually
+        // in scope. Without this, the operator picks "Domain Controllers"
+        // and still sees `acl`, `adduser`, `Adobe Refresh Manager`, etc. —
+        // none of which are on a DC. Debounced; only fires when the entity
+        // list is actually mounted.
+        let _blastEntitiesRefreshTimer = null;
+        let _blastEntitiesStale = false;
+        function _isBlastViewActive() {
+            const view = document.getElementById('blast-radius-view');
+            return !!(view && view.classList.contains('active'));
+        }
+        function _scheduleBlastEntitiesRefresh() {
+            if (typeof loadBlastEntities !== 'function') return;
+            if (!document.getElementById('blast-entity-list')) return;
+            // Same fix as the Graph view: visibility is class-based, not
+            // inline-style-based. Mark stale and flush on next switchView.
+            if (!_isBlastViewActive()) {
+                _blastEntitiesStale = true;
+                return;
+            }
+            if (_blastEntitiesRefreshTimer) clearTimeout(_blastEntitiesRefreshTimer);
+            _blastEntitiesRefreshTimer = setTimeout(() => {
+                _blastEntitiesRefreshTimer = null;
+                _blastEntitiesStale = false;
+                loadBlastEntities();
+            }, 250);
+        }
+        SessionLabelScope.subscribe(_scheduleBlastEntitiesRefresh);
+        function _wireBlastTeamRefresh() {
+            const teamEl = document.getElementById('blast-team-filter');
+            if (teamEl && !teamEl.dataset.wiredBlastRefresh) {
+                teamEl.addEventListener('change', _scheduleBlastEntitiesRefresh);
+                teamEl.dataset.wiredBlastRefresh = '1';
+            }
+        }
+        if (document.readyState !== 'loading') {
+            _wireBlastTeamRefresh();
+        } else {
+            document.addEventListener('DOMContentLoaded', _wireBlastTeamRefresh);
+        }
+
+        // Wire the team-filter dropdown to also trigger a Graph refresh when
+        // the user changes selection. The team-filter is the Graph view's
+        // primary scope control today; without this hook, switching teams
+        // didn't actually re-query the graph.
+        function _wireGraphFilterRefresh() {
+            const teamEl = document.getElementById('team-filter');
+            if (teamEl && !teamEl.dataset.wiredGraphRefresh) {
+                teamEl.addEventListener('change', () => _scheduleGraphRefresh('team-filter-change'));
+                teamEl.dataset.wiredGraphRefresh = '1';
+            }
+        }
+        if (document.readyState !== 'loading') {
+            _wireGraphFilterRefresh();
+        } else {
+            document.addEventListener('DOMContentLoaded', _wireGraphFilterRefresh);
+        }
+
+        function _esc(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        async function _fetchLabels(force) {
+            const now = Date.now();
+            if (!force && _labelDataCache && (now - _labelDataLoadedAt) < 30000) {
+                return _labelDataCache;
+            }
+            const resp = await fetch('/api/labels');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            _labelDataCache = await resp.json();
+            _labelDataLoadedAt = now;
+            return _labelDataCache;
+        }
+
+        async function _fetchScopeCount(scope) {
+            // Pre-flight count for zero-host UX. Returns
+            // {count, alt_count, alt_label_op} so the widget can render
+            // the "Switch to OR (matches N hosts)" CTA without a 2nd round-trip.
+            const params = new URLSearchParams();
+            if (scope.labels) {
+                params.set('labels', scope.labels);
+                params.set('label_op', scope.label_op);
+                params.set('include_alt', 'true');
+            }
+            const resp = await fetch(`/api/labels/scope-count?${params}`);
+            if (!resp.ok) return null;
+            return await resp.json();
+        }
+
+        function createLabelWidget(container, opts) {
+            const onChange = (opts && opts.onChange) || function () {};
+            const view = container.dataset.view || 'unknown';
+
+            // Restore from cross-view session scope (TODO-3) on mount.
+            const sessionScope = SessionLabelScope.get();
+
+            const state = {
+                labels: [],
+                selected: new Set(sessionScope.labels || []),
+                mode: sessionScope.label_op || 'AND',
+                search: '',
+                count: null,
+                altCount: null,
+                altMode: null,
+                error: null,
+                loading: true,
+                _suppressNextSessionWrite: false,
+            };
+
+            // Lookup elements once.
+            const elList = container.querySelector('.label-list');
+            const elSearch = container.querySelector('.label-search');
+            const elSegmented = container.querySelector('.segmented');
+            const elSegBtns = elSegmented
+                ? Array.from(elSegmented.querySelectorAll('button[data-op]'))
+                : [];
+            const elReadout = container.querySelector('.scope-readout');
+            const elClear = container.querySelector('.label-widget-clear');
+            const elStaleBanner = container.querySelector('.label-stale-banner');
+            const elAnnouncer = container.querySelector('.sr-only');
+
+            function getScope() {
+                const names = Array.from(state.selected);
+                return {
+                    labels: names.join(','),
+                    label_op: state.mode,
+                    count: names.length,
+                };
+            }
+
+            function announce(msg) {
+                if (elAnnouncer) elAnnouncer.textContent = msg;
+            }
+
+            function renderList() {
+                if (state.loading) {
+                    elList.innerHTML = `
+                        <div class="label-skeleton">
+                            <div class="label-skeleton-row"></div>
+                            <div class="label-skeleton-row" style="width:80%"></div>
+                            <div class="label-skeleton-row" style="width:65%"></div>
+                            <div class="label-skeleton-row" style="width:90%"></div>
+                        </div>`;
+                    return;
+                }
+                if (state.error) {
+                    elList.innerHTML = `
+                        <div class="label-stale-banner" style="border-left-color:var(--danger);background:rgba(229,72,77,0.1);">
+                            <strong style="color:var(--danger);">Backend unavailable.</strong><br>
+                            ${_esc(state.error)}
+                        </div>`;
+                    return;
+                }
+                if (state.labels.length === 0) {
+                    elList.innerHTML = `
+                        <div class="label-empty">
+                            <strong>No labels yet</strong>
+                            Define labels in Fleet to scope investigations by Shadow IT, asset criticality, or any custom grouping.
+                        </div>`;
+                    return;
+                }
+                const q = state.search.trim().toLowerCase();
+                const filtered = q
+                    ? state.labels.filter(l => l.name.toLowerCase().includes(q))
+                    : state.labels;
+                if (filtered.length === 0) {
+                    elList.innerHTML = `
+                        <div class="label-search-empty">
+                            No labels match &ldquo;${_esc(state.search)}&rdquo;.
+                            <button type="button" class="label-search-clear">Clear search</button>
+                        </div>`;
+                    return;
+                }
+                elList.innerHTML = filtered.map(lbl => {
+                    const sel = state.selected.has(lbl.name);
+                    const stale = lbl.last_label_sync_status &&
+                                  lbl.last_label_sync_status !== 'ok';
+                    const staleAria = stale
+                        ? ` Sync stale; last successful sync ${_esc(lbl.last_synced_iso || 'unknown')}.`
+                        : '';
+                    return `
+                        <li class="label-row${sel ? ' selected' : ''}"
+                            role="option"
+                            aria-selected="${sel ? 'true' : 'false'}"
+                            tabindex="0"
+                            data-name="${_esc(lbl.name)}"
+                            title="${_esc(lbl.name)}${staleAria}">
+                            <span class="label-cb" aria-hidden="true"></span>
+                            <span class="label-name">${_esc(lbl.name)}</span>
+                            <span class="label-count">${lbl.host_count || 0}</span>
+                            ${stale
+                                ? `<span class="stale-dot" role="img" aria-label="Sync stale; last sync ${_esc(lbl.last_synced_iso || 'unknown')}"></span>`
+                                : ''}
+                        </li>`;
+                }).join('');
+            }
+
+            function renderClear() {
+                if (!elClear) return;
+                elClear.hidden = state.selected.size === 0;
+            }
+
+            function renderSegmented() {
+                if (!elSegmented) return;
+                elSegmented.hidden = state.selected.size < 2;
+                elSegBtns.forEach(b => {
+                    const active = b.dataset.op === state.mode;
+                    b.classList.toggle('active', active);
+                    b.setAttribute('aria-checked', active ? 'true' : 'false');
+                    b.tabIndex = active ? 0 : -1;
+                });
+            }
+
+            function renderReadout() {
+                if (!elReadout) return;
+
+                if (state.selected.size === 0) {
+                    elReadout.classList.add('empty');
+                    elReadout.innerHTML = `
+                        <strong>Pick labels to scope this view.</strong><br>
+                        Match all = narrow (AND), Match any = broad (OR).`;
+                    return;
+                }
+
+                elReadout.classList.remove('empty');
+                const total = state.labels.length;
+                const sel = state.selected.size;
+                const modeLabel = state.mode === 'AND' ? 'AND mode' : 'OR mode';
+
+                if (state.count === 0 && state.altCount && state.altCount > 0) {
+                    // Zero-host result with non-zero alt
+                    const altLabel = state.altMode === 'AND' ? 'all' : 'any';
+                    elReadout.innerHTML = `
+                        <strong>0 hosts</strong> match this filter.
+                        Try <strong>${state.altMode}</strong> to broaden the scope.
+                        <button type="button" class="switch-cta">
+                            Switch to Match ${altLabel} (${state.altCount} hosts)
+                        </button>`;
+                    return;
+                }
+
+                const countText = state.count == null
+                    ? '…'
+                    : `${state.count} host${state.count === 1 ? '' : 's'}`;
+
+                elReadout.innerHTML = `
+                    <strong>${sel} of ${total} labels</strong> selected, ${modeLabel}
+                    <span class="count-pill">${countText}</span>`;
+            }
+
+            function renderStaleBanner() {
+                if (!elStaleBanner) return;
+                const failedCount = state.labels.filter(
+                    l => l.last_label_sync_status === 'failed' &&
+                         (l.consecutive_failures || 0) >= 3
+                ).length;
+                if (failedCount > 0) {
+                    elStaleBanner.hidden = false;
+                    elStaleBanner.innerHTML = `
+                        <strong>Label data may be stale.</strong>
+                        ${failedCount} label${failedCount === 1 ? '' : 's'} failed to sync recently.
+                        Selections still work; refreshes on next ETL.`;
+                } else {
+                    elStaleBanner.hidden = true;
+                }
+            }
+
+            function renderAll() {
+                renderList();
+                renderClear();
+                renderSegmented();
+                renderReadout();
+                renderStaleBanner();
+            }
+
+            async function refreshCount() {
+                state.count = null;
+                state.altCount = null;
+                state.altMode = null;
+                renderReadout();
+                if (state.selected.size === 0) {
+                    return;
+                }
+                try {
+                    const data = await _fetchScopeCount(getScope());
+                    if (data) {
+                        state.count = data.count;
+                        state.altCount = data.alt_count;
+                        state.altMode = data.alt_label_op;
+                    }
+                } catch (e) {
+                    // Non-fatal — readout falls back to "…" placeholder.
+                    console.warn('scope-count fetch failed:', e);
+                }
+                renderReadout();
+            }
+
+            async function commitChange() {
+                renderAll();
+                // Push to cross-view session scope (TODO-3). Skip when the
+                // change came FROM a session-scope event (avoids infinite
+                // notify loop).
+                if (!state._suppressNextSessionWrite) {
+                    SessionLabelScope.set({
+                        labels: Array.from(state.selected),
+                        label_op: state.mode,
+                    });
+                } else {
+                    state._suppressNextSessionWrite = false;
+                }
+                await refreshCount();
+                renderReadout();
+                onChange(getScope(), { source: view });
+            }
+
+            function toggleLabel(name) {
+                if (state.selected.has(name)) {
+                    state.selected.delete(name);
+                    announce(`${name} unselected. ${state.selected.size} of ${state.labels.length} labels selected.`);
+                } else {
+                    state.selected.add(name);
+                    announce(`${name} selected. ${state.selected.size} of ${state.labels.length} labels selected, ${state.mode} mode.`);
+                }
+                commitChange();
+            }
+
+            function setMode(newMode) {
+                if (newMode !== 'AND' && newMode !== 'OR') return;
+                if (newMode === state.mode) return;
+                state.mode = newMode;
+                announce(`${newMode} mode.`);
+                commitChange();
+            }
+
+            function clearAll() {
+                if (state.selected.size === 0) return;
+                state.selected.clear();
+                announce('All labels cleared.');
+                commitChange();
+            }
+
+            // Event wiring (delegated on the list to handle dynamic rows).
+            elList.addEventListener('click', e => {
+                const row = e.target.closest('.label-row');
+                if (row) {
+                    toggleLabel(row.dataset.name);
+                    return;
+                }
+                if (e.target.classList.contains('label-search-clear')) {
+                    state.search = '';
+                    if (elSearch) elSearch.value = '';
+                    renderList();
+                }
+            });
+            elList.addEventListener('keydown', e => {
+                const row = e.target.closest('.label-row');
+                if (!row) return;
+                if (e.key === ' ' || e.key === 'Enter') {
+                    e.preventDefault();
+                    toggleLabel(row.dataset.name);
+                    return;
+                }
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    const next = row.nextElementSibling;
+                    if (next && next.classList.contains('label-row')) next.focus();
+                }
+                if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    const prev = row.previousElementSibling;
+                    if (prev && prev.classList.contains('label-row')) prev.focus();
+                }
+            });
+
+            if (elSearch) {
+                elSearch.addEventListener('input', e => {
+                    state.search = e.target.value;
+                    renderList();
+                });
+            }
+
+            elSegBtns.forEach(b => {
+                b.addEventListener('click', () => setMode(b.dataset.op));
+                b.addEventListener('keydown', e => {
+                    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        const idx = elSegBtns.indexOf(b);
+                        const next = elSegBtns[(idx + 1) % elSegBtns.length];
+                        next.focus();
+                        setMode(next.dataset.op);
+                    }
+                });
+            });
+
+            if (elClear) {
+                elClear.addEventListener('click', clearAll);
+            }
+
+            if (elReadout) {
+                elReadout.addEventListener('click', e => {
+                    if (e.target.classList.contains('switch-cta')) {
+                        setMode(state.altMode || (state.mode === 'AND' ? 'OR' : 'AND'));
+                    }
+                });
+            }
+
+            async function refresh() {
+                state.loading = true;
+                state.error = null;
+                renderList();
+                try {
+                    state.labels = await _fetchLabels(false);
+                    state.loading = false;
+                    // Drop selections for labels that no longer exist (Fleet
+                    // deletion / 7-day reap).
+                    const live = new Set(state.labels.map(l => l.name));
+                    Array.from(state.selected).forEach(n => {
+                        if (!live.has(n)) state.selected.delete(n);
+                    });
+                } catch (e) {
+                    state.loading = false;
+                    state.error = 'Memgraph is unreachable. Retry shortly.';
+                }
+                renderAll();
+                refreshCount();
+            }
+
+            // Subscribe to cross-view scope changes. When another widget
+            // (or the active-scope banner's "Clear" button) mutates the
+            // session scope, mirror the change here without re-broadcasting.
+            const _unsub = SessionLabelScope.subscribe((scope) => {
+                const newSelected = new Set(scope.labels || []);
+                const newMode = scope.label_op || 'AND';
+                // Skip if our state already matches — this widget is the source.
+                const sameLabels =
+                    newSelected.size === state.selected.size &&
+                    Array.from(newSelected).every(n => state.selected.has(n));
+                const sameMode = newMode === state.mode;
+                if (sameLabels && sameMode) return;
+                state.selected = newSelected;
+                state.mode = newMode;
+                state._suppressNextSessionWrite = true;
+                commitChange();
+            });
+
+            const inst = {
+                refresh,
+                getScope,
+                getElement: () => container,
+                destroy: () => _unsub(),
+            };
+            _labelWidgetRegistry.set(container, inst);
+            refresh();
+            return inst;
+        }
+
+        // Backward-compat shim used by calculateBlastRadius and
+        // loadShadowITDetections — they still call readLabelFilter().
+        // The new signature accepts EITHER (selectEl, opEl) tuple (legacy)
+        // OR a single `.label-widget` container element. Resolve via the
+        // registry when given a container.
+        function readLabelFilter(elOrContainer, _opEl_unused) {
+            // Legacy: passed a <select> element directly. Read selectedOptions.
+            if (elOrContainer && elOrContainer.tagName === 'SELECT') {
+                const names = Array.from(elOrContainer.selectedOptions)
+                    .map(o => o.value).filter(v => v);
+                const opEl = _opEl_unused;
+                return {
+                    labels: names.join(','),
+                    label_op: (opEl && opEl.value) ? opEl.value : 'AND',
+                };
+            }
+            // New: passed the .label-widget container.
+            if (elOrContainer && elOrContainer.classList &&
+                elOrContainer.classList.contains('label-widget')) {
+                const inst = _labelWidgetRegistry.get(elOrContainer);
+                return inst
+                    ? inst.getScope()
+                    : { labels: '', label_op: 'AND' };
+            }
+            return { labels: '', label_op: 'AND' };
+        }
+
+        function loadLabels() {
+            // Discovery + binding. Each `.label-widget` container becomes its
+            // own widget instance bound to its parent view's data fetch.
+            document.querySelectorAll('.label-widget').forEach(container => {
+                if (_labelWidgetRegistry.has(container)) {
+                    _labelWidgetRegistry.get(container).refresh();
+                    return;
+                }
+                const view = container.dataset.view;
+                createLabelWidget(container, {
+                    onChange: () => {
+                        if (view === 'blast') {
+                            if (typeof calculateBlastRadius === 'function') {
+                                calculateBlastRadius();
+                            }
+                        } else if (view === 'shadow') {
+                            if (typeof loadShadowITDetections === 'function') {
+                                loadShadowITDetections();
+                            }
+                        }
+                    },
+                });
+            });
         }
 
         function loadPlatforms() {
@@ -3158,11 +4531,18 @@
             const hostCountFilter = document.getElementById('shadow-host-count-filter').value;
             const userCountFilter = document.getElementById('shadow-user-count-filter').value;
 
+            const shadowWidget = document.querySelector('.label-widget[data-view="shadow"]');
+            const labelScope = readLabelFilter(shadowWidget);
+
             const params = new URLSearchParams({
                 team: teamFilter, platform: platformFilter, risk: riskFilter,
                 detection_type: detectionTypeFilter, software_type: softwareTypeFilter,
                 host_count: hostCountFilter, user_count: userCountFilter
             });
+            if (labelScope.labels) {
+                params.set('labels', labelScope.labels);
+                params.set('label_op', labelScope.label_op);
+            }
 
             try {
                 const response = await fetch(`/api/shadow-it?${params}`);
@@ -4138,6 +5518,7 @@
 
             loadTeams();
             loadPlatforms();
+            loadLabels();
             loadGraph();
             refreshTopbarMeta();
 

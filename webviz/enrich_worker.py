@@ -40,7 +40,7 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
 # Use absolute import — Dockerfile copies prod/categorize_software.py to /app/.
 sys.path.insert(0, "/app")
-from categorize_software import _escape_sparql_string_literal, get_wikidata_info  # noqa: E402,F401
+from categorize_software import EnrichResult, get_software_info  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -248,12 +248,12 @@ def _loop(driver_provider, status: _SharedStatus, *,
                         if stop_event.is_set():
                             break
                         try:
-                            info = get_wikidata_info(name, http)
+                            status_code, payload = get_software_info(name, http)
                         except Exception as exc:
-                            logger.warning("enricher: wikidata error for %r: %s", name, exc)
-                            info = None
-                        if info:
-                            categories, desc = info
+                            logger.warning("enricher: lookup error for %r: %s", name, exc)
+                            status_code, payload = EnrichResult.TRANSIENT, None
+                        if status_code == EnrichResult.HIT and payload:
+                            categories, desc = payload
                             if categories or desc:
                                 if _write_categories(driver, name, categories, desc):
                                     enriched += 1

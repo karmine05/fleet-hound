@@ -16,11 +16,44 @@ from flask import Flask, jsonify, request, send_from_directory
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ClientError, ServiceUnavailable, TransientError
 
+# Host-filter helper (plan section 2A). Single source of truth for the
+# `?team=`, `?platform=`, `?labels=A,B&label_op=AND|OR` query-string contract
+# previously duplicated across ~6 endpoints. New scoping endpoints should
+# import from here rather than recreate the if-platform-then-AND pattern.
+from webviz.host_filters import (
+    FilterValidationError,
+    apply_composite_filter,
+    apply_host_filters,
+    apply_label_filter,
+    merge_filter_params,
+)
+
+# Shadow IT filter primitives (shared with categorize_software.py).
+# Pre-2026-05-07 these lived inline in this file; extracting to
+# src/shadow_it_filter.py let categorize_software.py reuse the same rules
+# for enrichment-candidate selection (so Wikidata stops getting hammered
+# with system-package lookups it has zero chance of resolving).
+from src.shadow_it_filter import (
+    DEV_LANGUAGE_SOURCES as _DEV_LANGUAGE_SOURCES,
+    EXTENSION_SOURCES as _EXTENSION_SOURCES,
+    MIN_OUTLIER_HOSTS as _MIN_OUTLIER_HOSTS,
+    SYSTEM_CATEGORY_TOKENS as _SYSTEM_CATEGORY_TOKENS,
+    SYSTEM_PACKAGE_RE as _SYSTEM_PACKAGE_RE,
+    USER_APP_SOURCES as _USER_APP_SOURCES,
+    compute_per_platform_thresholds as _compute_per_platform_thresholds,
+    get_outlier_pct as _get_outlier_pct,
+    has_user_app_source as _has_user_app_source,  # noqa: F401  (used by future endpoints)
+    is_non_app_source as _is_non_app_source,
+    is_system_package as _is_system_package,
+)
+
 # /app on the container has webviz/, src/, categorize_software.py side by side
-# (Dockerfile copies them all). Make /app importable so we can `from src.snapshot
-# import ...` and `from enrich_worker import ...`.
-sys.path.insert(0, "/app")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (Dockerfile copies them all). Make /app importable for `from src.snapshot import …`
+# and the webviz/ dir importable for bare `from enrich_worker import …` / `ooda_worker`.
+_WEBVIZ_DIR = os.path.dirname(os.path.abspath(__file__))
+_APP_DIR = os.path.dirname(_WEBVIZ_DIR)
+sys.path.insert(0, _APP_DIR)
+sys.path.insert(0, _WEBVIZ_DIR)
 
 # Configure logging
 logging.basicConfig(
@@ -169,108 +202,11 @@ OODA_MANUAL_TRIGGER_COOLDOWN = 60.0
 # running outlier / high-risk / version-sprawl detection.
 # ---------------------------------------------------------------------------
 
-# Names that are almost always installed by the OS package manager as
-# transitive deps or platform components — never user-chosen Shadow IT.
-_SYSTEM_PACKAGE_RE = re.compile(
-    r"^("
-    # Library packages (lib*, *-dev, *-doc, *-data, *-common, *-headers, *-dbg, *-dbgsym)
-    r"lib[a-z0-9].*"
-    r"|.*-(dev|dbg|dbgsym|doc|docs|data|common|headers|src|source|locale|locales|man|examples|utils|runtime|core|base|tiny|minimal)"
-    # Linux kernel / firmware / boot
-    r"|linux-(image|headers|libc|modules|tools|cloud|generic|signed|firmware|base|hwe|aws|azure|gcp|oracle|kvm|raspi|ibm|nvidia)([-.].*)?"
-    r"|kernel(-.*)?|firmware-.*|grub[-.].*|systemd([-.].*)?|initramfs.*|initrd.*"
-    # Package manager / distro plumbing
-    r"|debconf.*|dpkg.*|apt(-.*)?|aptitude.*|yum.*|dnf.*|rpm(-.*)?|alien.*|snapd.*|flatpak.*"
-    # Locale / timezone / console
-    r"|tzdata(-.*)?|locales(-.*)?|language-pack(-.*)?|console-(setup|data)(-.*)?"
-    # Language runtimes shipped as distro packages (transitive deps, not user installs)
-    r"|python3?(-.*|\.[0-9]+(-.*)?)?"
-    r"|perl(-.*|-base|-modules.*)?"
-    r"|ruby[0-9.]*(-.*)?|gem-.*"
-    r"|golang(-.*)?"
-    # Toolchain
-    r"|gcc(-.*)?|g\+\+(-.*)?|clang(-.*)?|llvm(-.*)?|binutils(-.*)?|make.*|cmake.*"
-    r"|automake.*|autoconf.*|libtool.*|pkg-config.*"
-    # Desktop / X11 / fonts
-    r"|gnome-.*|kde-.*|xfce4-.*|cinnamon-.*|mate-.*|x11-.*|xorg-.*|xserver-.*"
-    r"|fonts-.*|gtk[0-9.-]*|qt[0-9.-]*"
-    # Crypto / certs / shells
-    r"|openssl.*|ca-certificates.*|gnupg.*|gpg.*|gpgv.*|gnupg2.*"
-    # Core utils
-    r"|ucf|sensible-utils|lsb-.*|base-(files|passwd)|coreutils|util-linux.*"
-    r"|findutils|grep|sed|gawk|tar|gzip|xz-utils|bzip2|zstd|file|less|nano"
-    r"|vim-(common|tiny|runtime)|bash|dash|zsh|tmux|screen"
-    # Network plumbing
-    r"|cups(-.*)?|samba.*|smbclient.*|nfs-.*|rpcbind.*|netbase|iproute2|iputils-.*"
-    r")$"
-)
-
-# Wikidata category tokens that indicate "this is OS plumbing, not an app".
-_SYSTEM_CATEGORY_TOKENS = (
-    "software library", "shared library", "system library",
-    "free software library", "kernel module", "device driver",
-    "header file", "package manager package", "metapackage",
-    "init system", "system component", "operating system component",
-)
-
-# osquery `software` table source values. Sourced from the upstream osquery
-# spec: https://osquery.io/schema/current#software
-#
-# Sources we treat as NOT-shadow-IT-relevant for the main scan:
-#   * Language ecosystem packages (npm/pip/gem/cargo): always dev-environment
-#     transitive deps, never user-chosen end-user software. A pip-installed
-#     `requests` library is not Shadow IT.
-#   * Browser/IDE extensions: legitimate Shadow IT surface, but with a totally
-#     different risk taxonomy (privacy-affecting extensions, malicious tab
-#     hijackers, telemetry add-ons). Out of scope for the app-level scan; flag
-#     via a dedicated extension-shadow-IT view in the future.
-_DEV_LANGUAGE_SOURCES = frozenset({
-    "npm_packages", "python_packages", "gem_packages", "cargo_packages",
-    "pkg_packages", "portage_packages",
-})
-_EXTENSION_SOURCES = frozenset({
-    "chrome_extensions", "firefox_addons", "safari_extensions",
-    "ie_extensions", "vscode_extensions", "atom_packages",
-})
-# Sources that ARE the primary user-installable app surface — apps the user
-# actively chose to install. These are the highest-signal Shadow IT candidates.
-_USER_APP_SOURCES = frozenset({
-    "apps",                  # macOS .app bundles
-    "programs",              # Windows installed programs
-    "homebrew_packages",     # macOS user-installed
-    "chocolatey_packages",   # Windows user-installed
-})
-
-
-def _is_non_app_source(sources) -> bool:
-    """Return True if every recorded source for the software is a dev-language
-    package manager or a browser/IDE extension — i.e. not a user-installed app."""
-    if not sources:
-        return False
-    src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
-    if not src_set:
-        return False
-    return src_set.issubset(_DEV_LANGUAGE_SOURCES | _EXTENSION_SOURCES)
-
-
-def _is_system_package(name: str, db_categories, sources=None) -> bool:
-    """Return True if a Software node represents OS plumbing, dev-language
-    transitive deps, or a browser/IDE extension — anything that is NOT a
-    user-chosen end-user application. Used to suppress false-positive Shadow
-    IT hits on packages like libreadline8, python3.12-dev, tzdata-legacy,
-    npm-react, vscode-docker."""
-    if not name:
-        return False
-    # Source-based filter: highest-signal, deterministic.
-    if _is_non_app_source(sources):
-        return True
-    if _SYSTEM_PACKAGE_RE.match(name.lower().strip()):
-        return True
-    if db_categories:
-        cat_text = " ".join(c.lower() for c in db_categories if isinstance(c, str))
-        if any(tok in cat_text for tok in _SYSTEM_CATEGORY_TOKENS):
-            return True
-    return False
+# Shadow IT filter primitives now live in src/shadow_it_filter.py and are
+# imported above as _SYSTEM_PACKAGE_RE / _SYSTEM_CATEGORY_TOKENS /
+# _DEV_LANGUAGE_SOURCES / _EXTENSION_SOURCES / _USER_APP_SOURCES /
+# _is_non_app_source / _is_system_package. Single source of truth shared
+# with categorize_software.py.
 
 
 def _word_match(pattern: str, text_lower: str) -> bool:
@@ -614,6 +550,198 @@ def get_platforms():
         platforms = [r['platform'] for r in result]
         return jsonify(platforms)
 
+
+@app.route("/api/labels")
+def get_labels():
+    """List Fleet labels (user-defined + functional builtins) for scoping.
+
+    Plan section 1A/1E/2B. Powers the UI multi-select widget and any
+    consumer that needs to know:
+      - which labels exist in this graph
+      - how many hosts each one currently scopes
+      - how fresh the label sync is, per-label
+
+    Response schema (one entry per label):
+        {
+          "fleet_id": int,
+          "name": str,
+          "description": str | "",
+          "label_type": "regular" | "builtin",
+          "membership_type": "dynamic" | "manual" | "",
+          "host_count": int,           # live count from graph (HAS_LABEL edges)
+          "last_synced_iso": str,
+          "last_label_sync_status": "ok" | "stale" | "failed",
+          "consecutive_failures": int,
+        }
+
+    Notes:
+      - The osquery `query` field that defines a dynamic label is NOT
+        included by default. It can be large and is rarely needed for the
+        scoping UX. Pass `?include_query=true` to retrieve it.
+      - host_count comes from the live graph (count of HAS_LABEL edges),
+        not from Fleet's metadata. This catches drift between Fleet's
+        cached counter and what's actually in our graph.
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    include_query = request.args.get("include_query", "").strip().lower() == "true"
+
+    try:
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (l:Label)
+                OPTIONAL MATCH (l)<-[r:HAS_LABEL]-(:Host)
+                WITH l, count(r) AS live_host_count
+                RETURN l.fleet_id AS fleet_id,
+                       l.name AS name,
+                       coalesce(l.description, '') AS description,
+                       coalesce(l.label_type, 'regular') AS label_type,
+                       coalesce(l.membership_type, '') AS membership_type,
+                       live_host_count AS host_count,
+                       coalesce(l.last_synced_iso, '') AS last_synced_iso,
+                       coalesce(l.last_label_sync_status, 'unknown') AS last_label_sync_status,
+                       coalesce(l.consecutive_failures, 0) AS consecutive_failures,
+                       l.query AS query
+                ORDER BY l.name
+                """
+            )
+            payload = []
+            for r in result:
+                entry = {
+                    "fleet_id": r["fleet_id"],
+                    "name": r["name"],
+                    "description": r["description"],
+                    "label_type": r["label_type"],
+                    "membership_type": r["membership_type"],
+                    "host_count": int(r["host_count"]) if r["host_count"] is not None else 0,
+                    "last_synced_iso": r["last_synced_iso"],
+                    "last_label_sync_status": r["last_label_sync_status"],
+                    "consecutive_failures": int(r["consecutive_failures"] or 0),
+                }
+                if include_query and r["query"]:
+                    entry["query"] = r["query"]
+                payload.append(entry)
+            return jsonify(payload)
+    except (TransientError, ServiceUnavailable) as exc:
+        logger.warning("/api/labels transient: %s", exc)
+        return jsonify({
+            "error": "Database transient error",
+            "message": "Memgraph is unreachable. Retry in a moment.",
+        }), 503
+    except Exception as exc:
+        logger.error("/api/labels failed: %s", exc, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/labels/scope-count")
+def get_label_scope_count():
+    """Pre-flight host count for a candidate label scope.
+
+    Drives the zero-host empty-state UX in the label widget (plan-design-review
+    Pass 2 finding 2A). On every chip toggle the UI fires this endpoint with
+    the candidate scope; on count == 0 the widget surfaces the "Switch to OR
+    (matches N hosts)" CTA with a pre-computed alternative count.
+
+    Query params: same shape as /api/search etc.
+        ?labels=A,B&label_op=AND|OR  → count of hosts in scope
+        ?team=N&platform=X           → optional, filters the count
+        ?include_alt=true            → also return alternative count for
+                                       the OPPOSITE label_op (so the UI can
+                                       render "Switch to OR (matches N)" without
+                                       a second round-trip)
+
+    Response:
+        {
+          "count": int,
+          "labels": [...],         # echoed for client-side state alignment
+          "label_op": "AND"|"OR",
+          "alt_count": int|null,   # only when ?include_alt=true
+          "alt_label_op": "OR"|"AND"|null
+        }
+    """
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    # TODO-2: composite scoping. When `?expr=<json>` is provided, route
+    # through apply_composite_filter for arbitrary boolean expressions over
+    # team/platform/labels. Otherwise fall back to the flat-AND
+    # apply_host_filters path. The expr param is the opt-in — no separate
+    # feature flag needed.
+    expr_raw = (request.args.get("expr") or "").strip()
+    if expr_raw:
+        try:
+            expr_obj = json.loads(expr_raw)
+        except (ValueError, TypeError) as exc:
+            return jsonify({
+                "error": "Invalid expr",
+                "message": f"expr must be valid JSON: {exc}",
+            }), 400
+        try:
+            flt_fragment, flt_params = apply_composite_filter(expr_obj)
+        except FilterValidationError as exc:
+            return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
+    else:
+        try:
+            flt_fragment, flt_params = apply_host_filters(request.args)
+        except FilterValidationError as exc:
+            return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
+
+    include_alt = request.args.get("include_alt", "").strip().lower() == "true"
+    labels_csv = (request.args.get("labels") or "").strip()
+    label_names = [s.strip() for s in labels_csv.split(",") if s.strip()] if labels_csv else []
+    label_op = (request.args.get("label_op") or "AND").strip().upper()
+    if label_op not in ("AND", "OR"):
+        # Unreachable when apply_host_filters validates label_op, but defense
+        # in depth in case the helper signature changes later.
+        return jsonify({"error": "Invalid label_op"}), 400
+
+    try:
+        with driver.session() as session:
+            count_query = (
+                "MATCH (h:Host) WHERE 1=1" + flt_fragment + " RETURN count(h) AS c"
+            )
+            rec = session.run(count_query, **flt_params).single()
+            count = int(rec["c"]) if rec and rec["c"] is not None else 0
+
+            payload = {
+                "count": count,
+                "labels": label_names,
+                "label_op": label_op,
+                "alt_count": None,
+                "alt_label_op": None,
+            }
+
+            if include_alt and label_names and len(label_names) >= 2:
+                # Compute the count under the OPPOSITE op so the UI's
+                # "Switch to OR (matches N hosts)" CTA can pre-render without
+                # a second fetch. Only meaningful when ≥2 labels are selected
+                # (with one label, AND and OR are equivalent).
+                alt_op = "OR" if label_op == "AND" else "AND"
+                alt_args = dict(request.args)
+                alt_args["label_op"] = alt_op
+                alt_fragment, alt_params = apply_host_filters(alt_args)
+                alt_query = (
+                    "MATCH (h:Host) WHERE 1=1" + alt_fragment + " RETURN count(h) AS c"
+                )
+                alt_rec = session.run(alt_query, **alt_params).single()
+                payload["alt_count"] = (
+                    int(alt_rec["c"]) if alt_rec and alt_rec["c"] is not None else 0
+                )
+                payload["alt_label_op"] = alt_op
+
+            return jsonify(payload)
+    except (TransientError, ServiceUnavailable) as exc:
+        logger.warning("/api/labels/scope-count transient: %s", exc)
+        return jsonify({
+            "error": "Database transient error",
+            "message": "Memgraph is unreachable. Retry in a moment.",
+        }), 503
+    except Exception as exc:
+        logger.error("/api/labels/scope-count failed: %s", exc, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route("/api/search")
 def search_all():
     """Universal search endpoint for all node types (hosts, users, software).
@@ -630,6 +758,14 @@ def search_all():
     platform_filter = request.args.get('platform', 'all').strip().lower()
     team_filter = request.args.get('team', 'all').strip()
 
+    # Label scoping (plan section 1E + 2A): bolted on additively via the
+    # apply_label_filter helper so existing team/platform logic stays intact.
+    # The label fragment always starts with " AND " or is empty; appending
+    # it after the existing inline team/platform AND chain is safe.
+    try:
+        label_flt_fragment, label_flt_params = apply_label_filter(request.args)
+    except FilterValidationError as exc:
+        return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
 
     # Advanced search parameters
     search_mode = request.args.get('mode', 'wildcard').strip().lower()  # wildcard, exact, regex
@@ -723,6 +859,7 @@ def search_all():
                     host_query += " AND toLower(h.platform) CONTAINS toLower($platform)"
                 if team_filter != 'all':
                     host_query += " AND toString(h.team_id) = $team_id"
+                host_query += label_flt_fragment
                 host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
                 # Apply limit to search results too if requested
                 if limit_param > 0:
@@ -735,6 +872,7 @@ def search_all():
                     params['platform'] = platform_filter
                 if team_filter != 'all':
                     params['team_id'] = team_filter
+                params.update(label_flt_params)
                 host_result = session.run(host_query, **params)
             else:
                 # No search term: return ALL hosts (with optional platform and team filters)
@@ -747,11 +885,13 @@ def search_all():
                 if team_filter != 'all':
                     host_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
+                host_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
                 # Apply default limit if no term
                 host_query += f" LIMIT {cypher_limit}"
-                
+
                 host_result = session.run(host_query, **params)
 
             for record in host_result:
@@ -788,6 +928,8 @@ def search_all():
                 if team_filter != 'all':
                     user_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
+                user_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 user_query += " RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname"
                 if limit_param > 0:
@@ -805,6 +947,8 @@ def search_all():
                 if team_filter != 'all':
                     user_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
+                user_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 user_query += " RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname"
                 user_query += f" LIMIT {cypher_limit}"
@@ -842,6 +986,8 @@ def search_all():
                 if team_filter != 'all':
                     software_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
+                software_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 software_query += """
                     WITH s, COUNT(DISTINCT h) as host_count
@@ -849,7 +995,7 @@ def search_all():
                 """
                 if limit_param > 0:
                     software_query += f" LIMIT {cypher_limit}"
-                
+
                 software_result = session.run(software_query, **params)
             else:
                 # No search term: return top 100 software by host count (with optional platform and team filters)
@@ -865,6 +1011,8 @@ def search_all():
                 if team_filter != 'all':
                     software_query += " AND toString(h.team_id) = $team_id"
                     params['team_id'] = team_filter
+                software_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 software_query += f"""
                     WITH s.name AS name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, COUNT(DISTINCT h) AS host_count
@@ -1289,7 +1437,7 @@ def get_blast_radius():
     node_id = request.args.get('id')
     team_filter = request.args.get('team', 'all')
     ignore_defaults = request.args.get('ignore_defaults', 'false').lower() == 'true'
-    
+
     if not node_type or not node_id:
         return jsonify({"error": "Missing type or id parameter"}), 400
 
@@ -1306,6 +1454,13 @@ def get_blast_radius():
             "message": "id must be <= 300 characters",
         }), 400
 
+    # Label scoping (plan 1E): bolted on additively. label_clause is merged
+    # alongside team_clause into every Cypher query that filters on hosts.
+    try:
+        label_flt_fragment, label_flt_params = apply_label_filter(request.args)
+    except FilterValidationError as exc:
+        return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
+
     with driver.session() as session:
         metrics = {
             "host_reach": 0,
@@ -1313,21 +1468,27 @@ def get_blast_radius():
             "lateral_movement": 0,
             "platform_diversity": 0
         }
-        
+
         details = {
             "hosts": [],
             "users": [],
             "teams": [],
             "platforms": []
         }
-        
-        # Prepare team filter clause
+
+        # Prepare team + label filter clauses. team_clause uses the legacy
+        # inline pattern; label_clause comes from apply_label_filter so it
+        # supports multi-label AND/OR semantics. Both inject into the same
+        # WHERE chain via f-string interpolation below.
         team_clause = ""
+        label_clause = label_flt_fragment
         params = {"id": node_id}
-        
+
         if team_filter != 'all':
             team_clause = "AND toString(h.team_id) = $team_id"
             params["team_id"] = team_filter
+
+        params.update(label_flt_params)
 
         # Common logic for finding impacted users on compromised hosts
         # This is where we apply the ignore_defaults filter
@@ -1361,12 +1522,12 @@ def get_blast_radius():
             # Find hosts accessed by this user (filtered by team)
             host_query = f"""
                 MATCH (u:User {{username: $id}})-[:USES]->(h:Host)
-                WHERE 1=1 {team_clause}
+                WHERE 1=1 {team_clause} {label_clause}
                 RETURN collect(DISTINCT h) as hosts
             """
             result = session.run(host_query, **params)
-            
-            hosts = result.single()['hosts']
+            _h_rec = result.single()
+            hosts = (_h_rec['hosts'] if _h_rec else []) or []
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
             details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
@@ -1397,7 +1558,8 @@ def get_blast_radius():
                 query_params = {**params, "hostnames": host_names}
                 
                 user_res = session.run(user_query, **query_params)
-                impacted_users = user_res.single()['users']
+                user_rec = user_res.single()
+                impacted_users = (user_rec['users'] if user_rec else []) or []
                 metrics['user_impact'] = len(impacted_users)
                 details['users'] = impacted_users
 
@@ -1405,18 +1567,33 @@ def get_blast_radius():
             # For Software, blast radius is:
             # 1. Hosts installed on
             # 2. Users on those hosts
-            
-            # Find hosts for software (filtered by team)
+            #
+            # Two-step query because the previous one-step COLLECT version
+            # returned 0 rows when the team/label scope produced no matching
+            # hosts — and `result.single()` was None, crashing on
+            # `record['hosts']`. Splitting the metadata fetch from the host
+            # set lets us render an empty-blast-radius result cleanly when
+            # the operator scopes to a label this software isn't in.
+            sw_meta = session.run(
+                "MATCH (s:Software {name: $id}) "
+                "RETURN s.category AS category, "
+                "       s.wikidata_description AS description LIMIT 1",
+                id=node_id,
+            ).single()
+            if sw_meta is None:
+                metrics['category'] = None
+                metrics['description'] = None
+            else:
+                metrics['category'] = sw_meta['category']
+                metrics['description'] = sw_meta['description']
+
             host_query = f"""
                 MATCH (s:Software {{name: $id}})-[:INSTALLED_ON]->(h:Host)
-                WHERE 1=1 {team_clause}
-                RETURN collect(DISTINCT h) as hosts, s.category as category, s.wikidata_description as description
+                WHERE 1=1 {team_clause} {label_clause}
+                RETURN collect(DISTINCT h) AS hosts
             """
-            result = session.run(host_query, **params)
-            record = result.single()
-            hosts = record['hosts']
-            metrics['category'] = record['category']
-            metrics['description'] = record['description']
+            host_rec = session.run(host_query, **params).single()
+            hosts = (host_rec['hosts'] if host_rec else []) or []
             
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
@@ -1442,7 +1619,8 @@ def get_blast_radius():
                 query_params = {**params, "hostnames": host_names}
                 
                 user_res = session.run(user_query, **query_params)
-                impacted_users = user_res.single()['users']
+                user_rec = user_res.single()
+                impacted_users = (user_rec['users'] if user_rec else []) or []
                 metrics['user_impact'] = len(impacted_users)
                 details['users'] = impacted_users
         
@@ -1465,7 +1643,8 @@ def get_blast_radius():
                 RETURN collect(DISTINCT h.hostname) as lateral_hosts
             """, users=details['users'], original_hosts=original_host_names)
             
-            lateral_hosts = lateral_res.single()['lateral_hosts']
+            _lat_rec = lateral_res.single()
+            lateral_hosts = (_lat_rec['lateral_hosts'] if _lat_rec else []) or []
             metrics['lateral_movement'] = len(lateral_hosts)
             
         # Add lateral hosts count to details for potential display (though we might not list them all if too many)
@@ -1614,9 +1793,43 @@ def get_graph_data():
 
 @app.route("/api/graph/full")
 def get_full_graph_data():
-    """Get full graph data including software for expansion"""
+    """Get scoped graph data including software for expansion.
+
+    Supports the same scoping params as /api/search and /api/shadow-it:
+        ?team=<id>           — filter Hosts by team_id
+        ?platform=<name>     — filter Hosts by platform substring
+        ?labels=A,B          — filter Hosts by HAS_LABEL membership
+        ?label_op=AND|OR     — multi-label semantics (default AND)
+        ?expr=<json>         — composite boolean expression (alternative)
+
+    Filtering applies at the Host level. Users and Software cascade: only
+    surfaces if connected to at least one Host that survived filtering. This
+    ensures the graph shows only entities ACTUALLY in the selected scope —
+    no orphan apps that aren't part of the chosen labels.
+    """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+
+    # Parse scoping filters once. Apply the same fragment to every host-anchored
+    # query (Hosts, Users via h, Software via h) so the cascade is consistent.
+    expr_raw = (request.args.get("expr") or "").strip()
+    if expr_raw:
+        try:
+            expr_obj = json.loads(expr_raw)
+        except (ValueError, TypeError) as exc:
+            return jsonify({
+                "error": "Invalid expr",
+                "message": f"expr must be valid JSON: {exc}",
+            }), 400
+        try:
+            flt_fragment, flt_params = apply_composite_filter(expr_obj)
+        except FilterValidationError as exc:
+            return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
+    else:
+        try:
+            flt_fragment, flt_params = apply_host_filters(request.args)
+        except FilterValidationError as exc:
+            return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
 
     try:
         with driver.session() as session:
@@ -1624,14 +1837,18 @@ def get_full_graph_data():
             nodes = []
             node_ids = set()  # Track node IDs to ensure links are valid
 
-            # Host nodes - only hosts with relationships (users or software)
-            host_result = session.run("""
-                MATCH (h:Host)
-                WHERE EXISTS((h)<-[:USES]-(:User)) OR EXISTS((h)<-[:INSTALLED_ON]-(:Software))
-                RETURN h.hostname AS hostname, h.os_version AS os_version,
-                       h.platform AS platform, h.team_id AS team_id,
-                       h.team_name AS team_name
-            """)
+            # Host nodes — only hosts with relationships (users or software).
+            # `flt_fragment` always begins with " AND " or is empty, so it
+            # appends cleanly after the existing connected-host predicate.
+            host_query = (
+                "MATCH (h:Host) "
+                "WHERE (EXISTS((h)<-[:USES]-(:User)) OR EXISTS((h)<-[:INSTALLED_ON]-(:Software)))"
+                + flt_fragment +
+                " RETURN h.hostname AS hostname, h.os_version AS os_version, "
+                "        h.platform AS platform, h.team_id AS team_id, "
+                "        h.team_name AS team_name"
+            )
+            host_result = session.run(host_query, **flt_params)
             for record in host_result:
                 node_id = f"host_{record['hostname']}"
                 node_obj = {
@@ -1647,11 +1864,16 @@ def get_full_graph_data():
                 nodes.append(node_obj)
                 node_ids.add(node_id)
 
-            # User nodes
-            user_result = session.run("""
-                MATCH (u:User)-[:USES]->(h:Host)
-                RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname
-            """)
+            # User nodes — only those connected to a host that survived the
+            # filter. Without this cascade, the graph would include users from
+            # hosts the operator just scoped OUT.
+            user_query = (
+                "MATCH (u:User)-[:USES]->(h:Host) "
+                "WHERE 1=1" + flt_fragment +
+                " RETURN DISTINCT u.username AS username, u.email AS email, "
+                "        u.fullname AS fullname"
+            )
+            user_result = session.run(user_query, **flt_params)
             for record in user_result:
                 node_id = f"user_{record['username']}"
                 nodes.append({
@@ -1662,19 +1884,22 @@ def get_full_graph_data():
                 })
                 node_ids.add(node_id)
 
-            # Software nodes - ultra memory-efficient approach
-            # Load top 50 software globally by host count (simplest, most memory-efficient)
-            # This avoids expensive COLLECT operations on large datasets
-            software_result = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WITH s, COUNT(DISTINCT h) AS host_count
-                ORDER BY host_count DESC
-                LIMIT 50
-                RETURN s.name AS name, s.last_version AS last_version,
-                       s.category AS category,
-                       s.wikidata_description AS description,
-                       host_count
-            """)
+            # Software nodes — top 50 by host_count WITHIN the filtered scope.
+            # The host_count we report is the in-scope count, not the global
+            # count, so the badge ("on N hosts") matches what the operator
+            # actually sees in the graph.
+            software_query = (
+                "MATCH (s:Software)-[:INSTALLED_ON]->(h:Host) "
+                "WHERE 1=1" + flt_fragment +
+                " WITH s, COUNT(DISTINCT h) AS host_count "
+                "ORDER BY host_count DESC "
+                "LIMIT 50 "
+                "RETURN s.name AS name, s.last_version AS last_version, "
+                "        s.category AS category, "
+                "        s.wikidata_description AS description, "
+                "        host_count"
+            )
+            software_result = session.run(software_query, **flt_params)
             for record in software_result:
                 node_id = f"software_{record['name']}"
                 node_obj = {
@@ -2075,7 +2300,7 @@ def get_shadow_it():
     """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
-    
+
     team_filter = request.args.get('team', 'all')
     platform_filter = request.args.get('platform', 'all').lower()
     risk_filter = request.args.get('risk', 'all').lower()
@@ -2083,6 +2308,14 @@ def get_shadow_it():
     host_count_filter = request.args.get('host_count', 'all')  # New filter
     user_count_filter = request.args.get('user_count', 'all')  # New filter
     software_type_filter = request.args.get('software_type', 'all')  # New filter
+
+    # Label scoping (plan 1E): bolted on additively. label_flt_fragment
+    # is appended to each detection query's WHERE chain alongside team_clause
+    # and platform_clause; label_flt_params merge into filter_params.
+    try:
+        label_flt_fragment, label_flt_params = apply_label_filter(request.args)
+    except FilterValidationError as exc:
+        return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
     
     # Software type detection patterns
     def detect_software_type(software_name):
@@ -2168,12 +2401,45 @@ def get_shadow_it():
     
     
     with driver.session() as session:
-        # Get total host count for percentage thresholds
-        total_hosts_res = session.run("MATCH (h:Host) RETURN count(h) AS count")
-        total_hosts_count = total_hosts_res.single()['count'] or 1
-        
-        # Outlier threshold: software installed on <=5% of fleet (min 2 hosts).
-        OUTLIER_THRESHOLD = max(2, int(total_hosts_count * 0.05))
+        # Per-platform outlier thresholds. SHADOW_IT_OUTLIER_PCT (env, default
+        # 3%) controls the percentage. Per-platform avoids the global-threshold
+        # bug where a software on 1 of 10 Linux servers and a software on 1 of
+        # 100 Windows hosts would both count the same toward outlier scoring,
+        # even though the first is a much stronger signal.
+        outlier_pct = _get_outlier_pct()
+        platform_thresholds = _compute_per_platform_thresholds(session, outlier_pct)
+
+        # The detection queries below operate on a single composite scope
+        # (team_clause + platform_clause + label_clause). Use the MOST
+        # restrictive matching threshold across the platforms in scope:
+        #   - platform_filter set: use that platform's threshold
+        #   - platform_filter='all': use max threshold across platforms (so
+        #     software has to be rare on every platform it appears on, not
+        #     just one)
+        # Falls back to a global-style computation if the platform map is
+        # empty (no hosts ingested yet).
+        if platform_thresholds:
+            if platform_filter and platform_filter != 'all':
+                # Best-effort lookup; Fleet platforms are stored as strings
+                # like "darwin", "windows", "ubuntu", "rhel". Match
+                # case-insensitively with substring rules to mirror the
+                # frontend's behavior.
+                pf_lower = platform_filter.lower()
+                matched = [
+                    t for p, t in platform_thresholds.items()
+                    if p and pf_lower in p.lower()
+                ]
+                OUTLIER_THRESHOLD = (
+                    max(matched) if matched else max(platform_thresholds.values())
+                )
+            else:
+                OUTLIER_THRESHOLD = max(platform_thresholds.values())
+        else:
+            total_hosts_count = (
+                session.run("MATCH (h:Host) RETURN count(h) AS count")
+                .single()['count'] or 1
+            )
+            OUTLIER_THRESHOLD = max(_MIN_OUTLIER_HOSTS, int(total_hosts_count * outlier_pct))
 
         detections = []
         detection_id_counter = 1
@@ -2185,25 +2451,31 @@ def get_shadow_it():
         team_clause = ""
         platform_clause = ""
         whitelist_clause = ""
+        # label_clause is the apply_label_filter fragment renamed for visual
+        # parity with the other inline clauses. Always begins with " AND " or
+        # is empty; injects into the same `WHERE 1=1 {team_clause} ...` chain.
+        label_clause = label_flt_fragment
         filter_params = {}
-        
+
         if team_filter != 'all':
             team_clause = "AND toString(h.team_id) = $team_id"
             filter_params['team_id'] = team_filter
-        
+
         if platform_filter != 'all':
             platform_clause = "AND toLower(h.platform) CONTAINS toLower($platform)"
             filter_params['platform'] = platform_filter
-            
+
         if whitelist:
             whitelist_clause = "AND NOT s.name IN $whitelist"
             filter_params['whitelist'] = whitelist
+
+        filter_params.update(label_flt_params)
         
         # ===== DETECTION 1: Outlier Software (installed on very few hosts) =====
         if detection_type_filter in ['all', 'outlier']:
             outlier_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
+                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause} {label_clause}
                 WITH s.name AS software_name, s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
@@ -2289,7 +2561,7 @@ def get_shadow_it():
             # Get all software
             all_software_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause}
+                WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause} {label_clause}
                 WITH s.name AS software_name, s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
@@ -2405,7 +2677,7 @@ def get_shadow_it():
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE s.last_version IS NOT NULL
                   AND s.last_version <> ''
-                  {team_clause} {platform_clause} {whitelist_clause}
+                  {team_clause} {platform_clause} {whitelist_clause} {label_clause}
                 WITH s.name AS software_name,
                      s.category AS db_category,
                      s.sources AS db_sources,

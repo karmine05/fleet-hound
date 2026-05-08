@@ -1,8 +1,85 @@
+import base64
+import gzip
+import hashlib
+import json
 import os
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from neo4j import GraphDatabase
-from neo4j.exceptions import TransientError
+from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
+
+
+@dataclass
+class LabelSyncStats:
+    """Per-cycle label sync telemetry. Surfaced via ETLResult.
+
+    `labels_unchanged` is the hash-skip count — these labels had a member-list
+    hash match against the prior sync and emitted zero edge writes. `labels_resynced`
+    is the dirty-path count — DETACH+re-MERGE happened. `labels_reaped` is the
+    age-based orphan reap count from the end of the cycle.
+    """
+    labels_seen: int = 0
+    labels_unchanged: int = 0
+    labels_resynced: int = 0
+    labels_reaped: int = 0
+    edges_created: int = 0
+    edges_deleted: int = 0
+    errors: list = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "labels_seen": self.labels_seen,
+            "labels_unchanged": self.labels_unchanged,
+            "labels_resynced": self.labels_resynced,
+            "labels_reaped": self.labels_reaped,
+            "edges_created": self.edges_created,
+            "edges_deleted": self.edges_deleted,
+            "errors": list(self.errors),
+        }
+
+
+def compute_label_member_hash(fleet_host_ids) -> str:
+    """sha256 of the canonical sorted host_id list.
+
+    Hash on Fleet's stable numeric host id (NOT hostname). Hostnames are
+    mutable in osquery; renames would otherwise churn the membership hash on
+    every rename even when the actual host set is unchanged.
+    """
+    sorted_ids = sorted(int(h) for h in fleet_host_ids if h is not None)
+    canonical = json.dumps(sorted_ids, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def encode_label_member_blob(fleet_host_ids) -> str:
+    """Compact serialization of the member set for the per-host delta path.
+
+    Stored on `Label.last_members_compressed`. Gzip-then-base64 so a 10k-host
+    label's membership list lands at ~6KB instead of ~60KB raw JSON. Memgraph
+    string properties handle this cleanly.
+    """
+    sorted_ids = sorted(int(h) for h in fleet_host_ids if h is not None)
+    raw = json.dumps(sorted_ids, separators=(",", ":")).encode("utf-8")
+    gz = gzip.compress(raw, compresslevel=6)
+    return base64.b64encode(gz).decode("ascii")
+
+
+def decode_label_member_blob(blob):
+    """Inverse of encode_label_member_blob. Returns set[int] or None.
+
+    Returns None on any decode failure (treats it as 'prior membership
+    unknown') so callers fall back to the full-rewrite path safely.
+    """
+    if not blob:
+        return None
+    try:
+        gz = base64.b64decode(blob)
+        raw = gzip.decompress(gz)
+        ids = json.loads(raw.decode("utf-8"))
+        return set(int(x) for x in ids if x is not None)
+    except Exception:
+        return None
 
 
 def _memgraph_auth():
@@ -47,19 +124,35 @@ class MemgraphIngestion:
         return False
 
     def create_constraints(self):
-        """Create unique constraints on graph nodes."""
+        """Create unique constraints + indexes on graph nodes.
+
+        Label nodes MERGE on fleet_id (stable across renames in Fleet). The
+        fleet_id constraint is required for MERGE correctness; the name index
+        accelerates `?labels=foo` URL→node resolution. Host.fleet_host_id is
+        non-unique-but-indexed because legacy hosts pre-upgrade may have NULL
+        until backfilled, and MATCH on it must stay fast.
+        """
         with self.driver.session() as session:
-            # Try to create constraints, ignore if they already exist
             constraints = [
                 "CREATE CONSTRAINT ON (u:User) ASSERT u.username IS UNIQUE;",
                 "CREATE CONSTRAINT ON (h:Host) ASSERT h.hostname IS UNIQUE;",
-                "CREATE CONSTRAINT ON (s:Software) ASSERT s.name IS UNIQUE;"
+                "CREATE CONSTRAINT ON (s:Software) ASSERT s.name IS UNIQUE;",
+                "CREATE CONSTRAINT ON (l:Label) ASSERT l.fleet_id IS UNIQUE;",
             ]
             for constraint in constraints:
                 try:
                     session.run(constraint)
                 except Exception:
-                    # Constraint already exists, ignore
+                    pass
+
+            indexes = [
+                "CREATE INDEX ON :Label(name);",
+                "CREATE INDEX ON :Host(fleet_host_id);",
+            ]
+            for idx in indexes:
+                try:
+                    session.run(idx)
+                except Exception:
                     pass
 
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
@@ -122,8 +215,14 @@ class MemgraphIngestion:
                     continue
 
                 # Host Data
+                # fleet_host_id is the stable numeric host identifier from
+                # Fleet. We persist it on the Host node so label-membership
+                # hashes (computed on fleet_host_id, NOT hostname) can MATCH
+                # back to the right Host without depending on the mutable
+                # hostname field.
                 host_batch.append({
                     'hostname': hostname,
+                    'fleet_host_id': host.get('id'),
                     'os_version': host.get('os_version'),
                     'platform': host.get('platform'),
                     'ip': host.get('primary_ip'),
@@ -216,7 +315,20 @@ class MemgraphIngestion:
             print(f"Ingestion stats: Hosts={counts['hosts']} Users={counts['users']} Software={counts['software']} USES={counts['usesRels']} INSTALLED_ON={counts['installedRels']}")
 
     def _execute_with_retry(self, session, query, params, operation_name="operation"):
-        """Execute a query with retry logic for transient errors."""
+        """Execute a query with retry logic for transient errors.
+
+        Three error classes:
+          - TransientError → retry with backoff (Memgraph signaled retry).
+          - ServiceUnavailable / AuthError → propagate immediately. These are
+            connection-level failures (Memgraph down, wrong creds). Swallowing
+            them as warnings caused the May 2026 silent-watermark-advance bug
+            where ETL "succeeded" with zero ingest writes and bumped the
+            differential watermark, so the next cycle missed every host that
+            wasn't recently changed.
+          - Other Exception → warn + return False (legacy behavior for
+            unexpected per-query failures that don't indicate a system-wide
+            outage).
+        """
         for attempt in range(self.max_retries):
             try:
                 session.run(query, **params)
@@ -228,6 +340,13 @@ class MemgraphIngestion:
                 else:
                     print(f"   ⚠️  Warning: Failed to {operation_name} after {self.max_retries} attempts")
                     return False
+            except (ServiceUnavailable, AuthError):
+                # Connection-level failure. Re-raise so the ETL cycle aborts
+                # without advancing the differential watermark in
+                # `.state.json`. Caller (etl.run_etl) catches this in its
+                # outer try/except and skips state.save() — guaranteeing the
+                # next run will re-fetch everything from the prior watermark.
+                raise
             except Exception as e:
                 print(f"   ⚠️  Warning: Failed to {operation_name}: {e}")
                 return False
@@ -253,7 +372,8 @@ class MemgraphIngestion:
         query = """
             UNWIND $hosts AS host
             MERGE (h:Host {hostname: host.hostname})
-            SET h.os_version = host.os_version,
+            SET h.fleet_host_id = host.fleet_host_id,
+                h.os_version = host.os_version,
                 h.platform = host.platform,
                 h.ip = host.ip,
                 h.last_seen = host.last_seen,
@@ -422,3 +542,318 @@ class MemgraphIngestion:
             MERGE (s)-[:INSTALLED_ON]->(h)
         """
         self._execute_with_retry(session, query_rels, {'batches': software_grouped_batch}, "create grouped software rels")
+
+    # ------------------------------------------------------------------
+    # Label sync (added in v1.27 — see plan section 1A/1B/1D/4A)
+    # ------------------------------------------------------------------
+    #
+    # Per-cycle data flow:
+    #
+    #   labels (list of dicts from /labels)
+    #         │
+    #         ▼
+    #   _batch_merge_labels()  ── MERGE on fleet_id, SET name/description/etc.
+    #         │
+    #         ▼
+    #   for each label:
+    #       new_hash = sha256(sorted fleet_host_ids of current Fleet members)
+    #       if new_hash == Label.last_member_hash:
+    #           SET last_synced_iso ; status="ok"   ── HASH SKIP (zero edges)
+    #       else:
+    #           DETACH DELETE existing HAS_LABEL from this label
+    #           MERGE HAS_LABEL for current member set
+    #           SET last_member_hash = new_hash, last_synced_iso, status="ok"
+    #         │
+    #         ▼
+    #   _reap_stale_labels()  ── 7-day age-based DETACH DELETE for labels
+    #                           NOT in this cycle's payload (T2: option C)
+    #
+    # The hash key is fleet_host_id (stable), NOT hostname (mutable).
+    # Recovery: graph wipe → no Label nodes → first cycle re-MERGEs everything
+    # because every hash is missing → all labels treated as dirty. Self-healing.
+    # ------------------------------------------------------------------
+
+    def sync_labels_with_membership(self, labels, member_map, now_iso,
+                                    reap_age_seconds: int = 604800):
+        """Top-level label sync entry. Called by etl.run_etl after host ingest.
+
+        Args:
+            labels: list of label dicts from FleetGraphExtractor.extract_labels()
+            member_map: {fleet_label_id: [fleet_host_id, ...]} from
+                FleetGraphExtractor.extract_label_host_membership() per label
+            now_iso: ISO 8601 UTC timestamp for last_synced_iso writes
+            reap_age_seconds: orphan reap threshold; default 7 days per
+                plan T2 (option C, age-based)
+
+        Returns: LabelSyncStats summarizing the cycle.
+        """
+        stats = LabelSyncStats()
+        if not labels:
+            # Empty payload: don't touch the graph beyond age-based reaping.
+            # Pure age-based reaping is robust to single-cycle empty responses
+            # because labels synced within the last 7 days survive.
+            with self.driver.session() as session:
+                stats.labels_reaped = self._reap_stale_labels(
+                    session, present_fleet_ids=[], now_iso=now_iso,
+                    reap_age_seconds=reap_age_seconds,
+                )
+            return stats
+
+        with self.driver.session() as session:
+            self._batch_merge_labels(session, labels, now_iso)
+
+            for lbl in labels:
+                fleet_id = lbl.get('id')
+                if fleet_id is None:
+                    stats.errors.append(f"label without id: {lbl.get('name')!r}")
+                    continue
+                stats.labels_seen += 1
+                member_ids = member_map.get(fleet_id, [])
+                changed, edges_added, edges_removed = self._sync_single_label_membership(
+                    session, fleet_id, member_ids, now_iso,
+                )
+                if changed:
+                    stats.labels_resynced += 1
+                    stats.edges_created += edges_added
+                    stats.edges_deleted += edges_removed
+                else:
+                    stats.labels_unchanged += 1
+
+            present_ids = [
+                lbl['id'] for lbl in labels if lbl.get('id') is not None
+            ]
+            stats.labels_reaped = self._reap_stale_labels(
+                session, present_fleet_ids=present_ids, now_iso=now_iso,
+                reap_age_seconds=reap_age_seconds,
+            )
+        return stats
+
+    def _batch_merge_labels(self, session, labels, now_iso):
+        """MERGE Label nodes on fleet_id; refresh metadata + last_synced_iso.
+
+        Membership hash is NOT touched here — that's done in
+        _sync_single_label_membership which compares old vs new and decides
+        whether to re-MERGE edges. This call only handles Label entity props.
+        """
+        if not labels:
+            return
+        rows = []
+        for lbl in labels:
+            fleet_id = lbl.get('id')
+            if fleet_id is None:
+                continue
+            rows.append({
+                'fleet_id': fleet_id,
+                'name': lbl.get('name'),
+                'description': lbl.get('description') or '',
+                'label_type': (lbl.get('label_type') or 'regular').lower(),
+                'membership_type': (lbl.get('label_membership_type') or '').lower(),
+                'query': lbl.get('query') or '',
+                'host_count': lbl.get('host_count') or 0,
+                'now_iso': now_iso,
+            })
+        query = """
+            UNWIND $rows AS row
+            MERGE (l:Label {fleet_id: row.fleet_id})
+            SET l.name = row.name,
+                l.description = row.description,
+                l.label_type = row.label_type,
+                l.membership_type = row.membership_type,
+                l.query = row.query,
+                l.host_count = row.host_count,
+                l.last_synced_iso = row.now_iso,
+                l.last_label_sync_status = 'ok',
+                l.consecutive_failures = 0
+        """
+        self._execute_with_retry(session, query, {'rows': rows}, "merge label nodes")
+
+    def _sync_single_label_membership(self, session, fleet_id, member_ids, now_iso):
+        """Hash-skip + per-host symmetric diff (TODO-1, formerly hybrid C+B).
+
+        Three paths:
+          1. Hash match → zero edge writes (skip entirely).
+          2. Hash mismatch + prior member blob present → per-host delta.
+             Decode prior set; new set = current Fleet members; emit
+             DELETEs for `prior - new` and MERGEs for `new - prior`.
+             Edge churn is O(actual delta), not O(label size).
+          3. Hash mismatch + no prior blob → full rewrite (legacy path).
+             Hits on first sync after upgrade or after `Label.last_members_
+             compressed` is missing for any reason. Self-healing: next
+             cycle has the blob and the delta path takes over.
+
+        Returns (changed, edges_added, edges_removed).
+        """
+        new_hash = compute_label_member_hash(member_ids)
+
+        prior = session.run(
+            "MATCH (l:Label {fleet_id: $fid}) "
+            "RETURN l.last_member_hash AS h, l.last_members_compressed AS blob",
+            fid=fleet_id,
+        ).single()
+        prior_hash = prior["h"] if prior else None
+        prior_blob = prior["blob"] if prior else None
+
+        if prior_hash == new_hash:
+            # Hash match → zero edge writes. last_synced_iso already updated
+            # in _batch_merge_labels for ALL labels in this cycle.
+            return (False, 0, 0)
+
+        new_set = set(int(h) for h in member_ids if h is not None)
+        new_blob = encode_label_member_blob(new_set)
+        prior_set = decode_label_member_blob(prior_blob)
+
+        if prior_set is None:
+            # No prior blob (first cycle after upgrade, or decode failed).
+            # Fall back to the legacy full-rewrite path so the graph
+            # converges to the correct state. Next cycle will have the blob
+            # and the delta path takes over.
+            edges_added, edges_removed = self._full_rewrite_label_membership(
+                session, fleet_id, new_set,
+            )
+        else:
+            edges_added, edges_removed = self._delta_apply_label_membership(
+                session, fleet_id, prior_set, new_set,
+            )
+
+        # Persist the new hash + new blob atomically with the same SET.
+        session.run(
+            "MATCH (l:Label {fleet_id: $fid}) "
+            "SET l.last_member_hash = $h, "
+            "    l.last_members_compressed = $blob, "
+            "    l.last_synced_iso = $now",
+            fid=fleet_id, h=new_hash, blob=new_blob, now=now_iso,
+        )
+
+        return (True, edges_added, edges_removed)
+
+    def _delta_apply_label_membership(self, session, fleet_id, prior_set, new_set):
+        """Per-host symmetric diff. Emits only the delta edges.
+
+        Returns (edges_added, edges_removed).
+        """
+        added = sorted(new_set - prior_set)
+        removed = sorted(prior_set - new_set)
+
+        if removed:
+            self._execute_with_retry(
+                session,
+                """
+                UNWIND $hids AS hid
+                MATCH (h:Host {fleet_host_id: hid})-[r:HAS_LABEL]->(l:Label {fleet_id: $fid})
+                DELETE r
+                """,
+                {"hids": removed, "fid": fleet_id},
+                "delete HAS_LABEL edges (delta)",
+            )
+
+        if added:
+            self._execute_with_retry(
+                session,
+                """
+                UNWIND $hids AS hid
+                MATCH (h:Host {fleet_host_id: hid})
+                MATCH (l:Label {fleet_id: $fid})
+                MERGE (h)-[:HAS_LABEL]->(l)
+                """,
+                {"hids": added, "fid": fleet_id},
+                "merge HAS_LABEL edges (delta)",
+            )
+
+        return (len(added), len(removed))
+
+    def _full_rewrite_label_membership(self, session, fleet_id, new_set):
+        """Legacy full-rewrite path (DETACH all + re-MERGE current).
+
+        Used only when no prior member blob exists (first sync after upgrade
+        or decode failure). Returns (edges_added, edges_removed).
+        """
+        prior_edge_count_rec = session.run(
+            "MATCH (:Host)-[r:HAS_LABEL]->(:Label {fleet_id: $fid}) "
+            "RETURN count(r) AS c",
+            fid=fleet_id,
+        ).single()
+        prior_edges = prior_edge_count_rec["c"] if prior_edge_count_rec else 0
+
+        session.run(
+            "MATCH (:Host)-[r:HAS_LABEL]->(:Label {fleet_id: $fid}) DELETE r",
+            fid=fleet_id,
+        )
+
+        if new_set:
+            sorted_ids = sorted(new_set)
+            self._execute_with_retry(
+                session,
+                """
+                UNWIND $hids AS hid
+                MATCH (h:Host {fleet_host_id: hid})
+                MATCH (l:Label {fleet_id: $fid})
+                MERGE (h)-[:HAS_LABEL]->(l)
+                """,
+                {"hids": sorted_ids, "fid": fleet_id},
+                "re-merge HAS_LABEL edges (full rewrite fallback)",
+            )
+            edges_added = len(sorted_ids)
+        else:
+            edges_added = 0
+
+        return (edges_added, prior_edges)
+
+    def _reap_stale_labels(self, session, present_fleet_ids, now_iso,
+                           reap_age_seconds: int = 604800):
+        """Age-based DETACH DELETE for orphan Label nodes (plan T2 option C).
+
+        A label is reaped when:
+          - its fleet_id is NOT in `present_fleet_ids` (Fleet no longer
+            returns it from /labels), AND
+          - its `last_synced_iso` is older than `reap_age_seconds` ago.
+
+        Pure age-based: tolerates transient empty-response cycles because a
+        label synced in the last 7 days survives even if a single cycle
+        returns it stale. The `present_fleet_ids` arg is empty-list-safe.
+        """
+        try:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt - timedelta(seconds=reap_age_seconds)).isoformat()
+        present = list(present_fleet_ids)
+
+        # Memgraph does not support Cypher 5's `count {(pattern)}` subquery
+        # syntax. Split the count + delete into two queries within the same
+        # session so the reap stat is accurate without the subquery.
+        count_rec = session.run(
+            "MATCH (l:Label) "
+            "WHERE NOT l.fleet_id IN $present "
+            "  AND l.last_synced_iso < $cutoff "
+            "RETURN count(l) AS reaped",
+            present=present, cutoff=cutoff,
+        ).single()
+        reaped = count_rec["reaped"] if count_rec else 0
+
+        if reaped > 0:
+            session.run(
+                "MATCH (l:Label) "
+                "WHERE NOT l.fleet_id IN $present "
+                "  AND l.last_synced_iso < $cutoff "
+                "DETACH DELETE l",
+                present=present, cutoff=cutoff,
+            )
+        return reaped
+
+    def mark_label_sync_failure(self, error_msg: str):
+        """Record a global label-sync failure on every Label node.
+
+        Called by etl.run_etl when /labels itself fails (no per-label data
+        even available). Bumps consecutive_failures and flips status to
+        `failed` so /api/labels surfaces freshness drift in the UI.
+        Existing HAS_LABEL edges are NOT touched — last-known-good state
+        is preserved per plan section 2B.
+        """
+        with self.driver.session() as session:
+            session.run(
+                "MATCH (l:Label) "
+                "SET l.last_label_sync_status = 'failed', "
+                "    l.consecutive_failures = coalesce(l.consecutive_failures, 0) + 1, "
+                "    l.last_label_sync_error = $err",
+                err=error_msg[:500],
+            )

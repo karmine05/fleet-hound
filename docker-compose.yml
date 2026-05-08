@@ -64,6 +64,9 @@ services:
       - ENRICHER_ENABLED
       - ENRICHER_INTERVAL_SEC
       - ENRICHER_BATCH_SIZE
+      # Shadow IT outlier threshold (fraction of platform hosts; default 0.03).
+      # Drives /api/shadow-it detection AND enrichment-candidate selection.
+      - SHADOW_IT_OUTLIER_PCT
       # OODA supervisor — autonomous Observe→Orient→Decide→Act cycles.
       # Requires FLEET_URL + FLEET_API_TOKEN (or FLEET_EMAIL/FLEET_PASSWORD).
       - OODA_ENABLED

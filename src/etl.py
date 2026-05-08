@@ -12,6 +12,9 @@ belong in the CLI shim. Output is logging + return value.
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
 import logging
 import os
@@ -30,6 +33,52 @@ from src.ingestion import MemgraphIngestion, _memgraph_auth as _mg_auth
 from src.snapshot import write_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_LOCK_PATH = ".etl.lock"
+
+
+@contextlib.contextmanager
+def _etl_file_lock(lock_path: str):
+    """Process-level non-blocking advisory lock for the ETL cycle.
+
+    Mirrors the flock pattern used in webviz/enrich_worker.py for the
+    enrichment leader election. If a second ETL process tries to acquire
+    while one holds it, the second exits cleanly via OSError → context
+    manager raises so the caller can log + skip without partial state.
+
+    Why a process lock:
+      Plan section R5 (outside voice) — without this, two overlapping ETL
+      runs could both DETACH HAS_LABEL for the same label, then both
+      re-MERGE, producing relationship duplication or partial sets between
+      the two write phases. The lock guarantees one cycle at a time.
+    """
+    parent = Path(lock_path).parent
+    if str(parent):
+        parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise EtlAlreadyRunning(
+                    f"another ETL is in progress (lock held: {lock_path})"
+                ) from e
+            raise
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+class EtlAlreadyRunning(RuntimeError):
+    """Raised when ETL file lock is already held by another process."""
 
 
 @dataclass
@@ -57,6 +106,10 @@ class ETLConfig:
     enrich_target_names: Optional[list[str]] = None
     skip_enrichment: bool = False
     skip_snapshot: bool = False
+    skip_labels: bool = False
+    skip_all_label_builtins: bool = False  # legacy posture; default keeps functional builtins
+    label_reap_age_seconds: int = 7 * 24 * 60 * 60  # T2: 7-day age-based reap
+    lock_path: Optional[str] = None  # None → derive from state_path parent
 
 
 @dataclass
@@ -73,6 +126,12 @@ class ETLResult:
     enrichment_error: Optional[str] = None
     snapshot_error: Optional[str] = None
     error: Optional[str] = None
+    # Label sync (added v1.27 — see plan 1B/2B)
+    label_sync_attempted: bool = False
+    label_sync_error: Optional[str] = None
+    last_label_sync_iso: Optional[str] = None
+    label_sync_stats: Optional[dict] = None
+    skipped_due_to_lock: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -88,6 +147,11 @@ class ETLResult:
             "enrichment_error": self.enrichment_error,
             "snapshot_error": self.snapshot_error,
             "error": self.error,
+            "label_sync_attempted": self.label_sync_attempted,
+            "label_sync_error": self.label_sync_error,
+            "last_label_sync_iso": self.last_label_sync_iso,
+            "label_sync_stats": self.label_sync_stats,
+            "skipped_due_to_lock": self.skipped_due_to_lock,
         }
 
 
@@ -165,7 +229,14 @@ def _resolve_token(cfg: ETLConfig) -> Optional[str]:
 
 
 def run_etl(cfg: ETLConfig) -> ETLResult:
-    """Single Observe→Orient cycle. Never raises; encodes errors in the result."""
+    """Single Observe→Orient cycle. Never raises; encodes errors in the result.
+
+    Wraps the cycle in a file lock (see _etl_file_lock) to prevent two
+    overlapping ETL processes from racing on label-sync DETACH+re-MERGE
+    (plan section R5). If the lock is already held, returns immediately
+    with skipped_due_to_lock=True so the caller (CLI / OODA supervisor)
+    can log + continue without partial state.
+    """
     started = _now_iso()
     t0 = datetime.now(timezone.utc).timestamp()
     result = ETLResult(started_iso=started, finished_iso=started, duration_sec=0.0,
@@ -186,6 +257,28 @@ def run_etl(cfg: ETLConfig) -> ETLResult:
         result.finished_iso = _now_iso()
         result.duration_sec = datetime.now(timezone.utc).timestamp() - t0
         return result
+
+    # Resolve lock path: explicit cfg.lock_path > sibling of state file > cwd default.
+    if cfg.lock_path:
+        lock_path = cfg.lock_path
+    else:
+        state_p = Path(cfg.state_path)
+        lock_path = str(state_p.parent / _DEFAULT_LOCK_PATH) if str(state_p.parent) else _DEFAULT_LOCK_PATH
+
+    try:
+        with _etl_file_lock(lock_path):
+            return _run_etl_locked(cfg, token, result, t0)
+    except EtlAlreadyRunning as e:
+        logger.warning("etl: %s — skipping this cycle", e)
+        result.skipped_due_to_lock = True
+        result.error = str(e)
+        result.finished_iso = _now_iso()
+        result.duration_sec = datetime.now(timezone.utc).timestamp() - t0
+        return result
+
+
+def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) -> ETLResult:
+    """Body of run_etl, executed under the file lock."""
 
     state = load_state(cfg.state_path)
     since_map = state.get("team_syncs", {}) if isinstance(state, dict) else {}
@@ -213,6 +306,59 @@ def run_etl(cfg: ETLConfig) -> ETLResult:
         with MemgraphIngestion(cfg.memgraph_uri) as ingestion:
             ingestion.create_constraints()
             ingestion.create_graph_relationships(hosts, extractor, global_users=users)
+
+            # Label sync stage. Best-effort: matches enrichment/snapshot
+            # posture per plan section 2B. /labels failures don't break the
+            # cycle; existing edges + last-known-good state are preserved
+            # and surfaced via the freshness signal.
+            if not cfg.skip_labels:
+                result.label_sync_attempted = True
+                try:
+                    labels = extractor.extract_labels(
+                        skip_all_builtins=cfg.skip_all_label_builtins,
+                    )
+                    if not labels:
+                        # Empty payload: could be transient API failure or
+                        # genuinely zero user-defined labels. Either way the
+                        # ingestion's empty-payload branch handles it (only
+                        # runs age-based reaping; never wipes existing edges).
+                        logger.info("etl: /labels returned no labels (empty or filtered)")
+
+                    member_map = {}
+                    for lbl in labels:
+                        lid = lbl.get("id")
+                        if lid is None:
+                            continue
+                        members = extractor.extract_label_host_membership(lid)
+                        member_map[lid] = [
+                            m.get("id") for m in members if m.get("id") is not None
+                        ]
+
+                    label_sync_iso = _now_iso()
+                    stats = ingestion.sync_labels_with_membership(
+                        labels, member_map, label_sync_iso,
+                        reap_age_seconds=cfg.label_reap_age_seconds,
+                    )
+                    result.last_label_sync_iso = label_sync_iso
+                    result.label_sync_stats = stats.as_dict()
+                    logger.info(
+                        "etl: label sync ok — seen=%d unchanged=%d resynced=%d "
+                        "reaped=%d edges_added=%d edges_deleted=%d",
+                        stats.labels_seen, stats.labels_unchanged,
+                        stats.labels_resynced, stats.labels_reaped,
+                        stats.edges_created, stats.edges_deleted,
+                    )
+                except Exception as exc:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    logger.warning("etl: label sync failed: %s", msg)
+                    result.label_sync_error = msg
+                    try:
+                        ingestion.mark_label_sync_failure(msg)
+                    except Exception as inner:
+                        logger.warning(
+                            "etl: failed to mark label-sync failure on existing "
+                            "Label nodes: %s", inner,
+                        )
 
         # Orient: enrichment kick. Best-effort — never breaks a cycle.
         if not cfg.skip_enrichment:
