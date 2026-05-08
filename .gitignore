@@ -87,3 +87,9 @@ docs/*
 pytest.ini
 claude-flow.config.json
 DESIGN.md
+
+# AI Assist
+claude*
+.claude*
+.mcp*
+.swarm*
