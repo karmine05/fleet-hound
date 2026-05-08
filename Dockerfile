@@ -20,6 +20,14 @@ RUN mkdir -p /app/config /app/config/snapshots \
 
 USER webviz
 
+# Fail-closed default for prod image: refuse to start unless WEBVIZ_API_TOKEN
+# is supplied (via env or *_FILE secret mount). Operators running this image
+# must explicitly opt out by setting WEBVIZ_REQUIRE_AUTH=false in their
+# compose/k8s spec — there is no silent-anonymous-read path in a production
+# container. Dev (`python webviz/app.py` outside Docker) keeps the permissive
+# default from the code path.
+ENV WEBVIZ_REQUIRE_AUTH=true
+
 EXPOSE 8080
 
 # Health check — uses lightweight /api/health (database ping), not /api/graph (heavy query).

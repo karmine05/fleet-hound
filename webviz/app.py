@@ -188,6 +188,21 @@ OODA_STATE_PATH = os.environ.get("OODA_STATE_PATH", "/app/config/.state.json")
 OODA_SNAPSHOT_DIR = os.environ.get("OODA_SNAPSHOT_DIR", SNAPSHOT_DIR)
 OODA_MANUAL_TRIGGER_COOLDOWN = 60.0
 
+# Loud refusal-to-stay-silent when the long-running OODA supervisor is wired up
+# to talk to Fleet with TLS verification disabled. INSECURE is a legitimate
+# self-signed-cert / dev escape hatch for one-shot host ETL, but inside a
+# container that polls Fleet every OODA_INTERVAL_SEC for the lifetime of the
+# process it represents a sustained MITM exposure window. Surface it at boot
+# so an operator who flipped INSECURE for a one-time debug session and forgot
+# notices in their stack logs.
+if _bool_env("INSECURE", False) and OODA_ENABLED:
+    logger.warning(
+        "INSECURE=true with OODA_ENABLED=true: the supervisor will talk to "
+        "FLEET_URL with TLS verification DISABLED on every cycle. This is a "
+        "sustained MITM-exposure posture, not a one-shot dev override. Unset "
+        "INSECURE in production and front Fleet with a valid TLS cert."
+    )
+
 # ---------------------------------------------------------------------------
 # Shadow IT classification helpers
 #

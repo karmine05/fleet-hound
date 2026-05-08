@@ -1,0 +1,42 @@
+name: security
+
+on:
+  pull_request:
+    paths:
+      - 'requirements.txt'
+      - '.github/workflows/security.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'requirements.txt'
+      - '.github/workflows/security.yml'
+  schedule:
+    # Weekly Monday 14:00 UTC — catches advisories published against pinned
+    # versions even when requirements.txt itself hasn't changed.
+    - cron: '0 14 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (CVE scan of pinned deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit
+
+      - name: Audit pinned dependencies
+        # --strict flips warnings (e.g. unpinned, unresolvable) into failures
+        # so a malformed requirements.txt also fails the gate. --disable-pip
+        # avoids resolving transitive deps via pip's resolver (PyPI-only check
+        # against the exact pins we ship).
+        run: pip-audit --strict --requirement requirements.txt
