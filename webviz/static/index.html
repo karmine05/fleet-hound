@@ -774,6 +774,97 @@
             font-style: italic;
             font-size: 12px;
         }
+        .changes-filter {
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            background: var(--bg-primary, var(--accent-muted));
+            border: 1px solid var(--border, rgba(127,127,127,0.2));
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .changes-filter-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .changes-filter-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-tertiary);
+            min-width: 56px;
+        }
+        .changes-search-input {
+            flex: 1 1 240px;
+            min-width: 200px;
+            padding: 8px 10px;
+            border: 1px solid var(--border, rgba(127,127,127,0.25));
+            border-radius: 6px;
+            background: var(--bg-secondary, transparent);
+            color: var(--text-primary, inherit);
+            font-size: 13px;
+        }
+        .changes-search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(99,102,241,0.18);
+        }
+        .changes-chip-group {
+            display: inline-flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .changes-chip {
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border, rgba(127,127,127,0.3));
+            background: transparent;
+            color: var(--text-tertiary);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+        }
+        .changes-chip:hover {
+            border-color: var(--accent);
+            color: var(--text-primary, inherit);
+        }
+        .changes-chip.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+        .changes-filter-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-secondary, var(--text-tertiary));
+            cursor: pointer;
+            user-select: none;
+        }
+        .changes-filter-toggle input[type="checkbox"] {
+            margin: 0;
+        }
+        .changes-filter-meta {
+            border-top: 1px solid var(--border, rgba(127,127,127,0.15));
+            padding-top: 6px;
+        }
+        .changes-filter-summary {
+            font-size: 11px;
+            color: var(--text-tertiary);
+        }
+        .changes-filter-summary strong { color: var(--text-primary, inherit); font-weight: 600; }
+        .changes-filter-error { color: var(--danger, #ef4444); }
+        .changes-list .match-hit { background: rgba(245,158,11,0.18); border-radius: 3px; padding: 0 2px; }
+        .btn.btn-sm { padding: 6px 10px; font-size: 12px; }
 
         [data-theme="light"] .link {
             stroke-opacity: 0.35;
@@ -2422,7 +2513,52 @@
                 </p>
             </aside>
             <section class="changes-main" id="changes-main">
-                <div class="changes-empty">Pick two snapshots and run diff.</div>
+                <div id="changes-filter-bar" class="changes-filter" hidden>
+                    <div class="changes-filter-row">
+                        <input type="search" id="changes-search-input"
+                               class="changes-search-input"
+                               placeholder="Search IDs (host, user, software, edge endpoints)…"
+                               autocomplete="off" spellcheck="false">
+                        <button type="button" id="changes-search-clear" class="btn btn-ghost btn-sm" title="Clear filters">Clear</button>
+                    </div>
+                    <div class="changes-filter-row">
+                        <span class="changes-filter-label">Bucket</span>
+                        <div class="changes-chip-group" id="changes-bucket-chips">
+                            <button type="button" class="changes-chip active" data-bucket="added">Added</button>
+                            <button type="button" class="changes-chip active" data-bucket="removed">Removed</button>
+                            <button type="button" class="changes-chip active" data-bucket="changed">Property drift</button>
+                        </div>
+                    </div>
+                    <div class="changes-filter-row">
+                        <span class="changes-filter-label">Type</span>
+                        <div class="changes-chip-group" id="changes-type-chips">
+                            <button type="button" class="changes-chip active" data-type="hosts">Hosts</button>
+                            <button type="button" class="changes-chip active" data-type="users">Users</button>
+                            <button type="button" class="changes-chip active" data-type="software">Software</button>
+                            <button type="button" class="changes-chip active" data-type="edges">Edges</button>
+                        </div>
+                    </div>
+                    <div class="changes-filter-row">
+                        <label class="changes-filter-toggle">
+                            <input type="checkbox" id="changes-search-drift-values">
+                            <span>Search drift values (match old/new property values)</span>
+                        </label>
+                        <label class="changes-filter-toggle">
+                            <input type="checkbox" id="changes-case-sensitive">
+                            <span>Case sensitive</span>
+                        </label>
+                        <label class="changes-filter-toggle">
+                            <input type="checkbox" id="changes-regex-mode">
+                            <span>Regex</span>
+                        </label>
+                    </div>
+                    <div class="changes-filter-row changes-filter-meta">
+                        <span id="changes-filter-summary" class="changes-filter-summary"></span>
+                    </div>
+                </div>
+                <div id="changes-results">
+                    <div class="changes-empty">Pick two snapshots and run diff.</div>
+                </div>
             </section>
         </div>
     </div>
@@ -5261,103 +5397,351 @@
         async function runDiff() {
             const fromSel = document.getElementById('diff-from-select');
             const toSel = document.getElementById('diff-to-select');
-            const main = document.getElementById('changes-main');
-            if (!fromSel || !toSel || !main) return;
+            const results = document.getElementById('changes-results');
+            const bar = document.getElementById('changes-filter-bar');
+            if (!fromSel || !toSel || !results) return;
             const from = fromSel.value;
             const to = toSel.value;
             if (!from || !to) {
-                main.innerHTML = '<div class="changes-empty">Pick two snapshots first.</div>';
+                results.innerHTML = '<div class="changes-empty">Pick two snapshots first.</div>';
+                if (bar) bar.hidden = true;
+                _lastDiffData = null;
                 return;
             }
-            main.innerHTML = '<div class="changes-empty">Computing diff…</div>';
+            results.innerHTML = '<div class="changes-empty">Computing diff…</div>';
+            if (bar) bar.hidden = true;
+            _lastDiffData = null;
             try {
                 const r = await fetch(`/api/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
                 if (!r.ok) {
-                    main.innerHTML = `<div class="changes-empty">Diff failed (${r.status})</div>`;
+                    results.innerHTML = `<div class="changes-empty">Diff failed (${r.status})</div>`;
                     return;
                 }
                 const data = await r.json();
                 _renderDiff(data);
             } catch (e) {
                 console.error(e);
-                main.innerHTML = '<div class="changes-empty">Diff request failed</div>';
+                results.innerHTML = '<div class="changes-empty">Diff request failed</div>';
+            }
+        }
+
+        let _changesFilterDebounce = null;
+        function _wireChangesFilterUI() {
+            const input = document.getElementById('changes-search-input');
+            const clearBtn = document.getElementById('changes-search-clear');
+            const cs = document.getElementById('changes-case-sensitive');
+            const rx = document.getElementById('changes-regex-mode');
+            const sd = document.getElementById('changes-search-drift-values');
+            const bucketGroup = document.getElementById('changes-bucket-chips');
+            const typeGroup = document.getElementById('changes-type-chips');
+            if (!input || !bucketGroup || !typeGroup) return;
+
+            input.addEventListener('input', () => {
+                _changesFilter.text = input.value;
+                clearTimeout(_changesFilterDebounce);
+                _changesFilterDebounce = setTimeout(_applyChangesFilter, 120);
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    input.value = '';
+                    _changesFilter.text = '';
+                    _applyChangesFilter();
+                }
+            });
+            if (clearBtn) {
+                clearBtn.addEventListener('click', () => {
+                    _resetChangesFilter();
+                    _applyChangesFilter();
+                });
+            }
+            if (cs) cs.addEventListener('change', () => {
+                _changesFilter.caseSensitive = cs.checked;
+                _applyChangesFilter();
+            });
+            if (rx) rx.addEventListener('change', () => {
+                _changesFilter.regex = rx.checked;
+                _applyChangesFilter();
+            });
+            if (sd) sd.addEventListener('change', () => {
+                _changesFilter.searchDriftValues = sd.checked;
+                _applyChangesFilter();
+            });
+            bucketGroup.addEventListener('click', (e) => {
+                const chip = e.target.closest('.changes-chip[data-bucket]');
+                if (!chip) return;
+                const key = chip.getAttribute('data-bucket');
+                _changesFilter.buckets[key] = !_changesFilter.buckets[key];
+                chip.classList.toggle('active', _changesFilter.buckets[key]);
+                _applyChangesFilter();
+            });
+            typeGroup.addEventListener('click', (e) => {
+                const chip = e.target.closest('.changes-chip[data-type]');
+                if (!chip) return;
+                const key = chip.getAttribute('data-type');
+                _changesFilter.types[key] = !_changesFilter.types[key];
+                chip.classList.toggle('active', _changesFilter.types[key]);
+                _applyChangesFilter();
+            });
+        }
+
+        // Holds the most recent /api/diff payload so the filter UI can re-render
+        // without refetching. Reset whenever runDiff() fires a new fetch.
+        let _lastDiffData = null;
+        const _CHANGES_DEFAULT_CAP = 200;
+        const _changesFilter = {
+            text: '',
+            caseSensitive: false,
+            regex: false,
+            searchDriftValues: false,
+            buckets: { added: true, removed: true, changed: true },
+            types: { hosts: true, users: true, software: true, edges: true },
+        };
+
+        function _resetChangesFilter() {
+            _changesFilter.text = '';
+            _changesFilter.caseSensitive = false;
+            _changesFilter.regex = false;
+            _changesFilter.searchDriftValues = false;
+            _changesFilter.buckets = { added: true, removed: true, changed: true };
+            _changesFilter.types = { hosts: true, users: true, software: true, edges: true };
+            const input = document.getElementById('changes-search-input');
+            if (input) input.value = '';
+            const cs = document.getElementById('changes-case-sensitive');
+            if (cs) cs.checked = false;
+            const rx = document.getElementById('changes-regex-mode');
+            if (rx) rx.checked = false;
+            const sd = document.getElementById('changes-search-drift-values');
+            if (sd) sd.checked = false;
+            document.querySelectorAll('#changes-bucket-chips .changes-chip').forEach(c => c.classList.add('active'));
+            document.querySelectorAll('#changes-type-chips .changes-chip').forEach(c => c.classList.add('active'));
+        }
+
+        function _changesFilterIsActive() {
+            if (_changesFilter.text.trim()) return true;
+            if (!_changesFilter.buckets.added || !_changesFilter.buckets.removed || !_changesFilter.buckets.changed) return true;
+            if (!_changesFilter.types.hosts || !_changesFilter.types.users
+                || !_changesFilter.types.software || !_changesFilter.types.edges) return true;
+            return false;
+        }
+
+        function _buildChangesMatcher() {
+            const raw = _changesFilter.text.trim();
+            if (!raw) return { ok: true, match: () => true, error: null };
+            if (_changesFilter.regex) {
+                try {
+                    const re = new RegExp(raw, _changesFilter.caseSensitive ? '' : 'i');
+                    return { ok: true, match: (s) => re.test(String(s)), error: null };
+                } catch (e) {
+                    return { ok: false, match: () => false, error: e.message };
+                }
+            }
+            const needle = _changesFilter.caseSensitive ? raw : raw.toLowerCase();
+            const fn = _changesFilter.caseSensitive
+                ? (s) => String(s).includes(needle)
+                : (s) => String(s).toLowerCase().includes(needle);
+            return { ok: true, match: fn, error: null };
+        }
+
+        function _highlight(text, matcher) {
+            const raw = _changesFilter.text.trim();
+            if (!raw) return escapeHtml(text);
+            try {
+                let re;
+                if (_changesFilter.regex) {
+                    re = new RegExp(raw, _changesFilter.caseSensitive ? 'g' : 'gi');
+                } else {
+                    const esc = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    re = new RegExp(esc, _changesFilter.caseSensitive ? 'g' : 'gi');
+                }
+                const str = String(text);
+                let out = '';
+                let last = 0;
+                for (const m of str.matchAll(re)) {
+                    out += escapeHtml(str.slice(last, m.index));
+                    out += `<mark class="match-hit">${escapeHtml(m[0])}</mark>`;
+                    last = m.index + m[0].length;
+                    if (!m[0].length) break; // guard against zero-width regex
+                }
+                out += escapeHtml(str.slice(last));
+                return out;
+            } catch (_e) {
+                return escapeHtml(text);
             }
         }
 
         function _renderDiff(data) {
-            const main = document.getElementById('changes-main');
+            _lastDiffData = data || null;
+            _resetChangesFilter();
+            const bar = document.getElementById('changes-filter-bar');
+            if (bar) bar.hidden = !_lastDiffData;
+            _applyChangesFilter();
+        }
+
+        function _applyChangesFilter() {
+            const results = document.getElementById('changes-results');
+            if (!results) return;
+            if (!_lastDiffData) {
+                results.innerHTML = '<div class="changes-empty">Pick two snapshots and run diff.</div>';
+                return;
+            }
+            const matcherInfo = _buildChangesMatcher();
+            const summary = document.getElementById('changes-filter-summary');
+            const data = _lastDiffData;
+            const filterActive = _changesFilterIsActive();
+            const cap = filterActive ? Infinity : _CHANGES_DEFAULT_CAP;
+
             const sections = [
                 { key: 'added', label: 'Added', badge: 'badge-added' },
                 { key: 'removed', label: 'Removed', badge: 'badge-removed' },
             ];
             let html = '';
+            let totalShown = 0;
+            let totalMatched = 0;
+
             sections.forEach(({ key, label, badge }) => {
+                if (!_changesFilter.buckets[key]) return;
                 const bucket = data[key] || {};
-                const totalNodes = ['hosts', 'users', 'software'].reduce(
-                    (acc, k) => acc + ((bucket[k] || []).length), 0);
-                const totalEdges = (bucket.edges || []).length;
-                html += `<section class="changes-section">
-                    <header>${label}
-                        <span class="badge ${badge}">${totalNodes} nodes · ${totalEdges} edges</span>
-                    </header>`;
+                let sectionMatched = 0;
+                let sectionShown = 0;
+                let sectionTotal = 0;
+                let body = '';
+
                 ['hosts', 'users', 'software'].forEach(k => {
                     const items = bucket[k] || [];
-                    if (!items.length) return;
-                    html += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">${k} (${items.length})</div>`;
-                    html += '<ul class="changes-list">';
-                    items.slice(0, 200).forEach(id => {
-                        html += `<li>
-                            <span class="id-badge">${escapeHtml(id)}</span>
+                    sectionTotal += items.length;
+                    if (!_changesFilter.types[k]) return;
+                    const filtered = matcherInfo.ok
+                        ? items.filter(id => matcherInfo.match(id))
+                        : [];
+                    if (!filtered.length) return;
+                    sectionMatched += filtered.length;
+                    const slice = filtered.slice(0, cap);
+                    sectionShown += slice.length;
+                    body += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">${k} (${filtered.length}${filtered.length !== items.length ? ` of ${items.length}` : ''})</div>`;
+                    body += '<ul class="changes-list">';
+                    slice.forEach(id => {
+                        body += `<li>
+                            <span class="id-badge">${_highlight(id, matcherInfo)}</span>
                             <span class="view-link" data-jump-id="${escapeHtml(id)}">View on graph →</span>
                         </li>`;
                     });
-                    if (items.length > 200) {
-                        html += `<li><span class="id-badge">… ${items.length - 200} more</span></li>`;
+                    if (filtered.length > slice.length) {
+                        body += `<li><span class="id-badge">… ${filtered.length - slice.length} more</span></li>`;
                     }
-                    html += '</ul>';
+                    body += '</ul>';
                 });
-                if ((bucket.edges || []).length) {
-                    html += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">edges</div>`;
-                    html += '<ul class="changes-list">';
-                    (bucket.edges || []).slice(0, 200).forEach(e => {
-                        html += `<li><span class="id-badge">${escapeHtml(e.label)}: ${escapeHtml(e.from)} → ${escapeHtml(e.to)}</span></li>`;
-                    });
-                    html += '</ul>';
+
+                if (_changesFilter.types.edges) {
+                    const edges = bucket.edges || [];
+                    sectionTotal += edges.length;
+                    const filteredEdges = matcherInfo.ok
+                        ? edges.filter(e => matcherInfo.match(e.label) || matcherInfo.match(e.from) || matcherInfo.match(e.to))
+                        : [];
+                    if (filteredEdges.length) {
+                        sectionMatched += filteredEdges.length;
+                        const slice = filteredEdges.slice(0, cap);
+                        sectionShown += slice.length;
+                        body += `<div style="padding:8px 14px;color:var(--text-tertiary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">edges (${filteredEdges.length}${filteredEdges.length !== edges.length ? ` of ${edges.length}` : ''})</div>`;
+                        body += '<ul class="changes-list">';
+                        slice.forEach(e => {
+                            body += `<li><span class="id-badge">${_highlight(e.label, matcherInfo)}: ${_highlight(e.from, matcherInfo)} → ${_highlight(e.to, matcherInfo)}</span></li>`;
+                        });
+                        if (filteredEdges.length > slice.length) {
+                            body += `<li><span class="id-badge">… ${filteredEdges.length - slice.length} more</span></li>`;
+                        }
+                        body += '</ul>';
+                    }
                 }
-                if (totalNodes + totalEdges === 0) {
-                    html += '<div class="changes-empty">Nothing.</div>';
+
+                html += `<section class="changes-section">
+                    <header>${label}
+                        <span class="badge ${badge}">${filterActive ? `${sectionMatched} of ${sectionTotal}` : `${sectionTotal}`} match${sectionMatched === 1 && filterActive ? '' : 'es'}</span>
+                    </header>`;
+                if (sectionMatched === 0) {
+                    html += filterActive
+                        ? '<div class="changes-empty">No matches in this bucket.</div>'
+                        : '<div class="changes-empty">Nothing.</div>';
+                } else {
+                    html += body;
                 }
                 html += '</section>';
+
+                totalMatched += sectionMatched;
+                totalShown += sectionShown;
             });
 
-            const changed = data.changed || [];
-            html += `<section class="changes-section">
-                <header>Property drift <span class="badge badge-changed">${changed.length} nodes</span></header>`;
-            if (changed.length) {
-                html += '<ul class="changes-list">';
-                changed.slice(0, 200).forEach(c => {
-                    const propKeys = Object.keys(c.props_changed || {});
-                    const summary = propKeys.slice(0, 3).map(k => {
-                        const v = c.props_changed[k];
-                        return `${k}: ${escapeHtml(JSON.stringify(v.old))} → ${escapeHtml(JSON.stringify(v.new))}`;
-                    }).join(' · ');
-                    html += `<li>
-                        <div>
-                            <div class="id-badge">${escapeHtml(c.id)}</div>
-                            <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">${summary}</div>
-                        </div>
-                        <span class="view-link" data-jump-id="${escapeHtml(c.id)}">View on graph →</span>
-                    </li>`;
-                });
-                html += '</ul>';
-            } else {
-                html += '<div class="changes-empty">No property drift detected.</div>';
+            if (_changesFilter.buckets.changed) {
+                const changed = data.changed || [];
+                let changedMatched = 0;
+                let body = '';
+                const filtered = matcherInfo.ok
+                    ? changed.filter(c => {
+                        if (matcherInfo.match(c.id)) return true;
+                        if (!_changesFilter.searchDriftValues) return false;
+                        const props = c.props_changed || {};
+                        for (const k of Object.keys(props)) {
+                            if (matcherInfo.match(k)) return true;
+                            const v = props[k] || {};
+                            try {
+                                if (matcherInfo.match(JSON.stringify(v.old))) return true;
+                                if (matcherInfo.match(JSON.stringify(v.new))) return true;
+                            } catch (_e) { /* skip */ }
+                        }
+                        return false;
+                    })
+                    : [];
+                changedMatched = filtered.length;
+                const slice = filtered.slice(0, cap);
+                if (slice.length) {
+                    body += '<ul class="changes-list">';
+                    slice.forEach(c => {
+                        const propKeys = Object.keys(c.props_changed || {});
+                        const summaryStr = propKeys.slice(0, 3).map(k => {
+                            const v = c.props_changed[k];
+                            return `${_highlight(k, matcherInfo)}: ${_highlight(JSON.stringify(v.old), matcherInfo)} → ${_highlight(JSON.stringify(v.new), matcherInfo)}`;
+                        }).join(' · ');
+                        body += `<li>
+                            <div>
+                                <div class="id-badge">${_highlight(c.id, matcherInfo)}</div>
+                                <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">${summaryStr}</div>
+                            </div>
+                            <span class="view-link" data-jump-id="${escapeHtml(c.id)}">View on graph →</span>
+                        </li>`;
+                    });
+                    if (filtered.length > slice.length) {
+                        body += `<li><span class="id-badge">… ${filtered.length - slice.length} more</span></li>`;
+                    }
+                    body += '</ul>';
+                }
+                html += `<section class="changes-section">
+                    <header>Property drift
+                        <span class="badge badge-changed">${filterActive ? `${changedMatched} of ${changed.length}` : `${changed.length}`} nodes</span>
+                    </header>`;
+                if (!changedMatched) {
+                    html += filterActive
+                        ? '<div class="changes-empty">No matches in property drift.</div>'
+                        : '<div class="changes-empty">No property drift detected.</div>';
+                } else {
+                    html += body;
+                }
+                html += '</section>';
+                totalMatched += changedMatched;
+                totalShown += slice.length;
             }
-            html += '</section>';
 
-            main.innerHTML = html;
+            results.innerHTML = html;
 
-            main.querySelectorAll('[data-jump-id]').forEach(el => {
+            if (summary) {
+                if (!matcherInfo.ok) {
+                    summary.innerHTML = `<span class="changes-filter-error">Regex error: ${escapeHtml(matcherInfo.error || '')}</span>`;
+                } else if (filterActive) {
+                    summary.innerHTML = `Showing <strong>${totalShown}</strong> of <strong>${totalMatched}</strong> match${totalMatched === 1 ? '' : 'es'}.`;
+                } else {
+                    summary.innerHTML = `No filter. Each list capped at <strong>${_CHANGES_DEFAULT_CAP}</strong> — type to search all.`;
+                }
+            }
+
+            results.querySelectorAll('[data-jump-id]').forEach(el => {
                 el.addEventListener('click', () => {
                     const id = el.getAttribute('data-jump-id');
                     if (typeof switchView === 'function') switchView('graph');
@@ -5476,6 +5860,7 @@
                 loadSnapshots().then(_populateSnapshotPickers);
                 const btn = document.getElementById('diff-run-btn');
                 if (btn) btn.addEventListener('click', runDiff);
+                _wireChangesFilterUI();
             }
         };
 
