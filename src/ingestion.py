@@ -179,6 +179,23 @@ class MemgraphIngestion:
                 except Exception:
                     pass
 
+            # One-shot migration: clear the legacy `last_software_sync_iso`
+            # property from Host nodes that pre-date the rename. The ongoing
+            # write path (`_batch_create_hosts`) already SETs it to NULL on
+            # every touched host, but hosts that haven't appeared in any
+            # cycle since the rename would otherwise carry the stale field
+            # forever. This sweep is cheap (single Cypher) and runs once per
+            # ingest cycle — after the first cycle post-rename, all subsequent
+            # invocations match zero rows and exit instantly.
+            try:
+                session.run(
+                    "MATCH (h:Host) "
+                    "WHERE h.last_software_sync_iso IS NOT NULL "
+                    "SET h.last_software_sync_iso = NULL"
+                )
+            except Exception:
+                pass
+
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
         Ingest hosts, users, software, and relationships into Memgraph.
@@ -295,6 +312,11 @@ class MemgraphIngestion:
 
                 # Host Data — fleet_host_id is the MERGE key; all other fields
                 # (hostname included) are written via SET on every cycle.
+                # `last_ingest_iso` marks when the Host row was last touched
+                # by ETL (replaces the misleadingly-named `last_software_sync_iso`
+                # which sounded like "software was synced" but really meant
+                # "host row was processed" — `fleet_software_updated_at_synced`
+                # is now the field that actually tracks software sync freshness).
                 host_batch.append({
                     'hostname': hostname,
                     'fleet_host_id': fleet_host_id,
@@ -304,7 +326,7 @@ class MemgraphIngestion:
                     'last_seen': host.get('seen_time'),
                     'team_id': host.get('team_id'),
                     'team_name': host.get('team_name'),
-                    'last_software_sync_iso': now_iso,
+                    'last_ingest_iso': now_iso,
                 })
 
                 # User Relationships — match Host by fleet_host_id (stable).
@@ -482,6 +504,10 @@ class MemgraphIngestion:
         if not host_batch:
             return
 
+        # `last_ingest_iso` replaces the misleadingly-named `last_software_sync_iso`
+        # (see _ingest path docstring). Setting the old property to NULL in the
+        # same write drops it cleanly from existing Host nodes carried over
+        # from pre-rename cycles, so no separate migration is needed.
         query = """
             UNWIND $hosts AS host
             MERGE (h:Host {fleet_host_id: host.fleet_host_id})
@@ -492,7 +518,8 @@ class MemgraphIngestion:
                 h.last_seen = host.last_seen,
                 h.team_id = host.team_id,
                 h.team_name = host.team_name,
-                h.last_software_sync_iso = host.last_software_sync_iso
+                h.last_ingest_iso = host.last_ingest_iso,
+                h.last_software_sync_iso = NULL
         """
         self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch")
 
@@ -1263,6 +1290,83 @@ class MemgraphIngestion:
                 present=present, cutoff=cutoff,
             )
         return reaped
+
+    def reap_orphaned_software(self, now_iso: "str | None" = None,
+                                reap_age_seconds: int = 604800) -> dict:
+        """Age-based DELETE for :Software nodes that have no INSTALLED_ON edge.
+
+        Mirrors the label reap pattern. Sweep:
+          1. For Software with ≥1 INSTALLED_ON edge: clear `software_orphaned_since`
+             (re-attached after a prior orphaning — flip the marker off).
+          2. For Software with zero INSTALLED_ON edges AND no marker: stamp
+             `software_orphaned_since = now_iso`. First detection.
+          3. For Software with zero edges AND `software_orphaned_since` older
+             than `reap_age_seconds`: DELETE the node.
+
+        Defaulting to 7 days mirrors the label reap horizon. Tunable via
+        ETLConfig.software_reap_age_seconds. Enrichment-bearing Software
+        nodes (Wikidata category, sources) survive any single empty cycle —
+        re-installs within the window restore their edges and clear the
+        marker before they ever expire.
+
+        Returns: {'marked': int, 'unmarked': int, 'reaped': int}
+        """
+        if now_iso is None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt - timedelta(seconds=reap_age_seconds)).isoformat()
+
+        stats = {'marked': 0, 'unmarked': 0, 'reaped': 0}
+        with self.driver.session() as session:
+            # (1) Clear marker on Software that regained edges. Runs first so
+            # we don't immediately re-mark them in step (2).
+            rec = session.run(
+                "MATCH (s:Software) "
+                "WHERE s.software_orphaned_since IS NOT NULL "
+                "  AND EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
+                "WITH collect(s) AS matched "
+                "FOREACH (n IN matched | SET n.software_orphaned_since = NULL) "
+                "RETURN size(matched) AS n"
+            ).single()
+            stats['unmarked'] = int(rec['n']) if rec else 0
+
+            # (2) Stamp marker on freshly-orphaned Software (no edges, no marker yet).
+            rec = session.run(
+                "MATCH (s:Software) "
+                "WHERE s.software_orphaned_since IS NULL "
+                "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
+                "WITH collect(s) AS matched "
+                "FOREACH (n IN matched | SET n.software_orphaned_since = $now) "
+                "RETURN size(matched) AS n",
+                now=now_iso,
+            ).single()
+            stats['marked'] = int(rec['n']) if rec else 0
+
+            # (3) Reap Software still orphaned past the cutoff. Count then
+            # delete so the stat is accurate without a Cypher 5 subquery.
+            rec = session.run(
+                "MATCH (s:Software) "
+                "WHERE s.software_orphaned_since IS NOT NULL "
+                "  AND s.software_orphaned_since < $cutoff "
+                "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
+                "RETURN count(s) AS n",
+                cutoff=cutoff,
+            ).single()
+            reaped = int(rec['n']) if rec else 0
+            if reaped > 0:
+                session.run(
+                    "MATCH (s:Software) "
+                    "WHERE s.software_orphaned_since IS NOT NULL "
+                    "  AND s.software_orphaned_since < $cutoff "
+                    "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
+                    "DETACH DELETE s",
+                    cutoff=cutoff,
+                )
+            stats['reaped'] = reaped
+        return stats
 
     def mark_label_sync_failure(self, error_msg: str):
         """Record a global label-sync failure on every Label node.

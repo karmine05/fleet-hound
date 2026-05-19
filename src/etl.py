@@ -117,6 +117,16 @@ class ETLConfig:
     supplement_orphan_cap: int = 200
     # Maximum extra /hosts/{id} calls per cycle when supplement_label_orphans is True.
     # Bounded to prevent a misconfigured label from fanning out unboundedly.
+    skip_software_reap: bool = False
+    # When False, each cycle calls MemgraphIngestion.reap_orphaned_software to
+    # mark/sweep Software nodes that no longer have any INSTALLED_ON edge.
+    # Mirrors the label reap pattern. Set True to leave orphaned Software in
+    # place (e.g. during incident response when you want to inspect what was
+    # uninstalled before it's cleaned up).
+    software_reap_age_seconds: int = 7 * 24 * 60 * 60
+    # 7-day age horizon for software reap — orphaned Software survives any
+    # single empty cycle, only deleted after a full week without any host
+    # installing it.
 
 
 @dataclass
@@ -142,6 +152,10 @@ class ETLResult:
     # Label orphan tracking (added 260519-j0t)
     label_orphan_count: int = 0
     label_orphans_fetched: int = 0
+    # Software reap telemetry (added 260519-100k-scale)
+    software_reap_attempted: bool = False
+    software_reap_stats: Optional[dict] = None
+    software_reap_error: Optional[str] = None
 
     def as_dict(self) -> dict:
         return {
@@ -164,6 +178,9 @@ class ETLResult:
             "skipped_due_to_lock": self.skipped_due_to_lock,
             "label_orphan_count": self.label_orphan_count,
             "label_orphans_fetched": self.label_orphans_fetched,
+            "software_reap_attempted": self.software_reap_attempted,
+            "software_reap_stats": self.software_reap_stats,
+            "software_reap_error": self.software_reap_error,
         }
 
 
@@ -522,6 +539,28 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                             "etl: failed to mark label-sync failure on existing "
                             "Label nodes: %s", inner,
                         )
+
+            # Software node reap. Mark/unmark/sweep Software with no edges,
+            # mirrors the label reap pattern (age-based, 7-day default). Best-
+            # effort; failures never fail the cycle. Skipped under
+            # cfg.skip_software_reap for operators who want to inspect
+            # uninstalled software in-place before cleanup.
+            if not cfg.skip_software_reap:
+                result.software_reap_attempted = True
+                try:
+                    stats = ingestion.reap_orphaned_software(
+                        now_iso=_now_iso(),
+                        reap_age_seconds=cfg.software_reap_age_seconds,
+                    )
+                    result.software_reap_stats = stats
+                    logger.info(
+                        "etl: software reap — marked=%d unmarked=%d reaped=%d",
+                        stats['marked'], stats['unmarked'], stats['reaped'],
+                    )
+                except Exception as exc:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    logger.warning("etl: software reap failed: %s", msg)
+                    result.software_reap_error = msg
 
         # Orient: enrichment kick. Best-effort — never breaks a cycle.
         if not cfg.skip_enrichment:
