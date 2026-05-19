@@ -187,7 +187,9 @@ class MemgraphIngestion:
         - Optimized batch sizes
         """
         start_time = time.time()
-        
+        # Computed once per cycle so all host rows share the same freshness timestamp.
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         # Optimize batch sizing for different data types.
         # Users/Hosts are light, so larger batches amortize Bolt round-trips.
         # Software is grouped per-host so the flush threshold is in HOSTS-with-bundles,
@@ -259,7 +261,8 @@ class MemgraphIngestion:
                     'ip': host.get('primary_ip'),
                     'last_seen': host.get('seen_time'),
                     'team_id': host.get('team_id'),
-                    'team_name': host.get('team_name')
+                    'team_name': host.get('team_name'),
+                    'last_software_sync_iso': now_iso,
                 })
 
                 # User Relationships — match Host by fleet_host_id (stable).
@@ -420,7 +423,8 @@ class MemgraphIngestion:
                 h.ip = host.ip,
                 h.last_seen = host.last_seen,
                 h.team_id = host.team_id,
-                h.team_name = host.team_name
+                h.team_name = host.team_name,
+                h.last_software_sync_iso = host.last_software_sync_iso
         """
         self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch")
 
@@ -586,6 +590,28 @@ class MemgraphIngestion:
             MERGE (s)-[:INSTALLED_ON]->(h)
         """
         self._execute_with_retry(session, query_rels, {'batches': software_grouped_batch}, "create grouped software rels")
+
+        # 4. Orphan accounting: count entries whose fleet_host_id had no :Host
+        # node at MATCH time (parity with label-orphan telemetry from 260519-j0t).
+        # A single OPTIONAL MATCH against the same in-memory batch; no extra fan-out.
+        orphan_query = """
+            UNWIND $batches AS batch
+            OPTIONAL MATCH (h:Host {fleet_host_id: batch.fleet_host_id})
+            WITH batch, h
+            WHERE h IS NULL
+            RETURN count(batch) AS orphans
+        """
+        try:
+            rec = session.run(orphan_query, batches=software_grouped_batch).single()
+            orphans = int(rec["orphans"]) if rec and rec.get("orphans") is not None else 0
+        except Exception:
+            orphans = 0
+        if orphans > 0:
+            print(
+                f"   ⚠️  host_software_orphans={orphans}"
+                " (entries with fleet_host_id matching no :Host node"
+                " — software dropped on the floor for those hosts this cycle)"
+            )
 
     # ------------------------------------------------------------------
     # Label sync (added in v1.27 — see plan section 1A/1B/1D/4A)
