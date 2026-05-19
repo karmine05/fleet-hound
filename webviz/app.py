@@ -1859,13 +1859,17 @@ def get_full_graph_data():
                 "MATCH (h:Host) "
                 "WHERE (EXISTS((h)<-[:USES]-(:User)) OR EXISTS((h)<-[:INSTALLED_ON]-(:Software)))"
                 + flt_fragment +
-                " RETURN h.hostname AS hostname, h.os_version AS os_version, "
+                " RETURN h.fleet_host_id AS fleet_host_id, "
+                "        h.hostname AS hostname, h.os_version AS os_version, "
                 "        h.platform AS platform, h.team_id AS team_id, "
                 "        h.team_name AS team_name"
             )
             host_result = session.run(host_query, **flt_params)
             for record in host_result:
-                node_id = f"host_{record['hostname']}"
+                # Node id is keyed on fleet_host_id (stable, unique). hostname
+                # carries the current display label. This eliminates duplicate
+                # nodes when Fleet reports the same host with different casing.
+                node_id = f"host_{record['fleet_host_id']}"
                 node_obj = {
                     "id": node_id,
                     "name": record['hostname'],
@@ -1933,14 +1937,16 @@ def get_full_graph_data():
             # Get relationships - only for nodes that exist
             links = []
 
-            # User-Host relationships
+            # User-Host relationships — target keyed on fleet_host_id to match
+            # the node ids emitted above.
             rel_result = session.run("""
                 MATCH (u:User)-[r:USES]->(h:Host)
-                RETURN 'uses' AS type, u.username AS from_name, h.hostname AS to_host
+                RETURN 'uses' AS type, u.username AS from_name,
+                       h.fleet_host_id AS to_host_id
             """)
             for record in rel_result:
                 source_id = f"user_{record['from_name']}"
-                target_id = f"host_{record['to_host']}"
+                target_id = f"host_{record['to_host_id']}"
 
                 # Only add link if both nodes exist
                 if source_id in node_ids and target_id in node_ids:
@@ -1960,13 +1966,14 @@ def get_full_graph_data():
                 software_rel_result = session.run("""
                     MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
                     WHERE s.name IN $software_names
-                    RETURN 'installed' AS type, s.name AS from_name, h.hostname AS to_host
+                    RETURN 'installed' AS type, s.name AS from_name,
+                           h.fleet_host_id AS to_host_id
                 """, software_names=software_names)
 
                 added_software_links = 0
                 for record in software_rel_result:
                     source_id = f"software_{record['from_name']}"
-                    target_id = f"host_{record['to_host']}"
+                    target_id = f"host_{record['to_host_id']}"
 
                     # Only add link if both nodes exist
                     if source_id in node_ids and target_id in node_ids:
@@ -2107,39 +2114,57 @@ def get_software_hosts(software_name):
 
 @app.route("/api/host/<hostname>/software")
 def get_host_software(hostname):
-    """Get ALL software installed on a specific host"""
+    """Get ALL software installed on a specific host.
+
+    Looks the host up by case-insensitive hostname so that the side panel
+    still resolves when the URL casing differs from the surviving canonical
+    casing in the graph (e.g. an old bookmark, a copy-pasted link, or two
+    Fleet hosts whose names differ only in case). Once we have the host we
+    pivot to its fleet_host_id (stable id) for all subsequent rel lookups
+    to guarantee we follow edges of exactly one logical machine.
+    """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
-    
+
     with driver.session() as session:
-        # Get the host
+        # Case-insensitive host lookup. LIMIT 1 because, in the rare event
+        # two enrolled Fleet hosts share a lowercased hostname, we pick the
+        # one with the most recent activity to populate the side panel.
         host_result = session.run(
-            "MATCH (h:Host {hostname: $hostname}) RETURN h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform",
+            "MATCH (h:Host) "
+            "WHERE toLower(h.hostname) = toLower($hostname) "
+            "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
+            "       h.os_version AS os_version, h.platform AS platform "
+            "ORDER BY h.last_seen DESC LIMIT 1",
             hostname=hostname
         )
         host_data = host_result.single()
         if not host_data:
             return jsonify({"error": "Host not found"}), 404
-        
+
+        fleet_host_id = host_data['fleet_host_id']
+        canonical_hostname = host_data['hostname']
+
         nodes = []
         node_ids = set()
-        
-        # Add the host node
-        host_id = f"host_{hostname}"
+
+        # Add the host node — id keyed on fleet_host_id, name shows the
+        # canonical (most-recently-ingested) hostname casing.
+        host_id = f"host_{fleet_host_id}"
         nodes.append({
             "id": host_id,
-            "name": hostname,
+            "name": canonical_hostname,
             "type": "host",
             "details": f"{host_data['os_version'] or ''} ({host_data['platform'] or ''})"
         })
         node_ids.add(host_id)
-        
-        # Get ALL users connected to this host
+
+        # Get ALL users connected to this host — match by fleet_host_id.
         user_result = session.run("""
-            MATCH (u:User)-[:USES]->(h:Host {hostname: $hostname})
+            MATCH (u:User)-[:USES]->(h:Host {fleet_host_id: $fleet_host_id})
             RETURN u.username AS username, u.email AS email, u.fullname AS fullname
-        """, hostname=hostname)
-        
+        """, fleet_host_id=fleet_host_id)
+
         for record in user_result:
             user_id = f"user_{record['username']}"
             nodes.append({
@@ -2149,14 +2174,14 @@ def get_host_software(hostname):
                 "details": record['email'] or record['fullname'] or ''
             })
             node_ids.add(user_id)
-        
+
         # Get ALL software installed on this host
         software_result = session.run("""
-            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {hostname: $hostname})
+            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {fleet_host_id: $fleet_host_id})
             RETURN s.name AS name, s.last_version AS last_version
             ORDER BY s.name
-        """, hostname=hostname)
-        
+        """, fleet_host_id=fleet_host_id)
+
         for record in software_result:
             software_id = f"software_{record['name']}"
             nodes.append({
@@ -2166,16 +2191,16 @@ def get_host_software(hostname):
                 "details": f"Latest: {record['last_version'] or 'unknown'}"
             })
             node_ids.add(software_id)
-        
+
         # Get ALL relationships for this host
         links = []
-        
+
         # User-Host relationships
         user_links = session.run("""
-            MATCH (u:User)-[:USES]->(h:Host {hostname: $hostname})
+            MATCH (u:User)-[:USES]->(h:Host {fleet_host_id: $fleet_host_id})
             RETURN u.username AS username
-        """, hostname=hostname)
-        
+        """, fleet_host_id=fleet_host_id)
+
         for record in user_links:
             source_id = f"user_{record['username']}"
             if source_id in node_ids:
@@ -2184,13 +2209,13 @@ def get_host_software(hostname):
                     "target": host_id,
                     "type": "uses"
                 })
-        
+
         # Software-Host relationships
         software_links = session.run("""
-            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {hostname: $hostname})
+            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {fleet_host_id: $fleet_host_id})
             RETURN s.name AS name
-        """, hostname=hostname)
-        
+        """, fleet_host_id=fleet_host_id)
+
         for record in software_links:
             source_id = f"software_{record['name']}"
             if source_id in node_ids:
@@ -2199,8 +2224,8 @@ def get_host_software(hostname):
                     "target": host_id,
                     "type": "installed"
                 })
-        
-        logger.info(f"Host {hostname}: Returning {len(nodes)} nodes and {len(links)} links")
+
+        logger.info(f"Host {canonical_hostname} (id={fleet_host_id}): Returning {len(nodes)} nodes and {len(links)} links")
         return jsonify({"nodes": nodes, "links": links})
 
 @app.route("/api/meta")
