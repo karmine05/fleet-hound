@@ -356,6 +356,49 @@ class FleetGraphExtractor:
             time.sleep(0.2)
         return members
 
+    def extract_host_by_id(self, host_id: int) -> "dict | None":
+        """Fetch a single host record via /api/v1/fleet/hosts/{id}.
+
+        Best-effort: used by the label-orphan supplement path in etl.py to
+        back-fill hosts that appear in Fleet label membership but were never
+        ingested via the bulk /hosts endpoint (e.g. mobile MDM hosts, team-
+        scoped hosts, or hosts in transient states that /hosts filtered out).
+
+        Returns the inner host dict (unwrapped from {"host": {...}}) on 200.
+        Returns None on 404 (host legitimately deleted between membership
+        fetch and this call) or any other non-200 status.
+        Fleet wraps single-host responses as {"host": {...}}; the inner dict
+        contains id, hostname, platform, os_version, team_id, team_name,
+        primary_ip, seen_time, users, software — the same fields the bulk
+        /hosts endpoint returns, so create_graph_relationships accepts it
+        without a separate code path.
+        """
+        resp = self._get(f"/api/v1/fleet/hosts/{host_id}")
+        if resp is None:
+            if self.debug:
+                print(f"[extractor] extract_host_by_id({host_id}): no response")
+            return None
+        if resp.status_code == 404:
+            if self.debug:
+                print(f"[extractor] extract_host_by_id({host_id}): 404 (host gone)")
+            return None
+        if resp.status_code != 200:
+            if self.debug:
+                print(f"[extractor] extract_host_by_id({host_id}): unexpected status={resp.status_code}")
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            if self.debug:
+                print(f"[extractor] extract_host_by_id({host_id}): failed to parse JSON")
+            return None
+        host = data.get("host")
+        if not isinstance(host, dict):
+            if self.debug:
+                print(f"[extractor] extract_host_by_id({host_id}): unexpected shape, no 'host' key")
+            return None
+        return host
+
     def extract_users_for_host(self, host_id):
         """Attempt to retrieve per-host user list via detail endpoint.
 

@@ -110,6 +110,13 @@ class ETLConfig:
     skip_all_label_builtins: bool = False  # legacy posture; default keeps functional builtins
     label_reap_age_seconds: int = 7 * 24 * 60 * 60  # T2: 7-day age-based reap
     lock_path: Optional[str] = None  # None → derive from state_path parent
+    supplement_label_orphans: bool = False
+    # When True, the ETL cycle fetches each orphan host_id via /api/v1/fleet/hosts/{id}
+    # and appends it to the hosts list before create_graph_relationships so the missing
+    # :Host node is created and the next label sync can form the HAS_LABEL edge.
+    supplement_orphan_cap: int = 200
+    # Maximum extra /hosts/{id} calls per cycle when supplement_label_orphans is True.
+    # Bounded to prevent a misconfigured label from fanning out unboundedly.
 
 
 @dataclass
@@ -132,6 +139,9 @@ class ETLResult:
     last_label_sync_iso: Optional[str] = None
     label_sync_stats: Optional[dict] = None
     skipped_due_to_lock: bool = False
+    # Label orphan tracking (added 260519-j0t)
+    label_orphan_count: int = 0
+    label_orphans_fetched: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -152,6 +162,8 @@ class ETLResult:
             "last_label_sync_iso": self.last_label_sync_iso,
             "label_sync_stats": self.label_sync_stats,
             "skipped_due_to_lock": self.skipped_due_to_lock,
+            "label_orphan_count": self.label_orphan_count,
+            "label_orphans_fetched": self.label_orphans_fetched,
         }
 
 
@@ -302,6 +314,72 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         result.users_extracted = len(users)
         logger.info("etl: extracted %d hosts, %d users", len(hosts), len(users))
 
+        # --- Label extraction (moved BEFORE host ingest) ---
+        # Labels and membership are fetched here so we can compute orphan ids
+        # (member ids with no corresponding :Host node) BEFORE create_graph_relationships.
+        # This allows the optional supplement path to back-fill missing hosts so the
+        # label sync in the same cycle can create the HAS_LABEL edges (no two-cycle wait).
+        labels = []
+        member_map: dict = {}
+        if not cfg.skip_labels:
+            try:
+                labels = extractor.extract_labels(
+                    skip_all_builtins=cfg.skip_all_label_builtins,
+                )
+                if not labels:
+                    logger.info("etl: /labels returned no labels (empty or filtered)")
+                for lbl in labels:
+                    lid = lbl.get("id")
+                    if lid is None:
+                        continue
+                    members = extractor.extract_label_host_membership(lid)
+                    member_map[lid] = [
+                        m.get("id") for m in members if m.get("id") is not None
+                    ]
+            except Exception as exc:
+                logger.warning("etl: label pre-fetch failed: %s", exc)
+                labels = []
+                member_map = {}
+
+        # Compute orphan ids: member ids in any label not already in hosts.
+        known_host_ids = {h.get("id") for h in hosts if h.get("id") is not None}
+        all_member_ids: set = set()
+        for ids in member_map.values():
+            all_member_ids.update(ids)
+        orphan_ids = sorted(all_member_ids - known_host_ids)
+        result.label_orphan_count = len(orphan_ids)
+        logger.info(
+            "etl: label orphan ids detected=%d (host ids in Fleet membership with no :Host node)",
+            len(orphan_ids),
+        )
+
+        # Optional supplement fetch: back-fill orphan hosts before ingest so the
+        # label sync in this same cycle can create the missing HAS_LABEL edges.
+        # Honor supplement_orphan_cap during the fan-out, not at the end (CLAUDE.md
+        # pagination-cap rule). Default off; set cfg.supplement_label_orphans=True
+        # or FLEET_SUPPLEMENT_LABEL_ORPHANS=1 (env wiring is a follow-up commit).
+        if cfg.supplement_label_orphans and orphan_ids:
+            cap = cfg.supplement_orphan_cap
+            to_fetch = orphan_ids[:cap]
+            if len(orphan_ids) > cap:
+                logger.warning(
+                    "etl: orphan supplement capped at %d (total=%d); remaining will be "
+                    "fetched in subsequent cycles",
+                    cap, len(orphan_ids),
+                )
+            fetched = 0
+            for oid in to_fetch:
+                host_dict = extractor.extract_host_by_id(oid)
+                if host_dict is not None:
+                    hosts.append(host_dict)
+                    fetched += 1
+            result.label_orphans_fetched = fetched
+            result.hosts_extracted = len(hosts)
+            logger.info(
+                "etl: supplement fetched %d/%d orphan hosts",
+                fetched, len(to_fetch),
+            )
+
         logger.info("etl: ingesting into Memgraph %s", cfg.memgraph_uri)
         with MemgraphIngestion(cfg.memgraph_uri) as ingestion:
             ingestion.create_constraints()
@@ -314,26 +392,6 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
             if not cfg.skip_labels:
                 result.label_sync_attempted = True
                 try:
-                    labels = extractor.extract_labels(
-                        skip_all_builtins=cfg.skip_all_label_builtins,
-                    )
-                    if not labels:
-                        # Empty payload: could be transient API failure or
-                        # genuinely zero user-defined labels. Either way the
-                        # ingestion's empty-payload branch handles it (only
-                        # runs age-based reaping; never wipes existing edges).
-                        logger.info("etl: /labels returned no labels (empty or filtered)")
-
-                    member_map = {}
-                    for lbl in labels:
-                        lid = lbl.get("id")
-                        if lid is None:
-                            continue
-                        members = extractor.extract_label_host_membership(lid)
-                        member_map[lid] = [
-                            m.get("id") for m in members if m.get("id") is not None
-                        ]
-
                     label_sync_iso = _now_iso()
                     stats = ingestion.sync_labels_with_membership(
                         labels, member_map, label_sync_iso,
@@ -343,10 +401,11 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     result.label_sync_stats = stats.as_dict()
                     logger.info(
                         "etl: label sync ok — seen=%d unchanged=%d resynced=%d "
-                        "reaped=%d edges_added=%d edges_deleted=%d",
+                        "reaped=%d edges_added=%d edges_deleted=%d orphan_members=%d",
                         stats.labels_seen, stats.labels_unchanged,
                         stats.labels_resynced, stats.labels_reaped,
                         stats.edges_created, stats.edges_deleted,
+                        stats.orphan_members,
                     )
                 except Exception as exc:
                     msg = f"{type(exc).__name__}: {exc}"

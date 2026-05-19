@@ -2,10 +2,13 @@ import base64
 import gzip
 import hashlib
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
@@ -18,7 +21,9 @@ class LabelSyncStats:
     `labels_unchanged` is the hash-skip count — these labels had a member-list
     hash match against the prior sync and emitted zero edge writes. `labels_resynced`
     is the dirty-path count — DETACH+re-MERGE happened. `labels_reaped` is the
-    age-based orphan reap count from the end of the cycle.
+    age-based orphan reap count from the end of the cycle. `orphan_members` is the
+    total count of host_ids that appear in Fleet label membership but have no
+    corresponding :Host node in the graph — these are the silent off-by-one gaps.
     """
     labels_seen: int = 0
     labels_unchanged: int = 0
@@ -26,6 +31,7 @@ class LabelSyncStats:
     labels_reaped: int = 0
     edges_created: int = 0
     edges_deleted: int = 0
+    orphan_members: int = 0
     errors: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -36,6 +42,7 @@ class LabelSyncStats:
             "labels_reaped": self.labels_reaped,
             "edges_created": self.edges_created,
             "edges_deleted": self.edges_deleted,
+            "orphan_members": self.orphan_members,
             "errors": list(self.errors),
         }
 
@@ -646,15 +653,23 @@ class MemgraphIngestion:
                     continue
                 stats.labels_seen += 1
                 member_ids = member_map.get(fleet_id, [])
-                changed, edges_added, edges_removed = self._sync_single_label_membership(
+                changed, edges_added, edges_removed, orphans_count = self._sync_single_label_membership(
                     session, fleet_id, member_ids, now_iso,
                 )
+                stats.orphan_members += orphans_count
                 if changed:
                     stats.labels_resynced += 1
                     stats.edges_created += edges_added
                     stats.edges_deleted += edges_removed
                 else:
                     stats.labels_unchanged += 1
+
+            if stats.orphan_members > 0:
+                logger.info(
+                    "ingestion: label sync orphan summary — "
+                    "orphan_members=%d (host ids in Fleet membership with no :Host node)",
+                    stats.orphan_members,
+                )
 
             present_ids = [
                 lbl['id'] for lbl in labels if lbl.get('id') is not None
@@ -723,7 +738,7 @@ class MemgraphIngestion:
              compressed` is missing for any reason. Self-healing: next
              cycle has the blob and the delta path takes over.
 
-        Returns (changed, edges_added, edges_removed).
+        Returns (changed, edges_added, edges_removed, orphans_count).
         """
         new_hash = compute_label_member_hash(member_ids)
 
@@ -736,6 +751,7 @@ class MemgraphIngestion:
         prior_blob = prior["blob"] if prior else None
 
         expected_count = sum(1 for h in member_ids if h is not None)
+        ids_list = sorted(int(h) for h in member_ids if h is not None)
 
         if prior_hash == new_hash:
             # Drift check before honoring the fast-path skip. Counts the
@@ -750,7 +766,23 @@ class MemgraphIngestion:
             if live_edges == expected_count:
                 # Hash match AND graph state consistent → safe to skip.
                 # last_synced_iso already updated in _batch_merge_labels.
-                return (False, 0, 0)
+                # Still refresh orphan accounting cheaply so operators see
+                # an up-to-date orphan_member_count without waiting for a
+                # dirty cycle.
+                orphan_rec = session.run(
+                    """
+                    MATCH (l:Label {fleet_id: $fid})
+                    OPTIONAL MATCH (h:Host) WHERE h.fleet_host_id IN $ids
+                    WITH l, collect(h.fleet_host_id) AS present
+                    SET l.orphan_member_count = size([x IN $ids WHERE NOT x IN present]),
+                        l.orphan_member_ids = [x IN $ids WHERE NOT x IN present][..50],
+                        l.orphan_member_truncated = size([x IN $ids WHERE NOT x IN present]) > 50
+                    RETURN l.orphan_member_count AS c
+                    """,
+                    fid=fleet_id, ids=ids_list,
+                ).single()
+                orphans_c = int(orphan_rec["c"]) if orphan_rec and orphan_rec["c"] is not None else 0
+                return (False, 0, 0, orphans_c)
             # Drift detected: fall through to full-rewrite repair. Don't
             # trust the prior blob/hash because either the graph lost edges
             # since the last sync, or the prior cycle's MERGE silently
@@ -769,11 +801,11 @@ class MemgraphIngestion:
             # No prior blob (first cycle after upgrade or decode failed),
             # or drift-repair: full rewrite. Next cycle has the blob and
             # the delta path takes over.
-            edges_added, edges_removed = self._full_rewrite_label_membership(
+            edges_added, edges_removed, orphans_count = self._full_rewrite_label_membership(
                 session, fleet_id, new_set,
             )
         else:
-            edges_added, edges_removed = self._delta_apply_label_membership(
+            edges_added, edges_removed, orphans_count = self._delta_apply_label_membership(
                 session, fleet_id, prior_set, new_set,
             )
 
@@ -786,12 +818,19 @@ class MemgraphIngestion:
             fid=fleet_id, h=new_hash, blob=new_blob, now=now_iso,
         )
 
-        return (True, edges_added, edges_removed)
+        return (True, edges_added, edges_removed, orphans_count)
 
     def _delta_apply_label_membership(self, session, fleet_id, prior_set, new_set):
         """Per-host symmetric diff. Emits only the delta edges.
 
-        Returns (edges_added, edges_removed).
+        Computes orphan ids from the `added` set (hosts Fleet says are newly
+        in the label but have no :Host node in the graph). For the unchanged
+        carry-over set, orphan bookkeeping is maintained via the persisted
+        `Label.orphan_member_ids` property — read current, union with new
+        orphans from `added`, subtract any ids that NOW have a :Host node,
+        then write back to keep the property accurate across supplement cycles.
+
+        Returns (edges_added, edges_removed, orphans_count).
         """
         added = sorted(new_set - prior_set)
         removed = sorted(prior_set - new_set)
@@ -821,13 +860,67 @@ class MemgraphIngestion:
                 "merge HAS_LABEL edges (delta)",
             )
 
-        return (len(added), len(removed))
+        # Compute orphans for the `added` set: which new ids have no :Host?
+        new_orphan_candidates = added if added else []
+        if new_orphan_candidates:
+            present_rec = session.run(
+                "MATCH (h:Host) WHERE h.fleet_host_id IN $ids "
+                "RETURN collect(h.fleet_host_id) AS present",
+                ids=new_orphan_candidates,
+            ).single()
+            present_ids = set(present_rec["present"]) if present_rec else set()
+            new_orphans = sorted(set(new_orphan_candidates) - present_ids)
+        else:
+            new_orphans = []
+
+        # Read existing persisted orphan ids, union with new, re-check
+        # the full combined set against live :Host nodes so that ids
+        # back-filled by a prior supplement cycle are removed automatically.
+        existing_rec = session.run(
+            "MATCH (l:Label {fleet_id: $fid}) "
+            "RETURN coalesce(l.orphan_member_ids, []) AS oids",
+            fid=fleet_id,
+        ).single()
+        existing_orphans = set(existing_rec["oids"]) if existing_rec else set()
+
+        # Also remove any ids that left new_set (they're no longer members).
+        candidate_orphans = (existing_orphans | set(new_orphans)) - set(removed)
+        # Remove ids no longer in new_set at all.
+        candidate_orphans &= new_set
+
+        # Re-check all candidate orphans against live :Host nodes.
+        if candidate_orphans:
+            recheck_rec = session.run(
+                "MATCH (h:Host) WHERE h.fleet_host_id IN $ids "
+                "RETURN collect(h.fleet_host_id) AS present",
+                ids=sorted(candidate_orphans),
+            ).single()
+            still_present = set(recheck_rec["present"]) if recheck_rec else set()
+            final_orphans = sorted(candidate_orphans - still_present)
+        else:
+            final_orphans = []
+
+        orphans_count = len(final_orphans)
+        capped = final_orphans[:50]
+        truncated = len(final_orphans) > 50
+        session.run(
+            "MATCH (l:Label {fleet_id: $fid}) "
+            "SET l.orphan_member_count = $count, "
+            "    l.orphan_member_ids = $ids, "
+            "    l.orphan_member_truncated = $trunc",
+            fid=fleet_id, count=orphans_count, ids=capped, trunc=truncated,
+        )
+
+        return (len(added), len(removed), orphans_count)
 
     def _full_rewrite_label_membership(self, session, fleet_id, new_set):
         """Legacy full-rewrite path (DETACH all + re-MERGE current).
 
         Used only when no prior member blob exists (first sync after upgrade
-        or decode failure). Returns (edges_added, edges_removed).
+        or decode failure). Computes orphan ids (ids in new_set with no
+        matching :Host node) via a pre-MERGE existence check and persists
+        them on the :Label node. Returns (edges_added, edges_removed,
+        orphans_count).
         """
         prior_edge_count_rec = session.run(
             "MATCH (:Host)-[r:HAS_LABEL]->(:Label {fleet_id: $fid}) "
@@ -843,6 +936,29 @@ class MemgraphIngestion:
 
         if new_set:
             sorted_ids = sorted(new_set)
+
+            # Pre-MERGE existence check: find which ids have no :Host node.
+            # One round-trip; cheap relative to the MERGE that follows.
+            present_rec = session.run(
+                "MATCH (h:Host) WHERE h.fleet_host_id IN $ids "
+                "RETURN collect(h.fleet_host_id) AS present",
+                ids=sorted_ids,
+            ).single()
+            present_ids = set(present_rec["present"]) if present_rec else set()
+            orphan_ids = sorted(set(sorted_ids) - present_ids)
+            orphans_count = len(orphan_ids)
+            capped = orphan_ids[:50]
+            truncated = len(orphan_ids) > 50
+
+            # Persist orphan accounting on the Label node before MERGE.
+            session.run(
+                "MATCH (l:Label {fleet_id: $fid}) "
+                "SET l.orphan_member_count = $count, "
+                "    l.orphan_member_ids = $ids, "
+                "    l.orphan_member_truncated = $trunc",
+                fid=fleet_id, count=orphans_count, ids=capped, trunc=truncated,
+            )
+
             self._execute_with_retry(
                 session,
                 """
@@ -865,9 +981,18 @@ class MemgraphIngestion:
             ).single()
             edges_added = post_rec["c"] if post_rec else 0
         else:
+            orphans_count = 0
+            # Clear orphan accounting when label has no members.
+            session.run(
+                "MATCH (l:Label {fleet_id: $fid}) "
+                "SET l.orphan_member_count = 0, "
+                "    l.orphan_member_ids = [], "
+                "    l.orphan_member_truncated = false",
+                fid=fleet_id,
+            )
             edges_added = 0
 
-        return (edges_added, prior_edges)
+        return (edges_added, prior_edges, orphans_count)
 
     def _reap_stale_labels(self, session, present_fleet_ids, now_iso,
                            reap_age_seconds: int = 604800):
