@@ -587,6 +587,9 @@ def get_labels():
           "last_synced_iso": str,
           "last_label_sync_status": "ok" | "stale" | "failed",
           "consecutive_failures": int,
+          "orphan_member_count": int,  # host ids in Fleet membership with no :Host node
+          "orphan_member_ids": list[int],  # up to 50 orphan host ids
+          "orphan_member_truncated": bool, # true when >50 orphans exist
         }
 
     Notes:
@@ -618,9 +621,12 @@ def get_labels():
                        coalesce(l.last_synced_iso, '') AS last_synced_iso,
                        coalesce(l.last_label_sync_status, 'unknown') AS last_label_sync_status,
                        coalesce(l.consecutive_failures, 0) AS consecutive_failures,
-                       l.query AS query
+                       l.query AS query,
+                       coalesce(l.orphan_member_count, 0) AS orphan_member_count,
+                       coalesce(l.orphan_member_ids, []) AS orphan_member_ids,
+                       coalesce(l.orphan_member_truncated, false) AS orphan_member_truncated
                 ORDER BY l.name
-                """
+"""
             )
             payload = []
             for r in result:
@@ -634,6 +640,9 @@ def get_labels():
                     "last_synced_iso": r["last_synced_iso"],
                     "last_label_sync_status": r["last_label_sync_status"],
                     "consecutive_failures": int(r["consecutive_failures"] or 0),
+                    "orphan_member_count": int(r["orphan_member_count"] or 0),
+                    "orphan_member_ids": list(r["orphan_member_ids"] or []),
+                    "orphan_member_truncated": bool(r["orphan_member_truncated"]),
                 }
                 if include_query and r["query"]:
                     entry["query"] = r["query"]
