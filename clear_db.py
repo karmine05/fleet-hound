@@ -73,12 +73,23 @@ def clear_memgraph(memgraph_uri: str, *, assume_yes: bool, state_file: str) -> N
                 session.run("DROP CONSTRAINT ON (u:User) ASSERT u.username IS UNIQUE;")
             except Exception:
                 pass
+            # Drop both the legacy hostname-UNIQUE (older Bloodhound DBs) and the
+            # new fleet_host_id-UNIQUE introduced when Host identity was swapped
+            # to Fleet's stable numeric id.
             try:
                 session.run("DROP CONSTRAINT ON (h:Host) ASSERT h.hostname IS UNIQUE;")
             except Exception:
                 pass
             try:
+                session.run("DROP CONSTRAINT ON (h:Host) ASSERT h.fleet_host_id IS UNIQUE;")
+            except Exception:
+                pass
+            try:
                 session.run("DROP CONSTRAINT ON (s:Software) ASSERT s.name IS UNIQUE;")
+            except Exception:
+                pass
+            try:
+                session.run("DROP CONSTRAINT ON (l:Label) ASSERT l.fleet_id IS UNIQUE;")
             except Exception:
                 pass
 

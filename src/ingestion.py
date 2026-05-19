@@ -126,16 +126,28 @@ class MemgraphIngestion:
     def create_constraints(self):
         """Create unique constraints + indexes on graph nodes.
 
-        Label nodes MERGE on fleet_id (stable across renames in Fleet). The
-        fleet_id constraint is required for MERGE correctness; the name index
-        accelerates `?labels=foo` URL→node resolution. Host.fleet_host_id is
-        non-unique-but-indexed because legacy hosts pre-upgrade may have NULL
-        until backfilled, and MATCH on it must stay fast.
+        Host nodes MERGE on fleet_host_id — Fleet's stable numeric identifier.
+        Hostname is a mutable display field updated via SET on every ingest.
+        This eliminates case-variant duplicates (Fleet sometimes reports the
+        same physical host with different hostname casings across cycles).
+
+        Label nodes MERGE on fleet_id (stable across renames in Fleet); the
+        name index accelerates `?labels=foo` URL→node resolution. An explicit
+        hostname index keeps substring-search perf after the UNIQUE-on-hostname
+        constraint was removed.
         """
         with self.driver.session() as session:
+            # Drop the legacy hostname-UNIQUE constraint if present (idempotent
+            # on fresh DBs). Required before swapping to fleet_host_id because
+            # Memgraph rejects CREATE on a label that already has any UNIQUE.
+            try:
+                session.run("DROP CONSTRAINT ON (h:Host) ASSERT h.hostname IS UNIQUE;")
+            except Exception:
+                pass
+
             constraints = [
                 "CREATE CONSTRAINT ON (u:User) ASSERT u.username IS UNIQUE;",
-                "CREATE CONSTRAINT ON (h:Host) ASSERT h.hostname IS UNIQUE;",
+                "CREATE CONSTRAINT ON (h:Host) ASSERT h.fleet_host_id IS UNIQUE;",
                 "CREATE CONSTRAINT ON (s:Software) ASSERT s.name IS UNIQUE;",
                 "CREATE CONSTRAINT ON (l:Label) ASSERT l.fleet_id IS UNIQUE;",
             ]
@@ -145,9 +157,12 @@ class MemgraphIngestion:
                 except Exception:
                     pass
 
+            # UNIQUE on fleet_host_id implies a lookup index; no explicit index
+            # needed for it. Keep an explicit hostname index for substring
+            # search paths in webviz (search/filter queries).
             indexes = [
                 "CREATE INDEX ON :Label(name);",
-                "CREATE INDEX ON :Host(fleet_host_id);",
+                "CREATE INDEX ON :Host(hostname);",
             ]
             for idx in indexes:
                 try:
