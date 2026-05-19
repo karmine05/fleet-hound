@@ -61,7 +61,23 @@ Two long-lived services run under Docker Compose: `memgraph` (the graph DB) and 
 
 ## Quick start
 
-**Prerequisites:** Docker, Docker Compose, Python 3.11, and a Fleet API token.
+**Prerequisites:** Docker, Docker Compose, Python 3.x, and a Fleet API token.
+
+### Set up Python environment
+
+```bash
+# Create virtual environment (required for Homebrew Python 3.10+)
+python3 -m venv venv
+
+# Activate it in your shell
+source venv/bin/activate  # macOS/Linux
+# or: venv\Scripts\activate  # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Configure
 
 ```bash
 # 1. Configure
