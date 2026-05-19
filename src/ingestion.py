@@ -1,9 +1,11 @@
 import base64
+import concurrent.futures
 import gzip
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -219,9 +221,19 @@ class MemgraphIngestion:
                     self._batch_create_users(session, user_batch)
 
             # 2. Hosts & Relationships
-            total_hosts = len(hosts_data)
-            print(f"💾 Ingesting {total_hosts} hosts with relationships...")
-            
+            # hosts_data may be a list (small fleets, backward-compat callers)
+            # or a generator yielding host dicts (streaming path from
+            # extract_host_pages). Tolerate both — progress logging falls back
+            # to "?" denominator when total is unknown.
+            try:
+                total_hosts = len(hosts_data)
+            except TypeError:
+                total_hosts = None
+            if total_hosts is not None:
+                print(f"💾 Ingesting {total_hosts} hosts with relationships...")
+            else:
+                print(f"💾 Ingesting host stream (size unknown until drained)...")
+
             host_batch = []
             user_rel_batch = []
 
@@ -229,14 +241,44 @@ class MemgraphIngestion:
             # Keyed by Fleet's stable id; hostname carried only for diagnostic logs.
             software_grouped_batch = []
 
-            progress_interval = 100 if total_hosts > 500 else 50 if total_hosts > 100 else 25
+            if total_hosts is None:
+                progress_interval = 500  # unknown size — log every 500 hosts processed
+            else:
+                progress_interval = 100 if total_hosts > 500 else 50 if total_hosts > 100 else 25
 
             skipped_no_id = 0
             skipped_no_hostname = 0
+            skipped_unchanged_sw = 0
+
+            # Pre-fetch the set of host_ids that already have at least one
+            # INSTALLED_ON edge AND carry a stored Fleet software_updated_at
+            # watermark. Used below to short-circuit software rel rebuild when
+            # Fleet reports no change since our last successful sync. Bounded
+            # by host count (~100k = ~5 MB) so a single roundtrip is fine.
+            # If the prefetch fails (transient Memgraph error), we skip the
+            # optimization and fall back to unconditional rel rebuild — never
+            # masks freshness issues.
+            sw_synced_map: dict = {}
+            try:
+                rec = session.run(
+                    "MATCH (h:Host) "
+                    "WHERE h.fleet_software_updated_at_synced IS NOT NULL "
+                    "  AND EXISTS((h)<-[:INSTALLED_ON]-(:Software)) "
+                    "RETURN h.fleet_host_id AS id, "
+                    "       h.fleet_software_updated_at_synced AS s"
+                )
+                for r in rec:
+                    sw_synced_map[r['id']] = r['s']
+            except Exception as exc:
+                print(f"   ⚠️  sw_synced prefetch failed: {exc}; skipping short-circuit")
+                sw_synced_map = {}
 
             for idx, host in enumerate(hosts_data):
-                if (idx + 1) % progress_interval == 0 or (idx + 1) == total_hosts:
-                    print(f"   Processing host {idx + 1}/{total_hosts}...")
+                if (idx + 1) % progress_interval == 0 or (
+                    total_hosts is not None and (idx + 1) == total_hosts
+                ):
+                    denom = total_hosts if total_hosts is not None else "?"
+                    print(f"   Processing host {idx + 1}/{denom}...")
 
                 hostname = host.get('hostname')
                 if not hostname:
@@ -284,21 +326,42 @@ class MemgraphIngestion:
                 # vscode_extensions, chrome_extensions, ...). It is the cleanest
                 # signal for separating "user-installed apps" (Shadow IT surface)
                 # from "OS / language / extension transitive deps".
-                software_list = host.get('software', [])
-                if software_list:
-                    cleaned_software = []
-                    for s in software_list:
-                        if s.get('name'):
-                            cleaned_software.append({
-                                'name': s.get('name'),
-                                'version': s.get('version') or 'unknown',
-                                'source': (s.get('source') or '').strip(),
+                #
+                # Short-circuit: if Fleet's `software_updated_at` for this host
+                # matches the value we persisted on the last SUCCESSFUL rel
+                # sync AND the host has ≥1 INSTALLED_ON edge (per prefetch
+                # above), the software inventory is unchanged. Skip the rel
+                # rebuild — at 100k hosts with low churn this is the
+                # difference between a 30-minute cycle and a 30-hour cycle.
+                # Self-healing: any host missing the watermark, or with no
+                # edges, or with a changed timestamp, falls through to full
+                # ingest. User rels + Host MERGE still run unconditionally
+                # above so seen_time, team_id, USES edges stay fresh.
+                fleet_sw_updated = host.get('software_updated_at')
+                skip_sw = (
+                    bool(fleet_sw_updated)
+                    and sw_synced_map.get(fleet_host_id) == fleet_sw_updated
+                )
+
+                if skip_sw:
+                    skipped_unchanged_sw += 1
+                else:
+                    software_list = host.get('software', [])
+                    if software_list:
+                        cleaned_software = []
+                        for s in software_list:
+                            if s.get('name'):
+                                cleaned_software.append({
+                                    'name': s.get('name'),
+                                    'version': s.get('version') or 'unknown',
+                                    'source': (s.get('source') or '').strip(),
+                                })
+                        if cleaned_software:
+                            software_grouped_batch.append({
+                                'fleet_host_id': fleet_host_id,
+                                'software_list': cleaned_software,
+                                'fleet_software_updated_at': fleet_sw_updated,
                             })
-                    if cleaned_software:
-                        software_grouped_batch.append({
-                            'fleet_host_id': fleet_host_id,
-                            'software_list': cleaned_software
-                        })
 
                 # Flush Batches.
                 # Ordering invariant: HOSTS MUST FLUSH BEFORE user/software rels in
@@ -334,6 +397,11 @@ class MemgraphIngestion:
                 print(f"   ⚠️  Skipped {skipped_no_id} host(s) with missing fleet id (cannot MERGE without identity).")
             if skipped_no_hostname:
                 print(f"   ⚠️  Skipped {skipped_no_hostname} host(s) with missing hostname.")
+            if skipped_unchanged_sw:
+                print(
+                    f"   ⏭  Skipped software rel rebuild for {skipped_unchanged_sw} host(s) "
+                    f"(software_updated_at unchanged since last successful sync)"
+                )
 
             elapsed = time.time() - start_time
             print(f"✅ Ingestion completed in {elapsed:.2f} seconds")
@@ -536,17 +604,28 @@ class MemgraphIngestion:
                 deduped.append(u)
         return deduped
 
+    # Concurrency knob for software-rel chunk fan-out. 4 worker threads keeps
+    # contention low on Memgraph (UNIQUE-on-Software.name MERGE happens before
+    # chunks fan out, so per-chunk transactions only touch their own
+    # disjoint (host, software) edge subgraphs and avoid each other). Override
+    # via env if Memgraph is sized differently — set to 1 to force serial
+    # execution.
+    _SOFTWARE_REL_PARALLELISM = max(1, int(os.environ.get("INGEST_SW_PARALLELISM", "4")))
+
     def _batch_create_software_grouped(self, session, software_grouped_batch):
         """
         Optimized batch creation of software grouped by host.
-        Structure: [{'hostname': 'h1', 'software_list': [{'name': 's1', 'version': 'v1'}, ...]}, ...]
+        Structure: [{'fleet_host_id': int, 'software_list': [{'name','version','source'}, ...], 'fleet_software_updated_at': str|None}, ...]
         """
         if not software_grouped_batch:
             return
 
         # 1. Flatten for Node Creation (Deduplicated globally for this batch)
-        # We want to ensure all Software nodes exist before linking.
-        
+        # We want to ensure all Software nodes exist before linking. Done in
+        # the calling session (single-writer) so the fanned-out per-chunk
+        # threads below only need MATCH for software, never MERGE — that
+        # eliminates write-write conflicts on the Software UNIQUE index when
+        # chunks share popular software names like 'Quick Look Helper'.
         unique_software_map = {}
         for entry in software_grouped_batch:
             for sw in entry['software_list']:
@@ -579,8 +658,32 @@ class MemgraphIngestion:
         """
         self._execute_with_retry(session, query_nodes, {'software': unique_software_list}, "create software nodes")
 
-        # 3. Create Links (Optimized Grouping)
-        # MATCH Host ONCE per host entry, keyed by stable fleet_host_id.
+        # 3. Per-chunk pipeline: (a) prune stale rels (delta-delete), (b) MERGE
+        # fresh rels, (c) stamp software_updated_at watermark.
+        #
+        # (a) is new behavior — without it, INSTALLED_ON edges accumulate
+        # forever as software is uninstalled in Fleet. Fix: for each host
+        # currently being re-synced, DELETE rels whose Software.name is not in
+        # the incoming list. Empty incoming lists already short-circuit before
+        # this function via the `if cleaned_software:` guard upstream, so we
+        # never accidentally wipe rels for hosts whose software fetch was
+        # truncated by a transport error.
+        #
+        # (b) MATCH-Host + MATCH-Software MERGE rel pattern. Memgraph aborts
+        # transactions exceeding --query-execution-timeout-sec; a single rels
+        # query over a 200-host flush bundle routinely hits ~50k MERGEs and
+        # timed out historically (the May 2026 silent-drop bug). Chunking by
+        # row count + per-chunk transactions keeps each well inside the
+        # timeout.
+        #
+        # (c) Watermark stamped ONLY after rels MERGE succeeds, so failed
+        # chunks fall through to next cycle's short-circuit prefetch.
+        delete_stale_query = """
+            UNWIND $batches AS batch
+            MATCH (h:Host {fleet_host_id: batch.fleet_host_id})<-[r:INSTALLED_ON]-(s:Software)
+            WHERE NOT s.name IN batch.software_names
+            DELETE r
+        """
         query_rels = """
             UNWIND $batches AS batch
             MATCH (h:Host {fleet_host_id: batch.fleet_host_id})
@@ -589,11 +692,110 @@ class MemgraphIngestion:
             MATCH (s:Software {name: sw.name})
             MERGE (s)-[:INSTALLED_ON]->(h)
         """
-        self._execute_with_retry(session, query_rels, {'batches': software_grouped_batch}, "create grouped software rels")
+        mark_synced_query = """
+            UNWIND $batches AS b
+            MATCH (h:Host {fleet_host_id: b.fleet_host_id})
+            SET h.fleet_software_updated_at_synced = b.fleet_software_updated_at
+        """
+
+        # Chunk by total software rows per transaction (not host count) so a
+        # few software-heavy hosts can't blow past the timeout, and so chunks
+        # of many sparse hosts still amortize Bolt round-trips. 5000 rows
+        # keeps each chunk well under 10s on the current cluster.
+        SOFTWARE_REL_CHUNK_ROWS = 5000
+
+        chunks: list = []
+        chunk: list = []
+        chunk_rows = 0
+        for entry in software_grouped_batch:
+            n = len(entry.get('software_list') or [])
+            if chunk and (chunk_rows + n) > SOFTWARE_REL_CHUNK_ROWS:
+                chunks.append((chunk, chunk_rows))
+                chunk = []
+                chunk_rows = 0
+            chunk.append(entry)
+            chunk_rows += n
+        if chunk:
+            chunks.append((chunk, chunk_rows))
+
+        failed_host_ids: list = []
+        failed_lock = threading.Lock()
+
+        def _run_chunk(c: list, rows: int) -> bool:
+            # Each thread opens its own Bolt session — neo4j-driver sessions
+            # are not thread-safe; sharing one across the executor would
+            # deadlock on cursor state. Driver is thread-safe and pools
+            # connections under the hood, so opening N concurrent sessions
+            # is cheap. Returns True on success, False on retryable failure.
+            with self.driver.session() as worker_session:
+                delete_payload = [
+                    {
+                        'fleet_host_id': e['fleet_host_id'],
+                        'software_names': [sw['name'] for sw in e['software_list']],
+                    }
+                    for e in c
+                ]
+                label_d = f"delete stale software rels (chunk hosts={len(c)})"
+                ok = self._execute_with_retry(
+                    worker_session, delete_stale_query, {'batches': delete_payload}, label_d
+                )
+                if not ok:
+                    with failed_lock:
+                        failed_host_ids.extend(e['fleet_host_id'] for e in c)
+                    return False
+
+                label_m = f"create grouped software rels (chunk hosts={len(c)} sw_rows={rows})"
+                ok = self._execute_with_retry(
+                    worker_session, query_rels, {'batches': c}, label_m
+                )
+                if not ok:
+                    with failed_lock:
+                        failed_host_ids.extend(e['fleet_host_id'] for e in c)
+                    return False
+
+                stamps = [
+                    {
+                        'fleet_host_id': e['fleet_host_id'],
+                        'fleet_software_updated_at': e.get('fleet_software_updated_at'),
+                    }
+                    for e in c
+                    if e.get('fleet_software_updated_at')
+                ]
+                if stamps:
+                    self._execute_with_retry(
+                        worker_session, mark_synced_query, {'batches': stamps},
+                        f"stamp software_updated_at_synced ({len(stamps)} hosts)",
+                    )
+                return True
+
+        n_workers = min(self._SOFTWARE_REL_PARALLELISM, max(1, len(chunks)))
+        if n_workers <= 1 or len(chunks) <= 1:
+            for c, rows in chunks:
+                _run_chunk(c, rows)
+        else:
+            # ThreadPoolExecutor wraps any chunk exception into the future;
+            # we don't re-raise because per-chunk failures are already
+            # recorded in failed_host_ids by _run_chunk.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futures = [ex.submit(_run_chunk, c, rows) for c, rows in chunks]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        # Should not happen — _run_chunk traps internally.
+                        # Defensive log so a future regression isn't silent.
+                        print(f"   ⚠️  software rel chunk crashed: {exc}")
+
+        if failed_host_ids:
+            preview = failed_host_ids[:20]
+            more = "" if len(failed_host_ids) <= 20 else f" (+{len(failed_host_ids)-20} more)"
+            print(
+                f"   ⚠️  host_software_rels_failed={len(failed_host_ids)} hosts; "
+                f"fleet_host_ids={preview}{more}"
+            )
 
         # 4. Orphan accounting: count entries whose fleet_host_id had no :Host
         # node at MATCH time (parity with label-orphan telemetry from 260519-j0t).
-        # A single OPTIONAL MATCH against the same in-memory batch; no extra fan-out.
         orphan_query = """
             UNWIND $batches AS batch
             OPTIONAL MATCH (h:Host {fleet_host_id: batch.fleet_host_id})

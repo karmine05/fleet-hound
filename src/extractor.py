@@ -82,7 +82,7 @@ class FleetGraphExtractor:
             page += 1
         return teams
 
-    def __init__(self, fleet_url, api_token, verify: bool = True, timeout: int = 20, debug: bool = False, session=None):
+    def __init__(self, fleet_url, api_token, verify: bool = True, timeout: int = 60, debug: bool = False, session=None):
         self.fleet_url = fleet_url.rstrip('/')
         self.headers = {'Authorization': f'Bearer {api_token}', 'Accept': 'application/json'}
         self.verify = verify
@@ -90,28 +90,40 @@ class FleetGraphExtractor:
         self.debug = debug
         self.session = session or requests.Session()
 
-    def _get(self, path: str, retries: int = 3, **kwargs):
+    def _get(self, path: str, retries: int = 5, timeout: "int | None" = None, **kwargs):
+        """GET with exponential backoff retry on 429/5xx and connection errors.
+
+        retries: bumped from 3 to 5 to cover Cloudflare 502 windows on slow
+            Fleet endpoints (large `/hosts?populate_software=true` pages can
+            blow past CF's 100s upstream timeout — see global CLAUDE.md note).
+            5 attempts with capped exponential backoff gives ~30s total cover.
+        timeout: per-call override of self.timeout. Caller passes e.g. 120 for
+            the host-listing endpoint where populate_software is expensive at
+            10k+ hosts; default (60s) protects everything else.
+        """
         url = f"{self.fleet_url}{path}"
         last_resp = None
+        effective_timeout = timeout if timeout is not None else self.timeout
         for attempt in range(retries):
             try:
                 resp = self.session.get(
                     url,
                     headers=self.headers,
-                    timeout=self.timeout,
+                    timeout=effective_timeout,
                     verify=self.verify,
                     **kwargs,
                 )
                 last_resp = resp
 
-                # Simple retry policy for transient/ratelimit errors.
+                # Retry on transient/ratelimit errors. Cap backoff at 16s so
+                # we don't spend 8 minutes on a hopeless run.
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                     retry_after = resp.headers.get('Retry-After')
-                    backoff = 0.5 * (2 ** attempt)
+                    backoff = min(0.5 * (2 ** attempt), 16.0)
                     if resp.status_code == 429 and retry_after and retry_after.isdigit():
                         backoff = max(backoff, int(retry_after))
                     if self.debug:
-                        print(f"[extractor] GET {path} status={resp.status_code} retrying in {backoff:.1f}s")
+                        print(f"[extractor] GET {path} status={resp.status_code} retrying in {backoff:.1f}s (attempt {attempt + 1}/{retries})")
                     time.sleep(backoff)
                     continue
 
@@ -126,7 +138,7 @@ class FleetGraphExtractor:
                 if self.debug:
                     print(f"[extractor] Request error on {path}: {e}")
                 if attempt < retries - 1:
-                    backoff = 0.5 * (2 ** attempt)
+                    backoff = min(0.5 * (2 ** attempt), 16.0)
                     time.sleep(backoff)
                     continue
                 return None
@@ -134,27 +146,47 @@ class FleetGraphExtractor:
         return last_resp
 
     def extract_host_data(self, team_ids: list = None, since: str = None, since_map: dict = None):
-        """
-        Extract host data with optimized pagination and filtering.
-        
+        """Extract host data, eagerly materializing every page into one list.
+
+        Backward-compat shim around `extract_host_pages` for callers (main.py
+        CLI, ad-hoc scripts) that operate on small fleets where buffering the
+        whole result set is fine. For large fleets prefer `extract_host_pages`
+        and stream into ingestion to bound Python heap usage.
+
         Args:
             team_ids: Optional list of team IDs to filter by.
             since: Global fallback ISO timestamp.
             since_map: Optional dict mapping team_id (str) to ISO timestamp.
         """
-        hosts_data = []
-        
+        hosts_data: list = []
+        for page in self.extract_host_pages(team_ids=team_ids, since=since, since_map=since_map):
+            hosts_data.extend(page)
+        if self.debug:
+            print(f"[extractor] Extracted {len(hosts_data)} hosts total (differential={bool(since)})")
+        return hosts_data
+
+    def extract_host_pages(self, team_ids: list = None, since: str = None, since_map: dict = None):
+        """Generator yielding host pages one at a time. Same params as extract_host_data.
+
+        Designed for streaming ingest: caller iterates pages and hands each
+        directly to ingestion so the full host set never lives in Python heap
+        at once. Each yielded value is a `list[dict]` (one page; may be
+        empty if Fleet returns an empty filter result).
+
+        Tolerates per-page transport failures gracefully — a non-200 response
+        ends iteration with whatever pages have been yielded so far, mirroring
+        the original extract_host_data behavior. The retry layer in `_get`
+        already absorbs 5xx/429.
+        """
         # If no teams specified, use a single None entry to trigger the loop once (default fetch)
         target_teams = team_ids if team_ids else [None]
-        
+
         for team_id in target_teams:
-            # Determine effective 'since' for this specific iteration
             # Determine effective 'since' - use the LATEST of global or team-specific
             current_since = since
             if since_map and team_id is not None:
                 team_since = since_map.get(str(team_id))
                 if team_since and current_since:
-                    # If we have both, taking the MAX ensures we don't re-fetch calls covered by a global sync
                     current_since = max(current_since, team_since)
                 elif team_since:
                     current_since = team_since
@@ -164,27 +196,22 @@ class FleetGraphExtractor:
                 s_label = f" (since {current_since})" if current_since else " (full scan)"
                 print(f"[extractor] Fetching hosts for: {t_label}{s_label}")
 
-            # Define base parameters
             per_page = 500
             params = {
                 'per_page': per_page,
                 'populate_users': True,
-                'populate_software': True
+                'populate_software': True,
             }
             if team_id is not None:
                 params['team_id'] = team_id
 
-            # If doing differential fetch, ensure we sort by updated_at desc
+            # Differential fetch: ensure we sort by updated_at desc so the
+            # early-stop in `_filter_hosts` can short-circuit a deep pagination
+            # walk once we cross the watermark.
             if current_since:
                 params['order_key'] = 'updated_at'
                 params['order_direction'] = 'desc'
 
-            # Sequential pagination driven by meta.has_next_results.
-            # Fleet's PaginationMetadata does not serialize TotalResults
-            # (json tag "-"), so the only reliable signal that more pages
-            # exist is meta.has_next_results. Walk pages 0..N until that
-            # flag is false, the differential cutoff is crossed, or an
-            # error occurs.
             page = 0
             while True:
                 p_params = params.copy()
@@ -193,7 +220,11 @@ class FleetGraphExtractor:
                 if self.debug:
                     print(f"[extractor] Fetching hosts page {page}...")
 
-                resp = self._get("/api/v1/fleet/hosts", params=p_params)
+                # Per-call timeout: populate_software makes Fleet expensive
+                # on big pages. CF upstream tops out near 100s; give the
+                # request 120s, leaving the wrapper's retry to handle the
+                # 502 path if CF gives up first.
+                resp = self._get("/api/v1/fleet/hosts", params=p_params, timeout=120)
                 if not resp or resp.status_code != 200:
                     break
 
@@ -206,7 +237,8 @@ class FleetGraphExtractor:
 
                 page_hosts = data.get('hosts', [])
                 valid_hosts, stop = self._filter_hosts(page_hosts, current_since)
-                hosts_data.extend(valid_hosts)
+                if valid_hosts:
+                    yield valid_hosts
 
                 if stop and current_since:
                     if self.debug:
@@ -220,11 +252,6 @@ class FleetGraphExtractor:
                 page += 1
                 # Light pacing between pages to avoid hammering Fleet.
                 time.sleep(0.2)
-
-        if self.debug:
-            print(f"[extractor] Extracted {len(hosts_data)} hosts total (differential={bool(since)})")
-
-        return hosts_data
 
     def _filter_hosts(self, hosts, current_since):
         """Helper to filter hosts based on 'since'."""

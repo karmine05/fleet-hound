@@ -382,21 +382,41 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
 
         logger.info("etl: extracting hosts (full_scan=%s, since=%s, teams=%s)",
                     cfg.full_scan, global_since, cfg.team_ids or "ALL")
-        hosts = extractor.extract_host_data(
-            team_ids=cfg.team_ids,
-            since=global_since,
-            since_map=since_map,
-        )
+        # Streaming path: extract_host_pages yields one page (~500 hosts) at
+        # a time so peak Python heap stays bounded by page size, not fleet
+        # size. We wrap the generator in a side-effecting iterator that
+        # records host ids + the running count for downstream label-orphan
+        # math and the result struct, then hand it to ingestion as a single
+        # flat iterator of host dicts. This replaces the prior pattern of
+        # materializing the full fleet into a Python list, which OOMed
+        # around ~50k hosts in testing.
         users = extractor.extract_all_users()
-        result.hosts_extracted = len(hosts)
         result.users_extracted = len(users)
-        logger.info("etl: extracted %d hosts, %d users", len(hosts), len(users))
 
-        # --- Label extraction (moved BEFORE host ingest) ---
-        # Labels and membership are fetched here so we can compute orphan ids
-        # (member ids with no corresponding :Host node) BEFORE create_graph_relationships.
-        # This allows the optional supplement path to back-fill missing hosts so the
-        # label sync in the same cycle can create the HAS_LABEL edges (no two-cycle wait).
+        known_host_ids: set = set()
+        hosts_seen = 0
+
+        def _streaming_host_iter():
+            nonlocal hosts_seen
+            for page in extractor.extract_host_pages(
+                team_ids=cfg.team_ids,
+                since=global_since,
+                since_map=since_map,
+            ):
+                for h in page:
+                    hosts_seen += 1
+                    hid = h.get('id')
+                    if hid is not None:
+                        known_host_ids.add(hid)
+                    yield h
+        hosts_iter = _streaming_host_iter()
+        logger.info("etl: extracted users=%d; host extraction will stream", len(users))
+
+        # Label extraction. Membership lists are needed for orphan computation,
+        # but that math now happens AFTER streaming ingest completes (we don't
+        # know `known_host_ids` until the host stream drains). Label payload
+        # is still fetched here so a /labels failure can be logged early —
+        # the actual graph sync happens below post-ingest.
         labels = []
         member_map: dict = {}
         if not cfg.skip_labels:
@@ -419,49 +439,55 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                 labels = []
                 member_map = {}
 
-        # Compute orphan ids: member ids in any label not already in hosts.
-        known_host_ids = {h.get("id") for h in hosts if h.get("id") is not None}
-        all_member_ids: set = set()
-        for ids in member_map.values():
-            all_member_ids.update(ids)
-        orphan_ids = sorted(all_member_ids - known_host_ids)
-        result.label_orphan_count = len(orphan_ids)
-        logger.info(
-            "etl: label orphan ids detected=%d (host ids in Fleet membership with no :Host node)",
-            len(orphan_ids),
-        )
-
-        # Optional supplement fetch: back-fill orphan hosts before ingest so the
-        # label sync in this same cycle can create the missing HAS_LABEL edges.
-        # Honor supplement_orphan_cap during the fan-out, not at the end (CLAUDE.md
-        # pagination-cap rule). Default off; set cfg.supplement_label_orphans=True
-        # or FLEET_SUPPLEMENT_LABEL_ORPHANS=1 (env wiring is a follow-up commit).
-        if cfg.supplement_label_orphans and orphan_ids:
-            cap = cfg.supplement_orphan_cap
-            to_fetch = orphan_ids[:cap]
-            if len(orphan_ids) > cap:
-                logger.warning(
-                    "etl: orphan supplement capped at %d (total=%d); remaining will be "
-                    "fetched in subsequent cycles",
-                    cap, len(orphan_ids),
-                )
-            fetched = 0
-            for oid in to_fetch:
-                host_dict = extractor.extract_host_by_id(oid)
-                if host_dict is not None:
-                    hosts.append(host_dict)
-                    fetched += 1
-            result.label_orphans_fetched = fetched
-            result.hosts_extracted = len(hosts)
-            logger.info(
-                "etl: supplement fetched %d/%d orphan hosts",
-                fetched, len(to_fetch),
-            )
-
         logger.info("etl: ingesting into Memgraph %s", cfg.memgraph_uri)
         with MemgraphIngestion(cfg.memgraph_uri) as ingestion:
             ingestion.create_constraints()
-            ingestion.create_graph_relationships(hosts, extractor, global_users=users)
+            # Streaming ingest — drains hosts_iter, populating known_host_ids
+            # + hosts_seen via the side-effecting wrapper above.
+            ingestion.create_graph_relationships(hosts_iter, extractor, global_users=users)
+            result.hosts_extracted = hosts_seen
+
+            # Now that the host set is fully observed, compute label orphans.
+            all_member_ids: set = set()
+            for ids in member_map.values():
+                all_member_ids.update(ids)
+            orphan_ids = sorted(all_member_ids - known_host_ids)
+            result.label_orphan_count = len(orphan_ids)
+            logger.info(
+                "etl: label orphan ids detected=%d (host ids in Fleet membership with no :Host node)",
+                len(orphan_ids),
+            )
+
+            # Optional supplement fetch — back-fill orphan hosts via per-host
+            # GET /hosts/{id}, then ingest them in a second streaming pass.
+            # Honor supplement_orphan_cap during the fan-out (CLAUDE.md
+            # pagination-cap rule). Skipped by default.
+            if cfg.supplement_label_orphans and orphan_ids:
+                cap = cfg.supplement_orphan_cap
+                to_fetch = orphan_ids[:cap]
+                if len(orphan_ids) > cap:
+                    logger.warning(
+                        "etl: orphan supplement capped at %d (total=%d); remaining will be "
+                        "fetched in subsequent cycles",
+                        cap, len(orphan_ids),
+                    )
+                fetched = 0
+                supplement_hosts: list = []
+                for oid in to_fetch:
+                    host_dict = extractor.extract_host_by_id(oid)
+                    if host_dict is not None:
+                        supplement_hosts.append(host_dict)
+                        fetched += 1
+                if supplement_hosts:
+                    ingestion.create_graph_relationships(
+                        supplement_hosts, extractor, global_users=users,
+                    )
+                    result.hosts_extracted = hosts_seen + fetched
+                result.label_orphans_fetched = fetched
+                logger.info(
+                    "etl: supplement fetched %d/%d orphan hosts",
+                    fetched, len(to_fetch),
+                )
 
             # Label sync stage. Best-effort: matches enrichment/snapshot
             # posture per plan section 2B. /labels failures don't break the
