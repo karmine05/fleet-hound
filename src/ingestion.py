@@ -215,11 +215,15 @@ class MemgraphIngestion:
             
             host_batch = []
             user_rel_batch = []
-            
-            # Grouped software structure: List of {hostname: str, software_list: []}
-            software_grouped_batch = [] 
+
+            # Grouped software structure: List of {fleet_host_id: int, software_list: []}.
+            # Keyed by Fleet's stable id; hostname carried only for diagnostic logs.
+            software_grouped_batch = []
 
             progress_interval = 100 if total_hosts > 500 else 50 if total_hosts > 100 else 25
+
+            skipped_no_id = 0
+            skipped_no_hostname = 0
 
             for idx, host in enumerate(hosts_data):
                 if (idx + 1) % progress_interval == 0 or (idx + 1) == total_hosts:
@@ -227,17 +231,22 @@ class MemgraphIngestion:
 
                 hostname = host.get('hostname')
                 if not hostname:
+                    skipped_no_hostname += 1
                     continue
 
-                # Host Data
-                # fleet_host_id is the stable numeric host identifier from
-                # Fleet. We persist it on the Host node so label-membership
-                # hashes (computed on fleet_host_id, NOT hostname) can MATCH
-                # back to the right Host without depending on the mutable
-                # hostname field.
+                # fleet_host_id is the canonical identity for Host nodes (see
+                # create_constraints docstring). Without it we cannot MERGE
+                # safely — skip rather than create an orphan keyed by NULL.
+                fleet_host_id = host.get('id')
+                if fleet_host_id is None:
+                    skipped_no_id += 1
+                    continue
+
+                # Host Data — fleet_host_id is the MERGE key; all other fields
+                # (hostname included) are written via SET on every cycle.
                 host_batch.append({
                     'hostname': hostname,
-                    'fleet_host_id': host.get('id'),
+                    'fleet_host_id': fleet_host_id,
                     'os_version': host.get('os_version'),
                     'platform': host.get('platform'),
                     'ip': host.get('primary_ip'),
@@ -246,7 +255,7 @@ class MemgraphIngestion:
                     'team_name': host.get('team_name')
                 })
 
-                # User Relationships
+                # User Relationships — match Host by fleet_host_id (stable).
                 extracted_users = self._extract_user_identifiers(host)
                 for uname in extracted_users:
                      # Simple lookup for enrichment
@@ -255,7 +264,7 @@ class MemgraphIngestion:
                         'username': uname,
                         'email': user.get('email') if user else None,
                         'fullname': (user.get('name') or user.get('full_name')) if user else None,
-                        'hostname': hostname
+                        'fleet_host_id': fleet_host_id
                     })
 
                 # Software Data (Grouped)
@@ -277,15 +286,15 @@ class MemgraphIngestion:
                             })
                     if cleaned_software:
                         software_grouped_batch.append({
-                            'hostname': hostname,
+                            'fleet_host_id': fleet_host_id,
                             'software_list': cleaned_software
                         })
 
                 # Flush Batches.
                 # Ordering invariant: HOSTS MUST FLUSH BEFORE user/software rels in
-                # the same iteration because the rel queries MATCH on Host (no
-                # implicit creation). Always flush hosts first when ANY downstream
-                # batch is ready.
+                # the same iteration because the rel queries MATCH on Host by
+                # fleet_host_id (no implicit creation). Always flush hosts first
+                # when ANY downstream batch is ready.
                 hosts_full = len(host_batch) >= HOST_BATCH_SIZE
                 users_full = len(user_rel_batch) >= USER_BATCH_SIZE
                 software_full = len(software_grouped_batch) >= 200
@@ -310,6 +319,11 @@ class MemgraphIngestion:
                 self._batch_create_user_relationships(session, user_rel_batch)
             if software_grouped_batch:
                 self._batch_create_software_grouped(session, software_grouped_batch)
+
+            if skipped_no_id:
+                print(f"   ⚠️  Skipped {skipped_no_id} host(s) with missing fleet id (cannot MERGE without identity).")
+            if skipped_no_hostname:
+                print(f"   ⚠️  Skipped {skipped_no_hostname} host(s) with missing hostname.")
 
             elapsed = time.time() - start_time
             print(f"✅ Ingestion completed in {elapsed:.2f} seconds")
@@ -380,14 +394,20 @@ class MemgraphIngestion:
         self._execute_with_retry(session, query, {'users': user_batch}, "create user batch")
 
     def _batch_create_hosts(self, session, host_batch):
-        """Batch create hosts using UNWIND."""
+        """Batch create hosts using UNWIND.
+
+        MERGE keyed by fleet_host_id (Fleet's stable numeric id, guaranteed
+        non-null by the ingest-loop guard). Hostname is written via SET on
+        every cycle so case-drift or rename in Fleet updates the display
+        label without spawning a new node.
+        """
         if not host_batch:
             return
 
         query = """
             UNWIND $hosts AS host
-            MERGE (h:Host {hostname: host.hostname})
-            SET h.fleet_host_id = host.fleet_host_id,
+            MERGE (h:Host {fleet_host_id: host.fleet_host_id})
+            SET h.hostname = host.hostname,
                 h.os_version = host.os_version,
                 h.platform = host.platform,
                 h.ip = host.ip,
@@ -400,16 +420,17 @@ class MemgraphIngestion:
     def _batch_create_user_relationships(self, session, user_rel_batch):
         """Batch create user-host relationships using UNWIND.
 
-        Uses MATCH on Host to avoid creating ghost host nodes (with no platform/
-        team metadata) when the host hasn't been ingested yet in this batch run.
-        Hosts must be created via _batch_create_hosts before this is called.
+        Matches Host by fleet_host_id (stable identity) to avoid creating
+        ghost host nodes and to remain correct when hostname casing drifts
+        between cycles. Hosts must be created via _batch_create_hosts before
+        this is called.
         """
         if not user_rel_batch:
             return
 
         query = """
             UNWIND $rels AS rel
-            MATCH (h:Host {hostname: rel.hostname})
+            MATCH (h:Host {fleet_host_id: rel.fleet_host_id})
             MERGE (u:User {username: rel.username})
             SET u.email = rel.email, u.fullname = rel.fullname
             MERGE (u)-[:USES]->(h)
@@ -458,11 +479,12 @@ class MemgraphIngestion:
         self._execute_with_retry(session, query_nodes, {'software': unique_software_batch}, "create software nodes")
 
         # 3. Create relationships using MATCH on both endpoints to avoid ghost hosts.
-        # Hosts must be ingested via _batch_create_hosts before this runs.
+        # Host MATCH is keyed by fleet_host_id (stable identity); hosts must be
+        # ingested via _batch_create_hosts before this runs.
         query_rels = """
             UNWIND $software AS sw
             MATCH (s:Software {name: sw.name})
-            MATCH (h:Host {hostname: sw.hostname})
+            MATCH (h:Host {fleet_host_id: sw.fleet_host_id})
             MERGE (s)-[:INSTALLED_ON]->(h)
         """
         self._execute_with_retry(session, query_rels, {'software': software_batch}, "create software rels")
@@ -547,10 +569,10 @@ class MemgraphIngestion:
         self._execute_with_retry(session, query_nodes, {'software': unique_software_list}, "create software nodes")
 
         # 3. Create Links (Optimized Grouping)
-        # Instead of matching Host for every software item, we Match Host ONCE per host entry
+        # MATCH Host ONCE per host entry, keyed by stable fleet_host_id.
         query_rels = """
             UNWIND $batches AS batch
-            MATCH (h:Host {hostname: batch.hostname})
+            MATCH (h:Host {fleet_host_id: batch.fleet_host_id})
             WITH h, batch
             UNWIND batch.software_list AS sw
             MATCH (s:Software {name: sw.name})
