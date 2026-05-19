@@ -105,19 +105,25 @@ python3 main.py --full-scan
 ```bash
 open http://localhost:8080
 ```
-# Required:    FLEET_URL, FLEET_API_TOKEN
-# Strongly recommended for any deployment beyond a single-laptop demo:
-#   WEBVIZ_API_TOKEN=$(openssl rand -hex 32)
-#   MEMGRAPH_USER=memgraph; MEMGRAPH_PASSWORD=$(openssl rand -hex 32)
-$EDITOR .env
 
-# 2. Start Memgraph + the dashboard
-./start.sh
+**Optional: Start + sync in one command**
 
-# 3. Pull data from Fleet → Memgraph (initial baseline)
-python3 main.py --full-scan
+```bash
+# Boot stack and immediately run full sync
+./start.sh --full-scan
+```
 
-# 4. Open the dashboard
+---
+
+## Environment variables
+
+**Required:**
+- `FLEET_URL` - Your Fleet server URL
+- `FLEET_API_TOKEN` - Fleet API bearer token
+
+**Recommended for production:**
+- `WEBVIZ_API_TOKEN` - Dashboard API token (generate with `openssl rand -hex 32`)
+- `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` - Database authentication
 open http://localhost:8080
 ```
 
