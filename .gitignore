@@ -75,6 +75,7 @@ config/*
 .pytest_cache/
 .coverage
 htmlcov/
+tests/
 
 # Documentation builds
 docs/_build/
