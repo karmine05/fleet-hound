@@ -44,7 +44,13 @@ from typing import Callable, Optional
 # Container layout: /app holds webviz/, src/, categorize_software.py.
 sys.path.insert(0, "/app")
 
-from src.etl import ETLConfig, run_etl  # noqa: E402
+from src.etl import (  # noqa: E402
+    ETLConfig,
+    run_etl,
+    load_full_scan_cadence,
+    save_full_scan_cadence,
+    should_force_full_scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -389,17 +395,50 @@ def _loop(driver_provider: Callable, status: _SharedStatus, *,
           enricher_trigger_path: str,
           audit_log_path: str) -> None:
     last_trigger_seen = _trigger_mtime(trigger_path)
-    cycles_since_full_scan = 0
+    # Restore cadence state from disk so restarts continue counting from the
+    # prior value instead of resetting to 0 (260519-k2n fix).
+    cycles_since_full_scan, last_full_scan_iso = load_full_scan_cadence(state_path)
 
     while not stop_event.is_set():
         cycle_started = datetime.now(timezone.utc)
         cycle_id = status.next_cycle_id
 
-        full_scan = bool(full_scan_every > 0 and cycles_since_full_scan >= full_scan_every)
+        full_scan, reason = should_force_full_scan(
+            cycles_since_full_scan,
+            last_full_scan_iso,
+            full_scan_every,
+            float(interval_sec),
+        )
         if full_scan:
+            # Capture pre-reset values for the log line before zeroing counters.
+            _prior_cycles = cycles_since_full_scan
+            _prior_iso = last_full_scan_iso
             cycles_since_full_scan = 0
+            last_full_scan_iso = datetime.now(timezone.utc).isoformat()
+            # Persist BEFORE run_etl so a mid-cycle crash doesn't loop
+            # full-scans on every subsequent restart.
+            save_full_scan_cadence(
+                state_path,
+                cycles_since_full_scan=cycles_since_full_scan,
+                last_full_scan_iso=last_full_scan_iso,
+            )
+            logger.info(
+                "ooda: forcing full_scan (reason=%s, cycles=%d, last=%s)",
+                reason,
+                _prior_cycles,
+                _prior_iso,
+            )
         else:
             cycles_since_full_scan += 1
+            # If last_full_scan_iso is None (first ever cycle), seed it now so
+            # subsequent elapsed-time math has a reference point.
+            if last_full_scan_iso is None:
+                last_full_scan_iso = datetime.now(timezone.utc).isoformat()
+            save_full_scan_cadence(
+                state_path,
+                cycles_since_full_scan=cycles_since_full_scan,
+                last_full_scan_iso=last_full_scan_iso,
+            )
 
         phases: list[dict] = []
         cycle_error: Optional[str] = None

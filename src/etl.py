@@ -224,6 +224,84 @@ def save_state(state_path: str, state: dict) -> None:
                 pass
 
 
+def load_full_scan_cadence(state_path: str) -> tuple:
+    """Return (cycles_since_full_scan: int, last_full_scan_iso: Optional[str]).
+
+    Reads the two cadence keys added in plan 260519-k2n from .state.json.
+    Missing or malformed keys are silently defaulted: (0, None).
+    Never raises.
+    """
+    state = load_state(state_path)
+    try:
+        cycles = int(state.get("cycles_since_full_scan", 0))
+    except (TypeError, ValueError):
+        cycles = 0
+    last_iso = state.get("last_full_scan_iso")
+    if not isinstance(last_iso, str) or not last_iso:
+        last_iso = None
+    return (cycles, last_iso)
+
+
+def save_full_scan_cadence(
+    state_path: str,
+    *,
+    cycles_since_full_scan: int,
+    last_full_scan_iso: str,
+) -> None:
+    """Read-modify-write .state.json to persist cadence keys.
+
+    Preserves all existing keys (last_run_timestamp, team_syncs, …)
+    so this is purely additive and backward-compatible.
+    """
+    state = load_state(state_path)
+    state["cycles_since_full_scan"] = cycles_since_full_scan
+    state["last_full_scan_iso"] = last_full_scan_iso
+    save_state(state_path, state)
+
+
+def should_force_full_scan(
+    cycles_since_full_scan: int,
+    last_full_scan_iso: Optional[str],
+    full_scan_every: int,
+    interval_sec: float,
+    now: Optional[datetime] = None,
+) -> tuple:
+    """Decide whether the next cycle should be a full scan.
+
+    Returns (force: bool, reason: Optional[str]) where reason is one of:
+      "count"   — cycles_since_full_scan >= full_scan_every
+      "elapsed" — wall-clock elapsed since last_full_scan_iso >= 1.5x expected window
+      None      — no trigger condition met
+
+    Count threshold is checked first; elapsed-time is the safety net for the
+    post-restart case where the in-memory counter was lost.
+
+    The `now` parameter is injectable for deterministic unit tests; production
+    callers omit it and get datetime.now(timezone.utc).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # Count threshold (primary trigger).
+    if full_scan_every > 0 and cycles_since_full_scan >= full_scan_every:
+        return (True, "count")
+
+    # Elapsed-time guard (secondary trigger / post-restart safety net).
+    threshold_sec = full_scan_every * interval_sec * 1.5
+    if last_full_scan_iso is None:
+        return (True, "elapsed")
+    try:
+        last_dt = datetime.fromisoformat(last_full_scan_iso.replace("Z", "+00:00"))
+        elapsed = (now - last_dt).total_seconds()
+        if elapsed >= threshold_sec:
+            return (True, "elapsed")
+    except ValueError:
+        # Unparseable ISO → treat as never ran.
+        return (True, "elapsed")
+
+    return (False, None)
+
+
 def _resolve_token(cfg: ETLConfig) -> Optional[str]:
     if cfg.api_token:
         logger.info("etl: using API token authentication")
