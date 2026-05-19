@@ -63,25 +63,48 @@ Two long-lived services run under Docker Compose: `memgraph` (the graph DB) and 
 
 **Prerequisites:** Docker, Docker Compose, Python 3.x, and a Fleet API token.
 
-### Set up Python environment
+### Getting Started (5 minutes)
+
+**Step 1: Set up the environment**
 
 ```bash
-# Create virtual environment (required for Homebrew Python 3.10+)
-python3 -m venv venv
-
-# Activate it in your shell
-source venv/bin/activate  # macOS/Linux
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
-pip install -r requirements.txt
+# One-time setup
+./setup.sh
 ```
 
-### Configure
+**Step 2: Configure Fleet connection**
 
 ```bash
-# 1. Configure
+# Copy example env file
 cp .env.example .env
+
+# Edit with your Fleet credentials
+# Required: FLEET_URL, FLEET_API_TOKEN
+$EDITOR .env
+```
+
+**Step 3: Start the stack**
+
+```bash
+# Boot Memgraph + dashboard
+./start.sh
+```
+
+**Step 4: Pull your first data**
+
+```bash
+# Activate venv if not already done
+source venv/bin/activate
+
+# Initial baseline sync
+python3 main.py --full-scan
+```
+
+**Step 5: Open the dashboard**
+
+```bash
+open http://localhost:8080
+```
 # Required:    FLEET_URL, FLEET_API_TOKEN
 # Strongly recommended for any deployment beyond a single-laptop demo:
 #   WEBVIZ_API_TOKEN=$(openssl rand -hex 32)
@@ -98,101 +121,39 @@ python3 main.py --full-scan
 open http://localhost:8080
 ```
 
-The compose file binds webviz to `127.0.0.1:8080` by default — front it with a reverse proxy that terminates TLS and auth before exposing to non-loopback clients.
+The dashboard runs on `http://localhost:8080`. Front it with a reverse proxy for TLS + auth in production.
 
 ---
 
-## Operations
+## Common operations
 
 ### Sync data
 
 ```bash
-python3 main.py                          # delta sync; uses .state.json cutoff
-python3 main.py --teams 1,2              # team-scoped
-python3 main.py --full-scan              # ignore cutoff, refetch everything
+python3 main.py                  # Delta sync (incremental)
+python3 main.py --full-scan      # Full resync
+python3 main.py --teams 1,2      # Team-scoped sync
 ```
 
 ### Wipe and re-baseline
 
 ```bash
-python3 clear_db.py --yes
-python3 main.py --full-scan
+python3 clear_db.py --yes        # Clear database + reset state
+python3 main.py --full-scan      # Fresh baseline
 ```
 
-### Inspect Memgraph
+### Check logs
 
 ```bash
-docker exec -it fleet-memgraph mgconsole --use-ssl=false
-> MATCH (n) RETURN labels(n)[0] AS label, count(*) AS n;
+docker logs fleet-webviz         # Dashboard logs
+docker logs fleet-memgraph       # Database logs
 ```
 
-### Smoke test
+### Stop the stack
 
 ```bash
-FH_BASE=http://127.0.0.1:8080 FH_TOKEN=$WEBVIZ_API_TOKEN ./scripts/smoke.sh
+./stop.sh
 ```
-
-Exit 0 = green. Run after every deploy and as the post-rollback verification step.
-
-### Rotate the API token
-
-1. Generate a new token: `openssl rand -hex 32`
-2. Update `.env` (or the secret backing `WEBVIZ_API_TOKEN_FILE`)
-3. `docker compose up -d webviz`
-4. Update any CI/scripts that consume the token
-5. Run `./scripts/smoke.sh`
-
-### Health & logs
-
-| Endpoint | Purpose | Notes |
-|---|---|---|
-| `GET /api/health` | Container healthcheck | 200 healthy / 503 DB unreachable. Always public. |
-| `GET /api/meta` | Topbar pill (counts) | Cheap label-count query. Fronted by auth. |
-| `docker logs fleet-webviz` | App logs | gunicorn access + `app` logger structured-ish lines |
-| `docker logs fleet-memgraph` | DB logs | tune `--log-level=` in `config/memgraph.conf` |
-
-### App rollback
-
-The data plane is stateful (Memgraph) but the deploy artifact is not. Roll back by re-deploying a previous tagged image of `fleet-webviz`:
-
-```bash
-docker compose stop webviz
-docker tag fleet-webviz:current fleet-webviz:pre-rollback
-docker tag fleet-webviz:<previous-good-tag> fleet-webviz:current
-docker compose up -d webviz
-./scripts/smoke.sh                      # green is required to declare rollback complete
-```
-
-### Data restore
-
-Memgraph keeps `--storage-snapshot-retention-count=3` snapshots in its data volume. If the data layer was corrupted by a bad ingest, restore from the latest snapshot:
-
-```bash
-docker compose stop memgraph
-VOL=$(docker volume ls --format '{{.Name}}' | grep '_memgraph-data$' | head -1)  # e.g. prod_memgraph-data
-docker run --rm -v "$VOL":/data alpine \
-  sh -c 'cp /data/snapshots/<latest>.snapshot /data/durable.cypherl || true'
-docker compose start memgraph
-```
-
-Verify the exact snapshot path with `docker exec fleet-memgraph ls -1 /var/lib/memgraph/snapshots`.
-
-### Incident first responses
-
-| Symptom | First check | Likely cause |
-|---|---|---|
-| Dashboard 401 from a browser | `WEBVIZ_API_TOKEN` env vs. token entered in browser prompt | Token rotation didn't reach the client |
-| Dashboard 503 on every route | `docker logs fleet-memgraph` | Memgraph crash / OOM — see `--memory-limit` in `config/memgraph.conf` |
-| Sync hangs on `categorize_software` | Check Wikidata response | Rate-limited; safe to ctrl-c, sync state already saved |
-| `cannot add label '<X>'` from Fleet | Reserved Fleet built-in labels | Trying to redeclare a Fleet built-in |
-| `/api/relationships` empty | Auth posture mismatch | Add `Authorization: Bearer <token>` |
-
-### Known limitations
-
-- **No multi-tenant auth.** A single shared token gates the API. Build a real session/SSO layer before exposing the dashboard to multiple orgs.
-- **Force-graph perf cap** at 800 nodes for the overview view — search/expand to drill in.
-- **Wikidata enrichment is best-effort.** Rate limits and missing entries are normal; categorization runs degrade gracefully.
-- **`.state.json` is per-CWD.** Run `main.py` from the same working directory across syncs (the `prod/` dir).
 
 ![Shadow IT Detection](assets/PIC-2.png)
 
