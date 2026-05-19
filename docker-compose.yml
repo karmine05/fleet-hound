@@ -1,3 +1,5 @@
+name: fleet-hound
+
 services:
   # Memgraph Database
   memgraph:
