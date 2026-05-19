@@ -708,7 +708,12 @@ class MemgraphIngestion:
         """Hash-skip + per-host symmetric diff (TODO-1, formerly hybrid C+B).
 
         Three paths:
-          1. Hash match → zero edge writes (skip entirely).
+          1. Hash match → drift check, then zero edge writes (skip entirely).
+             Drift check: live count(HAS_LABEL) must equal len(member_ids).
+             If they diverge, the persisted blob is "stale-correct" but the
+             graph has lost (or never created) edges — fall through to the
+             full-rewrite repair path. Without this check, drift is sticky:
+             every subsequent cycle sees hash-match and never recovers.
           2. Hash mismatch + prior member blob present → per-host delta.
              Decode prior set; new set = current Fleet members; emit
              DELETEs for `prior - new` and MERGEs for `new - prior`.
@@ -730,20 +735,40 @@ class MemgraphIngestion:
         prior_hash = prior["h"] if prior else None
         prior_blob = prior["blob"] if prior else None
 
+        expected_count = sum(1 for h in member_ids if h is not None)
+
         if prior_hash == new_hash:
-            # Hash match → zero edge writes. last_synced_iso already updated
-            # in _batch_merge_labels for ALL labels in this cycle.
-            return (False, 0, 0)
+            # Drift check before honoring the fast-path skip. Counts the
+            # live HAS_LABEL edges from any Host to this Label; cheap because
+            # Memgraph indexes Label.fleet_id and HAS_LABEL is a typed edge.
+            count_rec = session.run(
+                "MATCH (:Host)-[r:HAS_LABEL]->(:Label {fleet_id: $fid}) "
+                "RETURN count(r) AS c",
+                fid=fleet_id,
+            ).single()
+            live_edges = count_rec["c"] if count_rec else 0
+            if live_edges == expected_count:
+                # Hash match AND graph state consistent → safe to skip.
+                # last_synced_iso already updated in _batch_merge_labels.
+                return (False, 0, 0)
+            # Drift detected: fall through to full-rewrite repair. Don't
+            # trust the prior blob/hash because either the graph lost edges
+            # since the last sync, or the prior cycle's MERGE silently
+            # no-op'd for hosts that hadn't been ingested yet. The
+            # full-rewrite path is idempotent and converges the graph.
 
         new_set = set(int(h) for h in member_ids if h is not None)
         new_blob = encode_label_member_blob(new_set)
         prior_set = decode_label_member_blob(prior_blob)
 
-        if prior_set is None:
-            # No prior blob (first cycle after upgrade, or decode failed).
-            # Fall back to the legacy full-rewrite path so the graph
-            # converges to the correct state. Next cycle will have the blob
-            # and the delta path takes over.
+        # When the hash-match drift check fell through, the persisted blob
+        # is stale-correct against truth but the graph diverges from it.
+        # Forcing the full-rewrite path here repairs in one shot — delta
+        # against `prior_set` would compute zero-diff and silently re-skip.
+        if prior_hash == new_hash or prior_set is None:
+            # No prior blob (first cycle after upgrade or decode failed),
+            # or drift-repair: full rewrite. Next cycle has the blob and
+            # the delta path takes over.
             edges_added, edges_removed = self._full_rewrite_label_membership(
                 session, fleet_id, new_set,
             )
@@ -829,7 +854,16 @@ class MemgraphIngestion:
                 {"hids": sorted_ids, "fid": fleet_id},
                 "re-merge HAS_LABEL edges (full rewrite fallback)",
             )
-            edges_added = len(sorted_ids)
+            # Count actual merged edges, not requested. If a Host node is
+            # missing (member id present in Fleet but not yet ingested),
+            # the MATCH drops that row and MERGE no-ops — counting len(ids)
+            # would overcount and mask the gap.
+            post_rec = session.run(
+                "MATCH (:Host)-[r:HAS_LABEL]->(:Label {fleet_id: $fid}) "
+                "RETURN count(r) AS c",
+                fid=fleet_id,
+            ).single()
+            edges_added = post_rec["c"] if post_rec else 0
         else:
             edges_added = 0
 
