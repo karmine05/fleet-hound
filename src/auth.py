@@ -1,6 +1,9 @@
+import logging
 from typing import Optional, Tuple
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class FleetAuthenticator:
@@ -33,28 +36,28 @@ class FleetAuthenticator:
             )
         except requests.exceptions.SSLError as e:
             if debug:
-                print(f"[auth] SSL error: {e}. Retry with --insecure if using self-signed cert.")
+                logger.error("SSL error: %s; retry with --insecure if using self-signed cert", e)
             return None
         except requests.exceptions.RequestException as e:
             if debug:
-                print(f"[auth] Request exception: {e}")
+                logger.warning("request exception: %s", e)
             return None
 
         if debug:
             snippet = response.text[:300].replace('\n', ' ')
-            print(f"[auth] Status={response.status_code} Body[0:300]='{snippet}'")
+            logger.debug("login status=%d body[0:300]=%r", response.status_code, snippet)
 
         if response.status_code == 200:
             try:
                 data = response.json()
             except ValueError:
                 if debug:
-                    print("[auth] Login response was not valid JSON")
+                    logger.warning("login response was not valid JSON")
                 return None
             # Common token locations
             token = data.get("token") or data.get("access_token") or data.get("api_token")
             if not token and debug:
-                print(f"[auth] Token not found in response keys: {list(data.keys())}")
+                logger.warning("token not found in response keys=%s", list(data.keys()))
             return token
         return None
 

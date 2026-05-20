@@ -19,6 +19,8 @@ from src.extractor import FleetGraphExtractor
 STATE_FILE = '.state.json'
 SNAPSHOT_DIR = 'config/snapshots'
 
+logger = logging.getLogger("fleethound.main")
+
 
 def load_env_file(env_path: str = '.env') -> dict:
     env_vars: dict[str, str] = {}
@@ -46,39 +48,39 @@ def str_to_bool(value: str) -> bool:
 
 def _interactive_team_select(fleet_url: str, token: str, insecure: bool, debug: bool) -> list[int]:
     extractor = FleetGraphExtractor(fleet_url, token, verify=not insecure, debug=debug)
-    print("⏳ Fetching teams...")
+    logger.info("fetching teams")
     teams = extractor.extract_teams()
     if not teams:
-        print("ℹ️  No teams found (or insufficient permissions). Fetching ALL data.")
+        logger.info("no teams found or insufficient permissions; fetching ALL data")
         return []
-    print("\n🏢 Available Teams:")
+    print("\nAvailable teams:")
     print(f"   {'[0]':<6} No Team (Unassigned)")
     for t in teams:
         tid = t.get('id', '?')
         tname = t.get('name', 'Unknown')
         print(f"   [{tid}]:   {tname}")
-    print("\n👉 Select teams by ID (comma-separated, e.g. '1,2') or press ENTER for ALL:")
+    print("\nSelect teams by ID (comma-separated, e.g. '1,2') or press ENTER for ALL:")
     selection = input("   > ").strip()
     if not selection:
-        print("ℹ️  No specific teams selected. Fetching ALL data.")
+        logger.info("no specific teams selected; fetching ALL data")
         return []
     try:
         return list({int(x.strip()) for x in selection.split(',') if x.strip()})
     except ValueError:
-        print("❌ Invalid input. Fetching ALL teams.")
+        logger.warning("invalid team input; fetching ALL teams")
         return []
 
 
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s %(levelname)-7s %(name)s | %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
     )
 
     env_vars = load_env_file('.env')
     if not env_vars and not Path('.env').exists() and Path('.env.example').exists():
-        print("⚠️  WARNING: .env file not found! Copy .env.example to .env first:")
-        print("   cp .env.example .env\n")
+        logger.warning(".env file not found; copy .env.example to .env first (`cp .env.example .env`)")
 
     parser = argparse.ArgumentParser(
         description="Fleet Hound: Extract Fleet data and ingest into Memgraph",
@@ -107,10 +109,10 @@ def main() -> int:
     debug = args.debug_auth or str_to_bool(env_vars.get('DEBUG', 'false'))
 
     if not fleet_url:
-        print("❌ ERROR: FLEET_URL is required (set in .env or use --fleet-url)")
+        logger.error("FLEET_URL is required (set in .env or use --fleet-url)")
         return 1
     if not (api_token or (email and password)):
-        print("❌ ERROR: Provide FLEET_API_TOKEN (preferred) or FLEET_EMAIL+FLEET_PASSWORD in .env")
+        logger.error("provide FLEET_API_TOKEN (preferred) or FLEET_EMAIL+FLEET_PASSWORD in .env")
         return 1
 
     # --dump-host-sample bypasses the full ETL — keep it as a thin diagnostic.
@@ -122,16 +124,16 @@ def main() -> int:
             auth = FleetAuthenticator(fleet_url, verify=not insecure)
             token = auth.login(email, password, debug=debug)
             if not token:
-                print("❌ Login failed.")
+                logger.error("login failed")
                 return 1
         ext = FleetGraphExtractor(fleet_url, token, verify=not insecure, debug=debug)
         hosts = ext.extract_host_data(team_ids=[], since=None, since_map={})
         if hosts:
             with open('hosts_sample.json', 'w') as fh:
                 json.dump(hosts[0], fh, indent=2)
-            print('📄 Wrote hosts_sample.json (first host object).')
+            logger.info("wrote hosts_sample.json (first host object)")
         else:
-            print('ℹ️  No hosts extracted.')
+            logger.info("no hosts extracted")
         return 0
 
     team_ids: list[int] = []
@@ -139,7 +141,7 @@ def main() -> int:
         try:
             team_ids = [int(t.strip()) for t in args.teams.split(',') if t.strip()]
         except ValueError:
-            print("❌ ERROR: --teams must be comma-separated integers")
+            logger.error("--teams must be comma-separated integers")
             return 1
     elif sys.stdin.isatty() and not args.full_scan:
         # Interactive selection requires an authenticated extractor.
@@ -150,7 +152,7 @@ def main() -> int:
             auth = FleetAuthenticator(fleet_url, verify=not insecure)
             tok = auth.login(email, password, debug=debug)
             if not tok:
-                print("❌ Login failed.")
+                logger.error("login failed")
                 return 1
         team_ids = _interactive_team_select(fleet_url, tok, insecure, debug)
 
@@ -173,26 +175,26 @@ def main() -> int:
         enrich_target_names=target_names,
     )
 
-    print(f"📡 Extracting from Fleet: {fleet_url}")
+    logger.info("extracting from Fleet url=%s", fleet_url)
     if insecure:
-        print("⚠️  TLS verification disabled (dev only)")
+        logger.warning("TLS verification disabled (dev only)")
 
     result = run_etl(cfg)
 
     if result.error:
-        print(f"❌ ETL failed: {result.error}")
+        logger.error("ETL failed: %s", result.error)
         return 1
-    print(f"✅ Hosts extracted: {result.hosts_extracted}")
-    print(f"✅ Users extracted: {result.users_extracted}")
+    logger.info("hosts extracted count=%d", result.hosts_extracted)
+    logger.info("users extracted count=%d", result.users_extracted)
     if result.enrichment_error:
-        print(f"⚠️  Enrichment warning: {result.enrichment_error}")
+        logger.warning("enrichment: %s", result.enrichment_error)
     if result.snapshot_path:
-        print(f"📸 Snapshot: {result.snapshot_path}")
+        logger.info("snapshot path=%s", result.snapshot_path)
     elif result.snapshot_error:
-        print(f"⚠️  Snapshot warning: {result.snapshot_error}")
-    print(f"⏱️  Duration: {result.duration_sec:.1f}s")
-    print(f"💾 Synced teams: {result.teams_synced or 'all'}")
-    print("🌐 Dashboard: http://localhost:8080")
+        logger.warning("snapshot: %s", result.snapshot_error)
+    logger.info("duration elapsed=%.1fs", result.duration_sec)
+    logger.info("synced teams=%s", result.teams_synced or "all")
+    logger.info("dashboard url=http://localhost:8080")
     return 0
 
 

@@ -14,6 +14,7 @@ Production-grade defenses against Wikidata's flaky free SPARQL endpoint:
 """
 
 import argparse
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,8 @@ from typing import List, Optional, Tuple
 import requests
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+
+logger = logging.getLogger(__name__)
 
 # Shadow IT filter primitives. Enrichment only targets software that COULD
 # plausibly be Shadow IT — never OS plumbing, dev-language transitive deps,
@@ -101,7 +104,7 @@ def _read_env_int(key: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        print(f"⚠️  {key}={raw!r} is not a valid int; using default {default}")
+        logger.warning("env var %s=%r is not a valid int; using default=%d", key, raw, default)
         return default
 
 
@@ -226,10 +229,10 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
     except (requests.exceptions.Timeout,
             requests.exceptions.ConnectionError,
             requests.exceptions.ChunkedEncodingError) as e:
-        print(f"Wikipedia transient error for '{software_name}': {e}")
+        logger.warning("wikipedia transient error name=%r: %s", software_name, e)
         return EnrichResult.TRANSIENT, None
     except Exception as e:
-        print(f"Wikipedia unexpected error for '{software_name}': {e}")
+        logger.warning("wikipedia unexpected error name=%r: %s", software_name, e)
         return EnrichResult.TRANSIENT, None
 
     if response.status_code == 404:
@@ -238,7 +241,7 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
     if response.status_code == 429:
         retry_after = response.headers.get('Retry-After')
         wait_s = int(retry_after) if (retry_after and retry_after.isdigit()) else 30
-        print(f"⚠️ Rate limited by Wikipedia. Waiting {wait_s}s...")
+        logger.warning("rate limited by wikipedia; waiting %ds", wait_s)
         time.sleep(wait_s)
         return EnrichResult.TRANSIENT, None
     if response.status_code >= 500:
@@ -277,30 +280,9 @@ def run_query_with_retry(session, query, params, max_retries=3):
                 wait_time = 0.5 * (2 ** attempt)
                 time.sleep(wait_time)
             else:
-                print(f"   ⚠️ Failed after {max_retries} attempts: {e}")
+                logger.warning("query failed after %d attempts: %s", max_retries, e)
                 return False
     return False
-
-def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█', print_end="\r"):
-    """
-    Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-        print_end   - Optional  : end character (e.g. "\r", "\r\n") (Str)
-    """
-    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filled_length = int(length * iteration // total)
-    bar = fill * filled_length + '-' * (length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end=print_end)
-    # Print New Line on Complete
-    if iteration == total:
-        print()
 
 def _memgraph_auth():
     """Resolve MEMGRAPH_USER/MEMGRAPH_PASSWORD (with _FILE indirection) to a Bolt auth tuple."""
@@ -321,7 +303,7 @@ def _memgraph_auth():
 
 
 def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 500, target_names=None):
-    print(f"🔗 Connecting to Memgraph at {memgraph_uri}...")
+    logger.info("connecting to memgraph uri=%s", memgraph_uri)
     driver = None
     try:
         driver = GraphDatabase.driver(memgraph_uri, auth=_memgraph_auth())
@@ -331,11 +313,12 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
     except Exception as e:
         if driver is not None:
             driver.close()
-        print(f"❌ Could not connect to Memgraph: {e}")
+        logger.error("could not connect to memgraph: %s", e)
         return
 
     if target_names:
-        print(f"🔍 Fetching specific software items: {', '.join(target_names[:5])}{'...' if len(target_names) > 5 else ''}")
+        preview = ", ".join(target_names[:5]) + ("..." if len(target_names) > 5 else "")
+        logger.info("fetching specific software items=%s", preview)
         software_list = target_names
     else:
         # Per-platform Shadow IT outlier scoping (May 2026 — user request).
@@ -355,19 +338,17 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
         outlier_pct = get_outlier_pct()
         with driver.session() as session:
             thresholds = compute_per_platform_thresholds(session, outlier_pct)
-        print(
-            "🔍 Fetching Shadow-IT-relevant software without categories "
-            f"(per-platform outliers ≤ {int(outlier_pct * 100)}% of platform hosts, "
-            f"min 2; user-app sources only"
-            f"{' - ' + str(limit) + ' max' if limit else ' - ALL'})..."
+        limit_label = f"{limit} max" if limit else "ALL"
+        logger.info(
+            "fetching shadow-IT candidates outlier_pct=%d%% min=2 user_app_sources_only limit=%s",
+            int(outlier_pct * 100), limit_label,
         )
         if not thresholds:
-            print("   (no platforms detected; skipping)")
+            logger.info("no platforms detected; skipping")
             software_list = []
         else:
-            print("   Per-platform thresholds: " + ", ".join(
-                f"{p}={t}" for p, t in sorted(thresholds.items())
-            ))
+            thresholds_str = ", ".join(f"{p}={t}" for p, t in sorted(thresholds.items()))
+            logger.info("per-platform thresholds %s", thresholds_str)
 
             # Per-platform query: pull all uncategorized user-app software
             # whose count of hosts ON THAT PLATFORM is at or below threshold.
@@ -437,21 +418,19 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                 software_list.append(c["name"])
                 if limit and len(software_list) >= limit:
                     break
-            print(
-                f"   Candidates: {len(by_name)} per-platform outliers "
-                f"→ {len(software_list)} after system-package filter "
-                f"({skipped} system packages skipped)"
+            logger.info(
+                "candidates outliers=%d after_system_filter=%d system_skipped=%d",
+                len(by_name), len(software_list), skipped,
             )
 
     if not software_list:
-        print("✅ No software to process.")
+        logger.info("no software to process")
         return
 
     total = len(software_list)
-    print(
-        f"🚀 Processing {total} items "
-        f"(catalog has {_catalog_size()} pre-mapped apps; "
-        f"unknowns fall through to Wikipedia REST)."
+    logger.info(
+        "processing items=%d catalog_size=%d (unknowns fall through to wikipedia REST)",
+        total, _catalog_size(),
     )
 
     processed = 0
@@ -463,9 +442,10 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
     base_sleep = 0.2
 
     http = requests.Session()
+    log_every = max(1, total // 10)  # ~10 progress lines for any input size
     try:
         with driver.session() as session:
-            print_progress_bar(0, total, prefix='Enriching:', suffix='Complete', length=50)
+            logger.info("enrichment starting total=%d", total)
 
             for name in software_list:
                 # Catalog hit doesn't even need to mark an attempt — it's
@@ -494,8 +474,11 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                         catalog_hits += 1
                     consecutive_failures = 0
                     processed += 1
-                    print_progress_bar(processed, total, prefix='Enriching:',
-                                       suffix=f'({updated} updated; {catalog_hits} catalog)', length=50)
+                    if processed % log_every == 0 or processed == total:
+                        logger.info(
+                            "enriching progress=%d/%d updated=%d catalog=%d",
+                            processed, total, updated, catalog_hits,
+                        )
                     continue  # no sleep — local lookup costs nothing
 
                 # Stage 2: Wikipedia REST.
@@ -541,9 +524,11 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                     consecutive_failures += 1
 
                 processed += 1
-                print_progress_bar(processed, total, prefix='Enriching:',
-                                   suffix=f'({updated} hits, {cached_misses} miss-cached, {transient_skips} transient)',
-                                   length=50)
+                if processed % log_every == 0 or processed == total:
+                    logger.info(
+                        "enriching progress=%d/%d hits=%d miss_cached=%d transient=%d",
+                        processed, total, updated, cached_misses, transient_skips,
+                    )
 
                 # Adaptive backoff. After ADAPTIVE_BACKOFF_TRIGGER consecutive
                 # transient failures, sleep longer between requests so we stop
@@ -559,14 +544,22 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
         if driver is not None:
             driver.close()
 
-    print(
-        f"\n🎉 Enrichment finished! "
-        f"{updated} hits ({catalog_hits} from catalog, {updated - catalog_hits} from Wikipedia), "
-        f"{cached_misses} marked as no-entry (cached for {ENRICH_FAILURE_COOLDOWN_DAYS}d), "
-        f"{transient_skips} transient errors (will retry next cycle)."
+    logger.info(
+        "enrichment finished hits=%d catalog=%d wikipedia=%d miss_cached=%d cooldown_days=%d transient=%d",
+        updated, catalog_hits, updated - catalog_hits,
+        cached_misses, ENRICH_FAILURE_COOLDOWN_DAYS, transient_skips,
     )
 
 if __name__ == "__main__":
+    # Stand-alone invocation: set up logging since main.py's basicConfig didn't run.
+    # When called from src/etl.py (importing run_categorization), this block is skipped
+    # and the inherited root logger config from main.py applies.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s %(levelname)-7s %(name)s | %(message)s',
+            datefmt='%Y-%m-%dT%H:%M:%S',
+        )
     parser = argparse.ArgumentParser(description="Enrich software nodes with Wikidata categories.")
     parser.add_argument('--memgraph-uri', default=MEMGRAPH_URI, help="Memgraph Bolt URI (default: from MEMGRAPH_URI or .env)")
     parser.add_argument('--limit', type=int, default=500, help="Maximum items to process (default: 500, use 0 for ALL)")

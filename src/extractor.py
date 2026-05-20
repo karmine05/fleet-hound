@@ -1,6 +1,9 @@
+import logging
 import time
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # Built-in label names that duplicate `host.platform` / `host.os_version` and
 # carry no scoping signal beyond what those properties already encode. Fleet
@@ -45,7 +48,7 @@ class FleetGraphExtractor:
                 data = resp.json()
             except ValueError:
                 if self.debug:
-                    print("[extractor] Failed to parse users JSON")
+                    logger.warning("failed to parse users JSON")
                 break
             page_users = data.get('users', [])
             users.extend(page_users)
@@ -55,7 +58,7 @@ class FleetGraphExtractor:
             # Reduced sleep time - only needed between pages
             time.sleep(0.5)
         if self.debug:
-            print(f"[extractor] Extracted {len(users)} users from /users endpoint")
+            logger.info("extracted users count=%d", len(users))
         return users
 
     def extract_teams(self):
@@ -123,20 +126,23 @@ class FleetGraphExtractor:
                     if resp.status_code == 429 and retry_after and retry_after.isdigit():
                         backoff = max(backoff, int(retry_after))
                     if self.debug:
-                        print(f"[extractor] GET {path} status={resp.status_code} retrying in {backoff:.1f}s (attempt {attempt + 1}/{retries})")
+                        logger.warning(
+                            "GET %s status=%d retrying_in=%.1fs attempt=%d/%d",
+                            path, resp.status_code, backoff, attempt + 1, retries,
+                        )
                     time.sleep(backoff)
                     continue
 
                 if self.debug:
-                    print(f"[extractor] GET {path} status={resp.status_code}")
+                    logger.debug("GET %s status=%d", path, resp.status_code)
                 return resp
             except requests.exceptions.SSLError as e:
                 if self.debug:
-                    print(f"[extractor] SSL error on {path}: {e}")
+                    logger.error("SSL error path=%s: %s", path, e)
                 return None
             except requests.exceptions.RequestException as e:
                 if self.debug:
-                    print(f"[extractor] Request error on {path}: {e}")
+                    logger.warning("request error path=%s: %s", path, e)
                 if attempt < retries - 1:
                     backoff = min(0.5 * (2 ** attempt), 16.0)
                     time.sleep(backoff)
@@ -162,7 +168,7 @@ class FleetGraphExtractor:
         for page in self.extract_host_pages(team_ids=team_ids, since=since, since_map=since_map):
             hosts_data.extend(page)
         if self.debug:
-            print(f"[extractor] Extracted {len(hosts_data)} hosts total (differential={bool(since)})")
+            logger.info("extracted hosts count=%d differential=%s", len(hosts_data), bool(since))
         return hosts_data
 
     def extract_host_pages(self, team_ids: list = None, since: str = None, since_map: dict = None):
@@ -192,9 +198,9 @@ class FleetGraphExtractor:
                     current_since = team_since
 
             if self.debug:
-                t_label = f"Team {team_id}" if team_id is not None else "All Teams"
-                s_label = f" (since {current_since})" if current_since else " (full scan)"
-                print(f"[extractor] Fetching hosts for: {t_label}{s_label}")
+                t_label = f"team={team_id}" if team_id is not None else "team=all"
+                s_label = f" since={current_since}" if current_since else " mode=full_scan"
+                logger.info("fetching hosts %s%s", t_label, s_label)
 
             per_page = 500
             params = {
@@ -218,7 +224,7 @@ class FleetGraphExtractor:
                 p_params['page'] = page
 
                 if self.debug:
-                    print(f"[extractor] Fetching hosts page {page}...")
+                    logger.debug("fetching hosts page=%d", page)
 
                 # Per-call timeout: populate_software makes Fleet expensive
                 # on big pages. CF upstream tops out near 100s; give the
@@ -232,7 +238,7 @@ class FleetGraphExtractor:
                     data = resp.json()
                 except ValueError:
                     if self.debug:
-                        print("[extractor] Failed to parse hosts JSON")
+                        logger.warning("failed to parse hosts JSON")
                     break
 
                 page_hosts = data.get('hosts', [])
@@ -242,7 +248,7 @@ class FleetGraphExtractor:
 
                 if stop and current_since:
                     if self.debug:
-                        print(f"[extractor] Differential cutoff reached on page {page}; stopping.")
+                        logger.info("differential cutoff reached page=%d; stopping", page)
                     break
 
                 meta = data.get('meta', {})
@@ -279,7 +285,7 @@ class FleetGraphExtractor:
                 return resp.json().get('software', [])
             except ValueError:
                 if self.debug:
-                    print(f"[extractor] Failed to parse software JSON for host {host_id}")
+                    logger.warning("failed to parse software JSON host_id=%s", host_id)
         return []
 
     def extract_labels(self, skip_all_builtins: bool = False):
@@ -308,16 +314,16 @@ class FleetGraphExtractor:
             )
             if not resp or resp.status_code != 200:
                 if self.debug:
-                    print(
-                        f"[extractor] /labels failed "
-                        f"status={resp.status_code if resp else 'no-resp'}"
+                    logger.warning(
+                        "/labels failed status=%s",
+                        resp.status_code if resp else "no-resp",
                     )
                 break
             try:
                 data = resp.json()
             except ValueError:
                 if self.debug:
-                    print("[extractor] Failed to parse /labels JSON")
+                    logger.warning("failed to parse /labels JSON")
                 break
             page_labels = data.get('labels', [])
             labels.extend(page_labels)
@@ -338,7 +344,7 @@ class FleetGraphExtractor:
             ]
 
         if self.debug:
-            print(f"[extractor] Extracted {len(labels)} labels (post-filter)")
+            logger.info("extracted labels count=%d (post-filter)", len(labels))
         return labels
 
     def extract_label_host_membership(self, label_id):
@@ -364,16 +370,16 @@ class FleetGraphExtractor:
             )
             if not resp or resp.status_code != 200:
                 if self.debug:
-                    print(
-                        f"[extractor] /labels/{label_id}/hosts failed "
-                        f"status={resp.status_code if resp else 'no-resp'}"
+                    logger.warning(
+                        "/labels/%s/hosts failed status=%s",
+                        label_id, resp.status_code if resp else "no-resp",
                     )
                 return []
             try:
                 data = resp.json()
             except ValueError:
                 if self.debug:
-                    print(f"[extractor] Failed to parse /labels/{label_id}/hosts JSON")
+                    logger.warning("failed to parse /labels/%s/hosts JSON", label_id)
                 return []
             page_hosts = data.get('hosts', [])
             members.extend(page_hosts)
@@ -403,26 +409,26 @@ class FleetGraphExtractor:
         resp = self._get(f"/api/v1/fleet/hosts/{host_id}")
         if resp is None:
             if self.debug:
-                print(f"[extractor] extract_host_by_id({host_id}): no response")
+                logger.warning("extract_host_by_id host_id=%s no_response", host_id)
             return None
         if resp.status_code == 404:
             if self.debug:
-                print(f"[extractor] extract_host_by_id({host_id}): 404 (host gone)")
+                logger.info("extract_host_by_id host_id=%s status=404 (host gone)", host_id)
             return None
         if resp.status_code != 200:
             if self.debug:
-                print(f"[extractor] extract_host_by_id({host_id}): unexpected status={resp.status_code}")
+                logger.warning("extract_host_by_id host_id=%s unexpected_status=%d", host_id, resp.status_code)
             return None
         try:
             data = resp.json()
         except ValueError:
             if self.debug:
-                print(f"[extractor] extract_host_by_id({host_id}): failed to parse JSON")
+                logger.warning("extract_host_by_id host_id=%s failed_to_parse_json", host_id)
             return None
         host = data.get("host")
         if not isinstance(host, dict):
             if self.debug:
-                print(f"[extractor] extract_host_by_id({host_id}): unexpected shape, no 'host' key")
+                logger.warning("extract_host_by_id host_id=%s unexpected_shape (no 'host' key)", host_id)
             return None
         return host
 
@@ -468,5 +474,5 @@ class FleetGraphExtractor:
                 seen.add(c)
                 out.append(c)
         if self.debug:
-            print(f"[extractor] Users for host {host_id}: {out}")
+            logger.debug("users for host_id=%s users=%s", host_id, out)
         return out

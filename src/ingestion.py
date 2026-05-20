@@ -211,7 +211,7 @@ class MemgraphIngestion:
             try:
                 self._dedupe_case_variant_software(session)
             except Exception as exc:
-                print(f"   ⚠️  Software case-variant dedupe skipped: {exc}")
+                logger.warning("software case-variant dedupe skipped: %s", exc)
 
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
@@ -237,7 +237,7 @@ class MemgraphIngestion:
             # 1. Users
             user_lookup = {}
             if global_users:
-                print(f"💾 Ingesting {len(global_users)} users...")
+                logger.info("ingesting users count=%d", len(global_users))
                 user_batch = []
                 for user in global_users:
                     uname = user.get('username') or user.get('email') or user.get('name')
@@ -264,9 +264,9 @@ class MemgraphIngestion:
             except TypeError:
                 total_hosts = None
             if total_hosts is not None:
-                print(f"💾 Ingesting {total_hosts} hosts with relationships...")
+                logger.info("ingesting hosts count=%d", total_hosts)
             else:
-                print(f"💾 Ingesting host stream (size unknown until drained)...")
+                logger.info("ingesting host stream (size unknown until drained)")
 
             host_batch = []
             user_rel_batch = []
@@ -304,7 +304,7 @@ class MemgraphIngestion:
                 for r in rec:
                     sw_synced_map[r['id']] = r['s']
             except Exception as exc:
-                print(f"   ⚠️  sw_synced prefetch failed: {exc}; skipping short-circuit")
+                logger.warning("sw_synced prefetch failed: %s; skipping short-circuit", exc)
                 sw_synced_map = {}
 
             for idx, host in enumerate(hosts_data):
@@ -312,7 +312,7 @@ class MemgraphIngestion:
                     total_hosts is not None and (idx + 1) == total_hosts
                 ):
                     denom = total_hosts if total_hosts is not None else "?"
-                    print(f"   Processing host {idx + 1}/{denom}...")
+                    logger.info("processed hosts=%d/%s", idx + 1, denom)
 
                 hostname = host.get('hostname')
                 if not hostname:
@@ -458,17 +458,17 @@ class MemgraphIngestion:
                 self._batch_create_software_grouped(session, software_grouped_batch)
 
             if skipped_no_id:
-                print(f"   ⚠️  Skipped {skipped_no_id} host(s) with missing fleet id (cannot MERGE without identity).")
+                logger.warning("skipped hosts missing_fleet_id=%d (cannot MERGE without identity)", skipped_no_id)
             if skipped_no_hostname:
-                print(f"   ⚠️  Skipped {skipped_no_hostname} host(s) with missing hostname.")
+                logger.warning("skipped hosts missing_hostname=%d", skipped_no_hostname)
             if skipped_unchanged_sw:
-                print(
-                    f"   ⏭  Skipped software rel rebuild for {skipped_unchanged_sw} host(s) "
-                    f"(software_updated_at unchanged since last successful sync)"
+                logger.info(
+                    "skipped software rel rebuild hosts=%d (software_updated_at unchanged)",
+                    skipped_unchanged_sw,
                 )
 
             elapsed = time.time() - start_time
-            print(f"✅ Ingestion completed in {elapsed:.2f} seconds")
+            logger.info("ingestion completed elapsed=%.2fs", elapsed)
 
     def print_stats(self):
         with self.driver.session() as session:
@@ -483,7 +483,11 @@ class MemgraphIngestion:
             for label, cypher in queries.items():
                 rec = session.run(cypher).single()  # type: ignore[arg-type]
                 counts[label] = rec["c"] if rec else 0
-            print(f"Ingestion stats: Hosts={counts['hosts']} Users={counts['users']} Software={counts['software']} USES={counts['usesRels']} INSTALLED_ON={counts['installedRels']}")
+            logger.info(
+                "ingestion stats hosts=%d users=%d software=%d uses=%d installed_on=%d",
+                counts['hosts'], counts['users'], counts['software'],
+                counts['usesRels'], counts['installedRels'],
+            )
 
     def _execute_with_retry(self, session, query, params, operation_name="operation"):
         """Execute a query with retry logic for transient errors.
@@ -517,7 +521,7 @@ class MemgraphIngestion:
                     wait_time = 0.1 * (2 ** attempt)
                     time.sleep(wait_time)
                 else:
-                    print(f"   ⚠️  Warning: Failed to {operation_name} after {self.max_retries} attempts")
+                    logger.warning("failed to %s after %d attempts", operation_name, self.max_retries)
                     return False
             except (ServiceUnavailable, AuthError):
                 # Connection-level failure. Re-raise so the ETL cycle aborts
@@ -527,7 +531,7 @@ class MemgraphIngestion:
                 # next run will re-fetch everything from the prior watermark.
                 raise
             except Exception as e:
-                print(f"   ⚠️  Warning: Failed to {operation_name}: {e}")
+                logger.warning("failed to %s: %s", operation_name, e)
                 return False
         return False
 
@@ -861,14 +865,14 @@ class MemgraphIngestion:
                     except Exception as exc:
                         # Should not happen — _run_chunk traps internally.
                         # Defensive log so a future regression isn't silent.
-                        print(f"   ⚠️  software rel chunk crashed: {exc}")
+                        logger.warning("software rel chunk crashed: %s", exc)
 
         if failed_host_ids:
             preview = failed_host_ids[:20]
             more = "" if len(failed_host_ids) <= 20 else f" (+{len(failed_host_ids)-20} more)"
-            print(
-                f"   ⚠️  host_software_rels_failed={len(failed_host_ids)} hosts; "
-                f"fleet_host_ids={preview}{more}"
+            logger.warning(
+                "host_software_rels_failed hosts=%d fleet_host_ids=%s%s",
+                len(failed_host_ids), preview, more,
             )
 
         # 4. Orphan accounting: count entries whose fleet_host_id had no :Host
@@ -886,10 +890,9 @@ class MemgraphIngestion:
         except Exception:
             orphans = 0
         if orphans > 0:
-            print(
-                f"   ⚠️  host_software_orphans={orphans}"
-                " (entries with fleet_host_id matching no :Host node"
-                " — software dropped on the floor for those hosts this cycle)"
+            logger.warning(
+                "host_software_orphans=%d (fleet_host_id matched no :Host node — software dropped this cycle)",
+                orphans,
             )
 
     # ------------------------------------------------------------------
@@ -1467,10 +1470,9 @@ class MemgraphIngestion:
         renamed = int(renamed_rec['n']) if renamed_rec else 0
 
         if clusters > 0 or renamed > 0:
-            print(
-                f"   🧹 Software case-dedupe: {clusters} cluster(s) collapsed, "
-                f"{duplicates_removed} duplicate node(s) removed, "
-                f"{renamed} solo node(s) renamed to lowercase"
+            logger.info(
+                "software case-dedupe clusters=%d duplicates_removed=%d renamed=%d",
+                clusters, duplicates_removed, renamed,
             )
         return {'clusters': clusters, 'duplicates_removed': duplicates_removed, 'renamed': renamed}
 
