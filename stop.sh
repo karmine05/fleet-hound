@@ -2,8 +2,10 @@
 # Fleet Hound stop script.
 #
 # Default: graceful shutdown (containers stopped, volumes preserved).
-# --purge: also drop the Memgraph data volume — use only when you want a
-#          completely empty graph on the next ./start.sh.
+# --purge: also drop the Memgraph data volume AND clean host-side / bind-mount
+#          state (./config/.state.json, ./config/snapshots/, ./config/whitelist.json,
+#          ./.state.json, ./.etl.lock). Use only when you want a fully empty
+#          deployment on the next ./start.sh.
 
 set -euo pipefail
 
@@ -31,7 +33,10 @@ for arg in "$@"; do
 ./stop.sh [--purge]
 
   (default)   Stop containers. Memgraph volume + /app/config artifacts kept.
-  --purge     Also drop the Memgraph data volume. NEXT ./start.sh boots empty.
+  --purge     Also drop the Memgraph data volume AND wipe host-side runtime
+              state (./config/.state.json, ./config/snapshots/,
+              ./config/whitelist.json, ./.state.json, ./.etl.lock).
+              NEXT ./start.sh boots with no carry-over.
 USAGE
             exit 0
             ;;
@@ -49,14 +54,39 @@ echo "🩸 Stopping Fleet Hound..."
 if [[ "$PURGE" -eq 1 ]]; then
     warn "Purging Memgraph volume — graph data will be lost."
     "${DOCKER_COMPOSE[@]}" down -v
-else
-    "${DOCKER_COMPOSE[@]}" down
+
+    # `docker compose down -v` removes named volumes only. The webviz service
+    # bind-mounts ./config:/app/config (see docker-compose.yml), so anything
+    # the OODA/enrichment workers wrote into /app/config survives `down -v`
+    # and gets re-loaded on the next start. Wipe those explicitly here.
+    #
+    # Preserves ./config/memgraph.conf — that's config, not state.
+    purge_paths=(
+        # Host-side runtime state (when ETL is invoked from the host with `python3 main.py`).
+        "./.state.json"
+        "./.etl.lock"
+        # Container-side runtime state (bind-mounted from ./config).
+        "./config/.state.json"
+        "./config/whitelist.json"
+        "./config/snapshots"
+    )
+    removed=0
+    for p in "${purge_paths[@]}"; do
+        if [[ -e "$p" ]]; then
+            rm -rf -- "$p"
+            ok "  removed $p"
+            removed=$((removed + 1))
+        fi
+    done
+    if [[ "$removed" -eq 0 ]]; then
+        info "  no host-side state artifacts to remove"
+    fi
 fi
 
 ok "Stack stopped"
 echo
 if [[ "$PURGE" -eq 1 ]]; then
-    info "Volumes were dropped. Run a host-side --full-scan after restart, or rely on the OODA loop's first-cycle full-scan behavior."
+    info "Volumes + host-side state were dropped. Run a host-side --full-scan after restart, or rely on the OODA loop's first-cycle full-scan behavior."
 else
     info "Volumes preserved."
     info "  Restart:        ./start.sh"
