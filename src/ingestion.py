@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -119,7 +120,13 @@ class MemgraphIngestion:
             auth = _memgraph_auth()
         self.driver = GraphDatabase.driver(uri, auth=auth)
         self.batch_size = 5000  # Optimized batch size
-        self.max_retries = 3
+        # 6 retries × 0.5s base exponential with full jitter gives a worst-case
+        # ~16s spread before declaring TransientError fatal. The 3-attempt /
+        # 100ms-base budget previously here dropped chunks under sustained
+        # parallel-MERGE contention on shared :Software nodes — see the
+        # ThreadPoolExecutor fan-out in _batch_create_software_grouped.
+        self.max_retries = 6
+        self._retry_base_sec = 0.5
 
     def close(self):
         """Close the underlying database driver."""
@@ -297,7 +304,7 @@ class MemgraphIngestion:
                 progress_interval = 100 if total_hosts > 500 else 50 if total_hosts > 100 else 25
 
             skipped_no_id = 0
-            skipped_no_hostname = 0
+            synthesized_hostname_ids: list = []
             skipped_unchanged_sw = 0
 
             # Pre-fetch the set of host_ids that already have at least one
@@ -330,11 +337,6 @@ class MemgraphIngestion:
                     denom = total_hosts if total_hosts is not None else "?"
                     logger.info("processed hosts=%d/%s", idx + 1, denom)
 
-                hostname = host.get('hostname')
-                if not hostname:
-                    skipped_no_hostname += 1
-                    continue
-
                 # fleet_host_id is the canonical identity for Host nodes (see
                 # create_constraints docstring). Without it we cannot MERGE
                 # safely — skip rather than create an orphan keyed by NULL.
@@ -342,6 +344,21 @@ class MemgraphIngestion:
                 if fleet_host_id is None:
                     skipped_no_id += 1
                     continue
+
+                # Hostname is mutable display data; fleet_host_id is the MERGE
+                # key. Newly-enrolled hosts, MDM-managed mobile devices, and
+                # hosts that haven't reported osquery `system_info` yet can
+                # surface from Fleet's `/hosts` endpoint with an empty
+                # hostname. Previously we dropped them — which also dropped
+                # their software/user edges from the graph. Synthesize a
+                # placeholder so downstream MERGE/SET writes complete and the
+                # webviz UI has a stable display label until Fleet observes
+                # the real name; log the fleet_host_ids so an operator can
+                # investigate the Fleet-side root cause.
+                hostname = host.get('hostname')
+                if not hostname:
+                    hostname = f"fleet-host-{fleet_host_id}"
+                    synthesized_hostname_ids.append(fleet_host_id)
 
                 # Host Data — fleet_host_id is the MERGE key; all other fields
                 # (hostname included) are written via SET on every cycle.
@@ -486,8 +503,13 @@ class MemgraphIngestion:
 
             if skipped_no_id:
                 logger.warning("skipped hosts missing_fleet_id=%d (cannot MERGE without identity)", skipped_no_id)
-            if skipped_no_hostname:
-                logger.warning("skipped hosts missing_hostname=%d", skipped_no_hostname)
+            if synthesized_hostname_ids:
+                preview = synthesized_hostname_ids[:20]
+                more = "" if len(synthesized_hostname_ids) <= 20 else f" (+{len(synthesized_hostname_ids)-20} more)"
+                logger.warning(
+                    "synthesized hostname=fleet-host-<id> for %d hosts missing hostname in Fleet (fleet_host_ids=%s%s)",
+                    len(synthesized_hostname_ids), preview, more,
+                )
             if skipped_unchanged_sw:
                 logger.info(
                     "skipped software rel rebuild hosts=%d (software_updated_at unchanged)",
@@ -545,8 +567,13 @@ class MemgraphIngestion:
                 return True
             except TransientError:
                 if attempt < self.max_retries - 1:
-                    wait_time = 0.1 * (2 ** attempt)
-                    time.sleep(wait_time)
+                    # Full jitter on exponential backoff. Without jitter, the
+                    # 4 parallel chunk threads each retry in lockstep and
+                    # re-collide on the same :Software node locks, producing
+                    # the same TransientError every attempt and exhausting
+                    # the retry budget while none of them make progress.
+                    backoff = self._retry_base_sec * (2 ** attempt)
+                    time.sleep(random.uniform(0, backoff))
                 else:
                     logger.warning("failed to %s after %d attempts", operation_name, self.max_retries)
                     return False
