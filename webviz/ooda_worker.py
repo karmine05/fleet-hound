@@ -107,7 +107,13 @@ def _append_jsonl(path: str, row: dict) -> None:
     except OSError:
         pass
     try:
-        with open(path, "a", encoding="utf-8") as fh:
+        # Open with explicit 0o600 perms so the cycles log isn't world-readable.
+        # Without this, the file inherits the umask default (0o644) on first
+        # creation, exposing scan cadence + host inventory metadata to other
+        # local users (the file is bind-mounted to the host filesystem via
+        # docker-compose's `./config:/app/config`).
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, separators=(",", ":")) + "\n")
             fh.flush()
     except OSError as exc:
@@ -379,7 +385,10 @@ def _audit_cycle(audit_log_path: str, cycle: CycleRecord) -> None:
         f"uncategorized={cycle.findings_summary.get('uncategorized', 0)}"
     )
     try:
-        with open(audit_log_path, "a", encoding="utf-8") as fh:
+        # 0o600: audit log carries cycle telemetry + may leak scan cadence to
+        # other local users via the bind-mounted /app/config volume.
+        fd = os.open(audit_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError as exc:
         logger.warning("ooda: audit write failed: %s", exc)
