@@ -460,7 +460,15 @@ class MemgraphIngestion:
         """
         for attempt in range(self.max_retries):
             try:
-                session.run(query, **params)
+                # Consume the result so the auto-commit transaction actually
+                # closes before this call returns. Without `.consume()`,
+                # Memgraph may treat the query as still-in-flight; subsequent
+                # sessions opened in OTHER threads (e.g. the parallel-chunk
+                # fan-out below) can MATCH against a snapshot that does not
+                # yet contain rows from this query. Manifests as zero
+                # INSTALLED_ON edges across all hosts on cold containers,
+                # because worker-thread MATCH (s:Software) finds nothing.
+                session.run(query, **params).consume()
                 return True
             except TransientError:
                 if attempt < self.max_retries - 1:
