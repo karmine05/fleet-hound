@@ -867,6 +867,11 @@ def search_all():
     with driver.session() as session:
         nodes = []
         node_ids = set()
+        # Cache raw host records here; we materialize the viz nodes in a second
+        # pass once every host has been collected so display_name can be
+        # disambiguated for hostname collisions (mac.lan #1229 vs mac.lan #1367
+        # — multiple Macs share Fleet's default hostname).
+        host_records_raw: list = []
 
         # Search/load hosts
         if node_type in ['all', 'host']:
@@ -874,7 +879,7 @@ def search_all():
                 # Search hosts by hostname or OS version
                 host_condition = get_search_condition('h.hostname', 'search_term')
                 os_condition = get_search_condition('h.os_version', 'search_term')
-                
+
                 host_query = f"""
                     MATCH (h:Host)
                     WHERE ({host_condition} OR {os_condition})
@@ -884,7 +889,7 @@ def search_all():
                 if team_filter != 'all':
                     host_query += " AND toString(h.team_id) = $team_id"
                 host_query += label_flt_fragment
-                host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
                 # Apply limit to search results too if requested
                 if limit_param > 0:
                     host_query += f" LIMIT {cypher_limit}"
@@ -912,22 +917,20 @@ def search_all():
                 host_query += label_flt_fragment
                 params.update(label_flt_params)
 
-                host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
                 # Apply default limit if no term
                 host_query += f" LIMIT {cypher_limit}"
 
                 host_result = session.run(host_query, **params)
 
             for record in host_result:
-                host_id = f"host_{record['hostname']}"
-                team_info = f" - Team: {record.get('team_name', 'No team')}" if record.get('team_name') else ""
-                nodes.append({
-                    "id": host_id,
-                    "name": record['hostname'],
-                    "type": "host",
-                    "details": f"{record['os_version'] or ''} ({record['platform'] or ''}){team_info}"
+                host_records_raw.append({
+                    'fleet_host_id': record['fleet_host_id'],
+                    'hostname': record['hostname'],
+                    'os_version': record['os_version'],
+                    'platform': record['platform'],
+                    'team_name': record['team_name'],
                 })
-                node_ids.add(host_id)
 
         # Search/load users
         if node_type in ['all', 'user']:
@@ -1087,20 +1090,17 @@ def search_all():
                 host_query += " AND toString(h.team_id) = $team_id"
                 params['team_id'] = team_filter
 
-            host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
 
             host_result = session.run(host_query, **params)
             for record in host_result:
-                host_id = f"host_{record['hostname']}"
-                if host_id not in node_ids:
-                    team_info = f" - Team: {record.get('team_name', 'No team')}" if record.get('team_name') else ""
-                    nodes.append({
-                        "id": host_id,
-                        "name": record['hostname'],
-                        "type": "host",
-                        "details": f"{record['os_version'] or ''} ({record['platform'] or ''}){team_info}"
-                    })
-                    node_ids.add(host_id)
+                host_records_raw.append({
+                    'fleet_host_id': record['fleet_host_id'],
+                    'hostname': record['hostname'],
+                    'os_version': record['os_version'],
+                    'platform': record['platform'],
+                    'team_name': record['team_name'],
+                })
 
         if user_ids_loaded and (node_type == 'user' or node_type == 'all'):
             # Load hosts connected to the users we loaded
@@ -1118,36 +1118,75 @@ def search_all():
                 host_query += " AND toString(h.team_id) = $team_id"
                 params['team_id'] = team_filter
 
-            host_query += " RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
 
             host_result = session.run(host_query, **params)
             for record in host_result:
-                host_id = f"host_{record['hostname']}"
-                if host_id not in node_ids:
-                    team_info = f" - Team: {record.get('team_name', 'No team')}" if record.get('team_name') else ""
-                    nodes.append({
-                        "id": host_id,
-                        "name": record['hostname'],
-                        "type": "host",
-                        "details": f"{record['os_version'] or ''} ({record['platform'] or ''}){team_info}"
-                    })
-                    node_ids.add(host_id)
+                host_records_raw.append({
+                    'fleet_host_id': record['fleet_host_id'],
+                    'hostname': record['hostname'],
+                    'os_version': record['os_version'],
+                    'platform': record['platform'],
+                    'team_name': record['team_name'],
+                })
+
+        # Materialize host viz nodes — dedupe by fleet_host_id, disambiguate
+        # display when hostname collides. Runs AFTER both load passes so we
+        # have the full set of hosts in scope.
+        seen_fids: set = set()
+        host_records_unique: list = []
+        for hr in host_records_raw:
+            fid = hr['fleet_host_id']
+            if fid is None or fid in seen_fids:
+                continue
+            seen_fids.add(fid)
+            host_records_unique.append(hr)
+
+        hostname_counts: dict = {}
+        for hr in host_records_unique:
+            hn = hr['hostname']
+            if hn:
+                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+
+        for hr in host_records_unique:
+            fid = hr['fleet_host_id']
+            hn = hr['hostname']
+            host_id = f"host_{fid}"
+            display_name = (
+                f"{hn} #{fid}"
+                if hn and hostname_counts.get(hn, 0) > 1
+                else hn
+            )
+            team_info = f" - Team: {hr.get('team_name', 'No team')}" if hr.get('team_name') else ""
+            nodes.append({
+                "id": host_id,
+                "name": hn,
+                "display_name": display_name,
+                "fleet_host_id": fid,
+                "type": "host",
+                "details": f"{hr['os_version'] or ''} ({hr['platform'] or ''}){team_info}",
+            })
+            node_ids.add(host_id)
 
         # Now get all relationships between the loaded nodes
         links = []
 
         # Get user-host relationships
         if node_ids:
-            user_host_query = """
-                MATCH (u:User)-[:USES]->(h:Host)
-                WHERE $user_filter OR $host_filter
-                RETURN DISTINCT u.username AS username, h.hostname AS hostname
-            """
-            # Build filter conditions
+            # Build filter conditions. Host filter uses fleet_host_id (the
+            # viz node id key); hostname is NOT unique and would over-match
+            # across collision groups like 4 distinct macs named "mac.lan".
             user_ids_list = [nid.replace('user_', '') for nid in node_ids if nid.startswith('user_')]
-            host_ids_list = [nid.replace('host_', '') for nid in node_ids if nid.startswith('host_')]
+            host_fids_list: list = []
+            for nid in node_ids:
+                if not nid.startswith('host_'):
+                    continue
+                try:
+                    host_fids_list.append(int(nid[len('host_'):]))
+                except ValueError:
+                    continue
 
-            if user_ids_list or host_ids_list:
+            if user_ids_list or host_fids_list:
                 user_host_query = """
                     MATCH (u:User)-[:USES]->(h:Host)
                 """
@@ -1157,9 +1196,9 @@ def search_all():
                 if user_ids_list:
                     conditions.append("u.username IN $user_list")
                     params['user_list'] = user_ids_list
-                if host_ids_list:
-                    conditions.append("h.hostname IN $host_list")
-                    params['host_list'] = host_ids_list
+                if host_fids_list:
+                    conditions.append("h.fleet_host_id IN $host_fid_list")
+                    params['host_fid_list'] = host_fids_list
 
                 if conditions:
                     user_host_query += " WHERE " + " OR ".join(conditions)
@@ -1180,13 +1219,13 @@ def search_all():
                         user_host_query += " WHERE toLower(h.platform) CONTAINS toLower($platform)"
                     params['platform'] = platform_filter
 
-                user_host_query += " RETURN DISTINCT u.username AS username, h.hostname AS hostname"
+                user_host_query += " RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id"
 
                 user_host_result = session.run(user_host_query, **params)
 
                 for record in user_host_result:
                     source_id = f"user_{record['username']}"
-                    target_id = f"host_{record['hostname']}"
+                    target_id = f"host_{record['fleet_host_id']}"
                     if source_id in node_ids and target_id in node_ids:
                         links.append({
                             "source": source_id,
@@ -1197,9 +1236,16 @@ def search_all():
         # Get software-host relationships
         if node_ids:
             software_ids_list = [nid.replace('software_', '') for nid in node_ids if nid.startswith('software_')]
-            host_ids_list = [nid.replace('host_', '') for nid in node_ids if nid.startswith('host_')]
+            host_fids_list = []
+            for nid in node_ids:
+                if not nid.startswith('host_'):
+                    continue
+                try:
+                    host_fids_list.append(int(nid[len('host_'):]))
+                except ValueError:
+                    continue
 
-            if software_ids_list or host_ids_list:
+            if software_ids_list or host_fids_list:
                 software_host_query = """
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 """
@@ -1209,9 +1255,9 @@ def search_all():
                 if software_ids_list:
                     conditions.append("s.name IN $software_list")
                     params['software_list'] = software_ids_list
-                if host_ids_list:
-                    conditions.append("h.hostname IN $host_list")
-                    params['host_list'] = host_ids_list
+                if host_fids_list:
+                    conditions.append("h.fleet_host_id IN $host_fid_list")
+                    params['host_fid_list'] = host_fids_list
 
                 if conditions:
                     software_host_query += " WHERE " + " OR ".join(conditions)
@@ -1232,13 +1278,13 @@ def search_all():
                         software_host_query += " WHERE toLower(h.platform) CONTAINS toLower($platform)"
                     params['platform'] = platform_filter
 
-                software_host_query += " RETURN DISTINCT s.name AS software_name, h.hostname AS hostname"
+                software_host_query += " RETURN DISTINCT s.name AS software_name, h.fleet_host_id AS fleet_host_id"
 
                 software_host_result = session.run(software_host_query, **params)
 
                 for record in software_host_result:
                     source_id = f"software_{record['software_name']}"
-                    target_id = f"host_{record['hostname']}"
+                    target_id = f"host_{record['fleet_host_id']}"
                     if source_id in node_ids and target_id in node_ids:
                         links.append({
                             "source": source_id,
@@ -1879,15 +1925,36 @@ def get_full_graph_data():
                 "        h.platform AS platform, h.team_id AS team_id, "
                 "        h.team_name AS team_name"
             )
-            host_result = session.run(host_query, **flt_params)
-            for record in host_result:
+            host_records = list(session.run(host_query, **flt_params))
+
+            # Detect hostname collisions inside this scope so the viz can
+            # disambiguate `mac.lan #1229` vs `mac.lan #1367` for distinct
+            # physical machines that share Fleet's default hostname. Without
+            # this, 4 different Macs all render as identical "mac.lan" red dots
+            # and the operator can't tell which is which.
+            hostname_counts: dict = {}
+            for record in host_records:
+                hn = record['hostname']
+                if hn:
+                    hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+
+            for record in host_records:
                 # Node id is keyed on fleet_host_id (stable, unique). hostname
                 # carries the current display label. This eliminates duplicate
                 # nodes when Fleet reports the same host with different casing.
-                node_id = f"host_{record['fleet_host_id']}"
+                fid = record['fleet_host_id']
+                hn = record['hostname']
+                node_id = f"host_{fid}"
+                display_name = (
+                    f"{hn} #{fid}"
+                    if hn and hostname_counts.get(hn, 0) > 1
+                    else hn
+                )
                 node_obj = {
                     "id": node_id,
-                    "name": record['hostname'],
+                    "name": hn,
+                    "display_name": display_name,
+                    "fleet_host_id": fid,
                     "type": "host",
                     "details": f"{record['os_version'] or ''} ({record['platform'] or ''})",
                 }

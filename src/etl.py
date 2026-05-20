@@ -127,6 +127,17 @@ class ETLConfig:
     # 7-day age horizon for software reap — orphaned Software survives any
     # single empty cycle, only deleted after a full week without any host
     # installing it.
+    skip_host_reap: bool = False
+    # When False AND cfg.full_scan is True, the cycle calls
+    # MemgraphIngestion.reap_stale_hosts to DETACH DELETE :Host nodes whose
+    # last_ingest_iso is older than host_reap_age_seconds. Only runs on
+    # full-scan cycles because differential cycles don't touch every host
+    # (last_ingest_iso isn't refreshed for unchanged hosts → false-positive
+    # reap risk on quiet hosts).
+    host_reap_age_seconds: int = int(
+        os.environ.get("HOST_REAP_AGE_DAYS", "7")
+    ) * 24 * 60 * 60
+    # Default 7d. Override via env HOST_REAP_AGE_DAYS=<n>.
 
 
 @dataclass
@@ -156,6 +167,10 @@ class ETLResult:
     software_reap_attempted: bool = False
     software_reap_stats: Optional[dict] = None
     software_reap_error: Optional[str] = None
+    # Host reap telemetry
+    host_reap_attempted: bool = False
+    host_reap_stats: Optional[dict] = None
+    host_reap_error: Optional[str] = None
 
     def as_dict(self) -> dict:
         return {
@@ -181,6 +196,9 @@ class ETLResult:
             "software_reap_attempted": self.software_reap_attempted,
             "software_reap_stats": self.software_reap_stats,
             "software_reap_error": self.software_reap_error,
+            "host_reap_attempted": self.host_reap_attempted,
+            "host_reap_stats": self.host_reap_stats,
+            "host_reap_error": self.host_reap_error,
         }
 
 
@@ -561,6 +579,28 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     msg = f"{type(exc).__name__}: {exc}"
                     logger.warning("etl: software reap failed: %s", msg)
                     result.software_reap_error = msg
+
+            # Host node reap. Only runs on full-scan cycles because differential
+            # cycles only refresh last_ingest_iso for hosts that changed —
+            # quiet hosts would be incorrectly reaped. Reaps :Host nodes whose
+            # last_ingest_iso is older than host_reap_age_seconds (default 7d,
+            # env HOST_REAP_AGE_DAYS).
+            if cfg.full_scan and not cfg.skip_host_reap:
+                result.host_reap_attempted = True
+                try:
+                    stats = ingestion.reap_stale_hosts(
+                        now_iso=_now_iso(),
+                        reap_age_seconds=cfg.host_reap_age_seconds,
+                    )
+                    result.host_reap_stats = stats
+                    logger.info(
+                        "etl: host reap — reaped=%d (cutoff=%dd)",
+                        stats['reaped'], cfg.host_reap_age_seconds // 86400,
+                    )
+                except Exception as exc:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    logger.warning("etl: host reap failed: %s", msg)
+                    result.host_reap_error = msg
 
         # Orient: enrichment kick. Best-effort — never breaks a cycle.
         if not cfg.skip_enrichment:

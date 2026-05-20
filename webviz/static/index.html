@@ -2919,7 +2919,7 @@
                 .attr("stroke-width", 2);
 
             node.append("text")
-                .text(d => d.name)
+                .text(d => d.display_name || d.name)
                 .attr("text-anchor", "middle")
                 .attr("dy", "0.35em")
                 .attr("font-size", "10px")
@@ -2928,7 +2928,7 @@
 
             node.append("title")
                 .text(d => {
-                    let tooltip = `${d.name}\nType: ${d.type}`;
+                    let tooltip = `${d.display_name || d.name}\nType: ${d.type}`;
                     if (d.type === 'software') {
                         if (d.category && d.category.length > 0) tooltip += `\nCategories: ${d.category.join(', ')}`;
                         if (d.description) tooltip += `\nDescription: ${d.description}`;

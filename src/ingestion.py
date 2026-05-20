@@ -1553,6 +1553,56 @@ class MemgraphIngestion:
             stats['reaped'] = reaped
         return stats
 
+    def reap_stale_hosts(self, now_iso: "str | None" = None,
+                          reap_age_seconds: int = 604800) -> dict:
+        """DETACH DELETE :Host nodes whose last_ingest_iso is older than cutoff.
+
+        Signal: every successful host MERGE refreshes `last_ingest_iso`. If a
+        host's stamp falls behind, Fleet hasn't reported it in any cycle since.
+        After `reap_age_seconds` of absence we treat the host as deleted from
+        Fleet (decommissioned, re-enrolled under new id, or otherwise gone)
+        and remove it from the graph.
+
+        IMPORTANT: caller (etl.run_etl) only invokes this on full-scan cycles.
+        Differential cycles only update last_ingest_iso for hosts that changed
+        in the watermark window — quiet but live hosts would otherwise be
+        reaped incorrectly.
+
+        DETACH DELETE removes the host AND every incident edge (USES,
+        INSTALLED_ON, HAS_LABEL). Software/User/Label nodes are NOT deleted;
+        their own reap functions handle cleanup if they're left orphaned.
+
+        Returns: {'reaped': int, 'cutoff_iso': str}
+        """
+        if now_iso is None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt - timedelta(seconds=reap_age_seconds)).isoformat()
+
+        stats = {'reaped': 0, 'cutoff_iso': cutoff}
+        with self.driver.session() as session:
+            rec = session.run(
+                "MATCH (h:Host) "
+                "WHERE h.last_ingest_iso IS NOT NULL "
+                "  AND h.last_ingest_iso < $cutoff "
+                "RETURN count(h) AS n",
+                cutoff=cutoff,
+            ).single()
+            reaped = int(rec['n']) if rec else 0
+            if reaped > 0:
+                session.run(
+                    "MATCH (h:Host) "
+                    "WHERE h.last_ingest_iso IS NOT NULL "
+                    "  AND h.last_ingest_iso < $cutoff "
+                    "DETACH DELETE h",
+                    cutoff=cutoff,
+                )
+            stats['reaped'] = reaped
+        return stats
+
     def mark_label_sync_failure(self, error_msg: str):
         """Record a global label-sync failure on every Label node.
 
