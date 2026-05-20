@@ -1478,6 +1478,12 @@ def get_blast_radius():
             "message": "id must be <= 300 characters",
         }), 400
 
+    # Software name lookup is case-insensitive against a graph that now
+    # stores names lowercase (see ingestion case-dedupe). Users (USES edge
+    # endpoints) stay case-sensitive because usernames are exact identifiers.
+    if node_type == 'software':
+        node_id = node_id.strip().lower()
+
     # Label scoping (plan 1E): bolted on additively. label_clause is merged
     # alongside team_clause into every Cypher query that filters on hosts.
     try:
@@ -2025,10 +2031,22 @@ def get_full_graph_data():
 
 @app.route("/api/software/<software_name>/hosts")
 def get_software_hosts(software_name):
-    """Get ALL hosts that have a specific software installed"""
+    """Get ALL hosts that have a specific software installed.
+
+    Software names are stored lowercase in the graph (see
+    src/ingestion.py — name is normalized at ingest to collapse the
+    "Ollama" / "ollama" / "OLLAMA" case-variant duplicates Fleet
+    exposes from heterogeneous osquery sources). Lowercase the URL
+    param before MATCH so a request for `/api/software/Ollama/hosts`
+    resolves to the same node as `/api/software/ollama/hosts`.
+    """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
-    
+
+    software_name = (software_name or "").strip().lower()
+    if not software_name:
+        return jsonify({"error": "Software name required"}), 400
+
     with driver.session() as session:
         # Check if software exists
         software_check = session.run(

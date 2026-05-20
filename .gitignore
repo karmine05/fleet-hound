@@ -98,3 +98,4 @@ README.md
 .gitignore
 .gitignore
 AGENTS.md
+data/memory*

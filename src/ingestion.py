@@ -192,9 +192,26 @@ class MemgraphIngestion:
                     "MATCH (h:Host) "
                     "WHERE h.last_software_sync_iso IS NOT NULL "
                     "SET h.last_software_sync_iso = NULL"
-                )
+                ).consume()
             except Exception:
                 pass
+
+            # One-shot migration: dedupe case-variant :Software nodes. Fleet
+            # exposes the same package under different casings via different
+            # osquery sources (macOS bundle "Ollama" vs homebrew "ollama";
+            # Debian "libXext6" vs apt-derived "libxext6"). Pre-fix
+            # ingestion MERGE'd them as distinct nodes — graph showed parallel
+            # software with split host sets. Going forward `_batch_create_software_grouped`
+            # ingests names already lowercased, but this sweep folds prior
+            # accumulated duplicates: redirects every INSTALLED_ON edge from
+            # the non-canonical variant onto the canonical (lowercased) node,
+            # unions versions/sources, then DETACH DELETEs the variant.
+            # Self-quiescing — after first cycle the cluster query returns
+            # zero rows and the sweep no-ops.
+            try:
+                self._dedupe_case_variant_software(session)
+            except Exception as exc:
+                print(f"   ⚠️  Software case-variant dedupe skipped: {exc}")
 
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
@@ -370,14 +387,39 @@ class MemgraphIngestion:
                 else:
                     software_list = host.get('software', [])
                     if software_list:
+                        # Software name is normalized to lowercase at ingest so
+                        # the case-variant duplicates Fleet exposes from
+                        # heterogeneous package sources (macOS app bundles
+                        # report "Ollama", homebrew reports "ollama", apt
+                        # reports "libxext6" vs the Debian-canonical
+                        # "libXext6") collapse into a single canonical
+                        # :Software node. Without normalization the graph
+                        # accumulates parallel nodes per casing, splitting
+                        # both INSTALLED_ON edges and any downstream
+                        # enrichment / shadow-IT detection. Display layer
+                        # lower-cases consistently; case-preserving display
+                        # would need a `display_name` companion field
+                        # (deferred — most names round-trip cleanly).
                         cleaned_software = []
+                        seen_lower = set()
                         for s in software_list:
-                            if s.get('name'):
-                                cleaned_software.append({
-                                    'name': s.get('name'),
-                                    'version': s.get('version') or 'unknown',
-                                    'source': (s.get('source') or '').strip(),
-                                })
+                            raw = s.get('name')
+                            if not raw:
+                                continue
+                            name_lc = raw.strip().lower()
+                            if not name_lc or name_lc in seen_lower:
+                                # Skip per-host duplicates that only differ in
+                                # casing (Fleet can report the same package via
+                                # multiple osquery `source` channels). Keep
+                                # the first instance — its `source` will be
+                                # MERGE-accumulated by _batch_create_software_grouped.
+                                continue
+                            seen_lower.add(name_lc)
+                            cleaned_software.append({
+                                'name': name_lc,
+                                'version': s.get('version') or 'unknown',
+                                'source': (s.get('source') or '').strip(),
+                            })
                         if cleaned_software:
                             software_grouped_batch.append({
                                 'fleet_host_id': fleet_host_id,
@@ -1298,6 +1340,139 @@ class MemgraphIngestion:
                 present=present, cutoff=cutoff,
             )
         return reaped
+
+    def _dedupe_case_variant_software(self, session) -> dict:
+        """Collapse Software clusters that share toLower(name) into one node.
+
+        Strategy per cluster:
+          1. Pick canonical = the lowercased variant if one exists, otherwise
+             the lexicographically first variant (deterministic).
+          2. Re-create INSTALLED_ON edges from every dup → canonical via MERGE
+             (idempotent — if canonical already shared a host with a dup the
+             new edge collapses).
+          3. Union `versions` and `sources` list properties onto canonical
+             before deletion so enrichment data isn't lost.
+          4. DETACH DELETE the dups.
+          5. If canonical's `name` isn't already lowercased, rename it.
+
+        Done in one batched query per cluster (driver-side loop, single-query
+        per cluster keeps Memgraph transactions small enough to fit under the
+        execution timeout even on 12k+ Software node graphs).
+
+        Returns: {'clusters': N, 'duplicates_removed': M}.
+        """
+        cluster_rows = session.run(
+            """
+            MATCH (s:Software)
+            WITH toLower(s.name) AS lname, collect(s.name) AS variants
+            WHERE size(variants) > 1
+            RETURN lname, variants
+            """
+        ).data()
+
+        clusters = 0
+        duplicates_removed = 0
+        for row in cluster_rows:
+            lname = row['lname']
+            variants = row['variants']
+            # Prefer the already-lowercased variant. Falls back to sorted-first.
+            if lname in variants:
+                canonical = lname
+            else:
+                canonical = sorted(variants)[0]
+            dups = [v for v in variants if v != canonical]
+
+            # Edge redirect: MERGE rather than CREATE so a dup's edge that
+            # overlaps an existing canonical edge collapses cleanly.
+            session.run(
+                """
+                MATCH (canon:Software {name: $canon})
+                UNWIND $dups AS dname
+                MATCH (dup:Software {name: dname})
+                OPTIONAL MATCH (dup)-[r:INSTALLED_ON]->(h:Host)
+                WITH canon, dup, collect(DISTINCT h) AS hosts
+                FOREACH (h IN hosts | MERGE (canon)-[:INSTALLED_ON]->(h))
+                """,
+                canon=canonical, dups=dups,
+            ).consume()
+
+            # Property union: pull versions / sources from dups into canonical.
+            session.run(
+                """
+                MATCH (canon:Software {name: $canon})
+                UNWIND $dups AS dname
+                MATCH (dup:Software {name: dname})
+                WITH canon, dup
+                SET canon.versions = [v IN coalesce(canon.versions, []) + coalesce(dup.versions, []) | v]
+                SET canon.sources  = [v IN coalesce(canon.sources, [])  + coalesce(dup.sources, [])  | v]
+                """,
+                canon=canonical, dups=dups,
+            ).consume()
+
+            # Deduplicate the merged lists in-place (Memgraph lacks a builtin
+            # list-distinct on read, so do it post-write with a small UNWIND).
+            session.run(
+                """
+                MATCH (canon:Software {name: $canon})
+                WITH canon,
+                     [x IN coalesce(canon.versions, []) WHERE x IS NOT NULL] AS vs,
+                     [x IN coalesce(canon.sources, []) WHERE x IS NOT NULL] AS ss
+                UNWIND vs AS v
+                WITH canon, ss, collect(DISTINCT v) AS vu
+                UNWIND ss AS s
+                WITH canon, vu, collect(DISTINCT s) AS su
+                SET canon.versions = vu, canon.sources = su
+                """,
+                canon=canonical,
+            ).consume()
+
+            # Drop the dups.
+            session.run(
+                """
+                UNWIND $dups AS dname
+                MATCH (dup:Software {name: dname})
+                DETACH DELETE dup
+                """,
+                dups=dups,
+            ).consume()
+
+            # If canonical isn't lowercased, rename it. Renaming after the
+            # MERGE-and-delete avoids transiently violating the name-UNIQUE
+            # constraint when a lowercase dup existed alongside an upper-case
+            # canonical (the dup is already gone by this point).
+            if canonical != lname:
+                session.run(
+                    "MATCH (s:Software {name: $old}) SET s.name = $new",
+                    old=canonical, new=lname,
+                ).consume()
+
+            clusters += 1
+            duplicates_removed += len(dups)
+
+        # Solo non-lowercased Software: nodes whose `name` differs from
+        # `toLower(name)` but have no case-sibling. The cluster query above
+        # only handles 2+ variants; solo cases need a rename so the
+        # ingestion-side `MERGE (s:Software {name: <lowercase>})` doesn't
+        # spawn a fresh node on the next cycle when it sees the lowercased
+        # form. Done in a single batched query.
+        renamed_rec = session.run(
+            """
+            MATCH (s:Software)
+            WHERE s.name <> toLower(s.name)
+            WITH s, toLower(s.name) AS lname
+            SET s.name = lname
+            RETURN count(s) AS n
+            """
+        ).single()
+        renamed = int(renamed_rec['n']) if renamed_rec else 0
+
+        if clusters > 0 or renamed > 0:
+            print(
+                f"   🧹 Software case-dedupe: {clusters} cluster(s) collapsed, "
+                f"{duplicates_removed} duplicate node(s) removed, "
+                f"{renamed} solo node(s) renamed to lowercase"
+            )
+        return {'clusters': clusters, 'duplicates_removed': duplicates_removed, 'renamed': renamed}
 
     def reap_orphaned_software(self, now_iso: "str | None" = None,
                                 reap_age_seconds: int = 604800) -> dict:
