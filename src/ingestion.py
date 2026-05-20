@@ -213,6 +213,22 @@ class MemgraphIngestion:
             except Exception as exc:
                 logger.warning("software case-variant dedupe skipped: %s", exc)
 
+            # Recurring sweep: collapse duplicate INSTALLED_ON edges between
+            # the same (Software, Host) pair. Memgraph MERGE on a relationship
+            # pattern is NOT serializable across concurrent transactions —
+            # two parallel chunks both seeing "no edge exists" can each
+            # create one, producing 2 rels for the same pair.
+            # `_batch_create_software_grouped` deliberately runs chunks in
+            # parallel via ThreadPoolExecutor for ingest throughput, so the
+            # race window is real on every cycle. This sweep keeps one rel
+            # per (s,h) and deletes the rest; cheap (single Cypher) and
+            # self-quiescing — after a clean cycle the WHERE clause matches
+            # zero rows and the sweep no-ops in <50ms.
+            try:
+                self._dedupe_installed_on_edges(session)
+            except Exception as exc:
+                logger.warning("installed_on edge dedupe skipped: %s", exc)
+
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
         Ingest hosts, users, software, and relationships into Memgraph.
@@ -456,6 +472,17 @@ class MemgraphIngestion:
                 self._batch_create_user_relationships(session, user_rel_batch)
             if software_grouped_batch:
                 self._batch_create_software_grouped(session, software_grouped_batch)
+
+            # Post-ingest sweep: collapse any duplicate INSTALLED_ON edges the
+            # parallel-chunk MERGE race may have produced this cycle (see
+            # `_dedupe_installed_on_edges` for the mechanism). Runs in the
+            # same session as ingest so a fresh install doesn't leave dupes
+            # behind even on its first cycle, before the next-cycle startup
+            # sweep would catch them. No-op when clean.
+            try:
+                self._dedupe_installed_on_edges(session)
+            except Exception as exc:
+                logger.warning("post-ingest installed_on dedupe skipped: %s", exc)
 
             if skipped_no_id:
                 logger.warning("skipped hosts missing_fleet_id=%d (cannot MERGE without identity)", skipped_no_id)
@@ -1475,6 +1502,48 @@ class MemgraphIngestion:
                 clusters, duplicates_removed, renamed,
             )
         return {'clusters': clusters, 'duplicates_removed': duplicates_removed, 'renamed': renamed}
+
+    def _dedupe_installed_on_edges(self, session) -> dict:
+        """Collapse duplicate INSTALLED_ON edges between same (Software, Host).
+
+        Memgraph MERGE on a relationship pattern is not serializable across
+        concurrent transactions. `_batch_create_software_grouped` runs chunk
+        MERGEs in parallel (ThreadPoolExecutor, see _SOFTWARE_REL_PARALLELISM)
+        to keep ingest under the cluster's query-execution timeout. The race
+        window: two threads check existence of (s)-[:INSTALLED_ON]->(h),
+        both see none, both create. Net result: 2 edges per (s,h) pair, one
+        per concurrent winner. /api/software/<name>/hosts then renders one
+        D3 node per edge instead of one per host — `mac.lan` appears 6
+        times for 1Password instead of 4 distinct fleet_host_ids (the actual
+        host count).
+
+        Sweep keeps the first edge per pair and deletes the rest. Cheap
+        single-Cypher pass; on a clean cycle the WHERE clause matches zero
+        rows and the sweep returns in <50ms. Returns telemetry so etl.py
+        can surface it the same way the case-variant dedupe does.
+
+        NOTE: this is a recurring sweep, not a one-shot migration — the
+        race persists for every ingestion cycle that runs parallel chunks,
+        so the sweep must run every cycle to keep the graph clean.
+        """
+        rec = session.run(
+            """
+            MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
+            WITH s, h, collect(r) AS rs
+            WHERE size(rs) > 1
+            WITH s, h, rs, size(rs) - 1 AS extras
+            FOREACH (rel IN tail(rs) | DELETE rel)
+            RETURN count(*) AS pairs, sum(extras) AS extras_removed
+            """
+        ).single()
+        pairs = int(rec['pairs']) if rec and rec['pairs'] is not None else 0
+        extras_removed = int(rec['extras_removed']) if rec and rec['extras_removed'] is not None else 0
+        if extras_removed > 0:
+            logger.info(
+                "installed_on edge dedupe: pairs=%d extras_removed=%d",
+                pairs, extras_removed,
+            )
+        return {'pairs': pairs, 'extras_removed': extras_removed}
 
     def reap_orphaned_software(self, now_iso: "str | None" = None,
                                 reap_age_seconds: int = 604800) -> dict:
