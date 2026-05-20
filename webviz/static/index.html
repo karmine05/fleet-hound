@@ -2866,6 +2866,47 @@
                 nodesToRender = data.nodes;
             }
 
+            // Defensive dedupe by node id. Server endpoints should already
+            // return unique node ids, but if any payload slips through with
+            // duplicates (e.g. an unfixed endpoint, or duplicate INSTALLED_ON
+            // edges hitting a non-DISTINCT cypher), D3 happily renders one
+            // SVG <g> per array entry — so 4 entries with the same id become
+            // 4 stacked circles with identical labels. Coalesce here so the
+            // viz can't lie about cardinality.
+            const _seen = new Map();
+            for (const n of nodesToRender) {
+                if (n && n.id != null && !_seen.has(n.id)) _seen.set(n.id, n);
+            }
+            if (_seen.size !== nodesToRender.length) {
+                console.warn(
+                    `renderGraph: deduped ${nodesToRender.length - _seen.size} duplicate node id(s); ` +
+                    `the API payload should not contain duplicates.`
+                );
+            }
+            nodesToRender = Array.from(_seen.values());
+
+            // Client-side display_name fallback. Endpoints that emit
+            // display_name (graph/full, search, software/hosts) already
+            // disambiguate hostname collisions. For payloads that don't
+            // (older snapshots, unfixed endpoints), synthesize the same
+            // `name #fleet_host_id` label here so distinct hosts sharing a
+            // hostname remain visually distinguishable in any view.
+            const _nameCounts = new Map();
+            for (const n of nodesToRender) {
+                if (n.type === 'host' && n.name) {
+                    _nameCounts.set(n.name, (_nameCounts.get(n.name) || 0) + 1);
+                }
+            }
+            for (const n of nodesToRender) {
+                if (n.type !== 'host') continue;
+                if (n.display_name) continue;
+                if (n.name && _nameCounts.get(n.name) > 1 && n.fleet_host_id != null) {
+                    n.display_name = `${n.name} #${n.fleet_host_id}`;
+                } else {
+                    n.display_name = n.name;
+                }
+            }
+
             const svg = container.append("svg")
                 .attr("width", width)
                 .attr("height", height);

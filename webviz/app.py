@@ -1814,28 +1814,57 @@ def get_blast_radius():
 
 @app.route("/api/graph")
 def get_graph_data():
-    """Get graph data formatted for D3.js force layout"""
+    """Get graph data formatted for D3.js force layout.
+
+    Host node id is keyed on fleet_host_id (stable, unique) to match the
+    id format used elsewhere (/api/graph/full, /api/search, /api/path,
+    /api/correlate). Without this consistency, links from one endpoint
+    don't resolve against nodes from another when both are mixed by the
+    client (hover correlation, cross-view jumps).
+    """
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
-    
+
     with driver.session() as session:
-        # Get all nodes (only those with relationships)
         nodes = []
 
-        # Host nodes - only hosts that have users connected
+        # Host nodes - only hosts that have users connected. Pull
+        # fleet_host_id alongside hostname; collapse by fleet_host_id (not
+        # hostname) so Fleet's default-hostname collisions (mac.lan ×4)
+        # render as distinct nodes with disambiguated display labels.
         host_result = session.run("""
             MATCH (h:Host)<-[:USES]-(u:User)
-            RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform
+            RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
+                            h.hostname AS hostname,
+                            h.os_version AS os_version,
+                            h.platform AS platform
         """)
-        for record in host_result:
+        host_records = list(host_result)
+        hostname_counts: dict = {}
+        for record in host_records:
+            hn = record['hostname']
+            if hn:
+                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+
+        for record in host_records:
+            fid = record['fleet_host_id']
+            hn = record['hostname']
+            if fid is None:
+                continue
+            display_name = (
+                f"{hn} #{fid}"
+                if hn and hostname_counts.get(hn, 0) > 1
+                else hn
+            )
             nodes.append({
-                "id": f"host_{record['hostname']}",
-                "name": record['hostname'],
+                "id": f"host_{fid}",
+                "name": hn,
+                "display_name": display_name,
+                "fleet_host_id": fid,
                 "type": "host",
                 "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
             })
 
-        # User nodes (only those connected to hosts)
         user_result = session.run("""
             MATCH (u:User)-[:USES]->(h:Host)
             RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname
@@ -1847,24 +1876,21 @@ def get_graph_data():
                 "type": "user",
                 "details": record['email'] or record['fullname'] or ''
             })
-        
-        # Get ONLY user-host relationships for clean initial view
+
+        # User→Host edges keyed on fleet_host_id for symmetry with node ids.
         links = []
         rel_result = session.run("""
             MATCH (u:User)-[r:USES]->(h:Host)
-            RETURN 'uses' AS type, u.username AS from_name, h.hostname AS to_host
+            RETURN DISTINCT 'uses' AS type, u.username AS from_name,
+                            h.fleet_host_id AS to_host_id
         """)
-        
         for record in rel_result:
-            source_id = f"user_{record['from_name']}"
-            target_id = f"host_{record['to_host']}"
-            
             links.append({
-                "source": source_id,
-                "target": target_id,
+                "source": f"user_{record['from_name']}",
+                "target": f"host_{record['to_host_id']}",
                 "type": record['type']
             })
-        
+
         return jsonify({"nodes": nodes, "links": links})
 
 @app.route("/api/graph/full")
@@ -2137,30 +2163,59 @@ def get_software_hosts(software_name):
         })
         node_ids.add(software_id)
         
-        # Get ALL hosts that have this software
+        # Get ALL hosts that have this software. DISTINCT on fleet_host_id
+        # because duplicate INSTALLED_ON edges can exist for the same
+        # (Software, Host) pair (legacy data from before edge-dedupe);
+        # without DISTINCT each duplicate edge becomes a duplicate node.
+        # Node id keyed on fleet_host_id (stable, unique). hostname is for
+        # display only — multiple distinct hosts share Fleet's default
+        # hostname (mac.lan, etc.) and must be disambiguated via #<fid>.
         host_result = session.run("""
             MATCH (s:Software {name: $name})-[:INSTALLED_ON]->(h:Host)
-            RETURN h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform
+            RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
+                            h.hostname AS hostname,
+                            h.os_version AS os_version,
+                            h.platform AS platform
         """, name=software_name)
-        
-        for record in host_result:
-            host_id = f"host_{record['hostname']}"
+
+        host_records_raw = list(host_result)
+        hostname_counts: dict = {}
+        for record in host_records_raw:
+            hn = record['hostname']
+            if hn:
+                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+
+        for record in host_records_raw:
+            fid = record['fleet_host_id']
+            hn = record['hostname']
+            host_id = f"host_{fid}"
+            if host_id in node_ids:
+                continue  # belt-and-suspenders: skip if same fid already added
+            display_name = (
+                f"{hn} #{fid}"
+                if hn and hostname_counts.get(hn, 0) > 1
+                else hn
+            )
             nodes.append({
                 "id": host_id,
-                "name": record['hostname'],
+                "name": hn,
+                "display_name": display_name,
+                "fleet_host_id": fid,
                 "type": "host",
                 "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
             })
             node_ids.add(host_id)
-        
+
         # Get users connected to these hosts
         user_result = session.run("""
             MATCH (s:Software {name: $name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
             RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname
         """, name=software_name)
-        
+
         for record in user_result:
             user_id = f"user_{record['username']}"
+            if user_id in node_ids:
+                continue
             nodes.append({
                 "id": user_id,
                 "name": record['username'],
@@ -2168,34 +2223,45 @@ def get_software_hosts(software_name):
                 "details": record['email'] or record['fullname'] or ''
             })
             node_ids.add(user_id)
-        
+
         # Get ALL relationships
         links = []
-        
-        # Software-Host relationships
+
+        # Software-Host relationships. DISTINCT to collapse duplicate edges
+        # and reference target hosts by fleet_host_id to match node ids above.
         software_host_links = session.run("""
             MATCH (s:Software {name: $name})-[:INSTALLED_ON]->(h:Host)
-            RETURN h.hostname AS hostname
+            RETURN DISTINCT h.fleet_host_id AS fleet_host_id
         """, name=software_name)
-        
+
+        seen_sw_links = set()
         for record in software_host_links:
-            target_id = f"host_{record['hostname']}"
+            target_id = f"host_{record['fleet_host_id']}"
+            link_key = (software_id, target_id)
+            if link_key in seen_sw_links:
+                continue
+            seen_sw_links.add(link_key)
             if target_id in node_ids:
                 links.append({
                     "source": software_id,
                     "target": target_id,
                     "type": "installed"
                 })
-        
+
         # User-Host relationships (for hosts that have this software)
         user_host_links = session.run("""
             MATCH (s:Software {name: $name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-            RETURN u.username AS username, h.hostname AS hostname
+            RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id
         """, name=software_name)
-        
+
+        seen_uh_links = set()
         for record in user_host_links:
             source_id = f"user_{record['username']}"
-            target_id = f"host_{record['hostname']}"
+            target_id = f"host_{record['fleet_host_id']}"
+            link_key = (source_id, target_id)
+            if link_key in seen_uh_links:
+                continue
+            seen_uh_links.add(link_key)
             if source_id in node_ids and target_id in node_ids:
                 links.append({
                     "source": source_id,
@@ -2243,11 +2309,16 @@ def get_host_software(hostname):
         node_ids = set()
 
         # Add the host node — id keyed on fleet_host_id, name shows the
-        # canonical (most-recently-ingested) hostname casing.
+        # canonical (most-recently-ingested) hostname casing. display_name
+        # mirrors name here (single-host detail view; no collision context),
+        # but the field exists so client code that reads
+        # `d.display_name || d.name` produces the expected label.
         host_id = f"host_{fleet_host_id}"
         nodes.append({
             "id": host_id,
             "name": canonical_hostname,
+            "display_name": canonical_hostname,
+            "fleet_host_id": fleet_host_id,
             "type": "host",
             "details": f"{host_data['os_version'] or ''} ({host_data['platform'] or ''})"
         })
@@ -2942,21 +3013,46 @@ def _node_label_for_kind(kind: str) -> str:
 
 
 def _key_prop_for_kind(kind: str) -> str:
-    return {"host": "hostname", "user": "username", "software": "name"}[kind]
+    # Host nodes are keyed on fleet_host_id (stable, unique) to match the
+    # id format emitted by /api/graph/full and /api/search. hostname is
+    # display-only and may collide across distinct hosts.
+    return {"host": "fleet_host_id", "user": "username", "software": "name"}[kind]
+
+
+def _coerce_typed_id_name(kind: str, name: str):
+    """Convert the parsed typed-id name to the type expected by the cypher
+    key for that kind. host: fleet_host_id is int; user/software: str.
+    Returns None on coercion failure (caller treats as not-found).
+    """
+    if kind == "host":
+        try:
+            return int(name)
+        except (TypeError, ValueError):
+            return None
+    return name
 
 
 def _serialize_graph_node(record_obj):
-    """Map a Memgraph node object to the same node shape as /api/graph/full."""
+    """Map a Memgraph node object to the same node shape as /api/graph/full.
+
+    Host node id is keyed on fleet_host_id (stable, unique) so that nodes
+    returned by /api/path and /api/correlate match node ids in the main
+    graph view. Without this, hover-correlation highlights would silently
+    fail because host_<hostname> never matches host_<fid>.
+    """
     labels = list(record_obj.labels) if hasattr(record_obj, "labels") else []
     props = dict(record_obj) if record_obj else {}
 
     if "Host" in labels:
         hostname = props.get("hostname")
-        if not hostname:
+        fleet_host_id = props.get("fleet_host_id")
+        if fleet_host_id is None:
             return None
         node = {
-            "id": f"host_{hostname}",
+            "id": f"host_{fleet_host_id}",
             "name": hostname,
+            "display_name": hostname,
+            "fleet_host_id": fleet_host_id,
             "type": "host",
             "details": f"{props.get('os_version') or ''} ({props.get('platform') or ''})",
         }
@@ -3020,6 +3116,15 @@ def get_path():
     b_kind, b_name = _resolve_typed_id(to_id)
     if not a_kind or not b_kind:
         return jsonify({"error": "Invalid typed id; expected <type>_<name>"}), 400
+
+    # Coerce the parsed name to match the cypher key type. Host kind keys on
+    # fleet_host_id (int); other kinds remain string. Reject early if coerce
+    # fails (e.g. `host_<hostname>` passed to a host endpoint that now expects
+    # a fleet_host_id) so the caller gets a clean 400.
+    a_name = _coerce_typed_id_name(a_kind, a_name)
+    b_name = _coerce_typed_id_name(b_kind, b_name)
+    if a_name is None or b_name is None:
+        return jsonify({"error": "Invalid typed id; host ids must be host_<fleet_host_id>"}), 400
 
     # Identity case: same node both endpoints. Skip the DB roundtrip and return
     # a degenerate "path" containing just that node so the client can render it.
@@ -3146,6 +3251,10 @@ def get_correlate():
     kind, name = _resolve_typed_id(typed_id)
     if not kind:
         return jsonify({"error": "Invalid typed id; expected <type>_<name>"}), 400
+
+    name = _coerce_typed_id_name(kind, name)
+    if name is None:
+        return jsonify({"error": "Invalid typed id; host ids must be host_<fleet_host_id>"}), 400
 
     label = _node_label_for_kind(kind)
     key = _key_prop_for_kind(kind)
