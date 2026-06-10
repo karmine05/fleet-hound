@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -52,7 +53,19 @@ _NOISY_PROPS = {
     "last_members_compressed",
 }
 
-_RETAIN_DEFAULT = 30
+# Retention is age-driven, not count-driven. The drift/changelog UI lets an
+# operator diff any two retained snapshots, so history must reach back far
+# enough to answer "what changed last week" — not just the last few hours.
+#
+# The old count-only cap of 30 silently truncated history to ~15h at the
+# default 30-min OODA cadence (30 snapshots × 30 min), which is why the UI
+# only ever showed ~last-day data. We now keep snapshots up to RETAIN_DAYS old
+# and only fall back to a count cap as a disk-bound safety valve for very high
+# cadences. Both are env-overridable so ops can tune without a code change.
+_RETAIN_DAYS_DEFAULT = int(os.environ.get("SNAPSHOT_RETAIN_DAYS", "30"))
+# Safety cap on total retained files. Generous so age is the effective limit
+# at any sane cadence (30 days @ 30-min cadence = 1440 files < 5000).
+_RETAIN_DEFAULT = int(os.environ.get("SNAPSHOT_RETAIN_MAX", "5000"))
 
 
 def _node_hash(props: dict) -> str:
@@ -87,23 +100,32 @@ def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
 
     with driver.session() as session:
         # --- Hosts ---
+        # Node identity is keyed on fleet_host_id to match the live graph
+        # endpoints (/api/graph, /api/correlate all use `host_<fleet_host_id>`).
+        # Keying on the (mutable, non-unique) hostname would (a) collide two
+        # distinct hosts that share a display name — now likely since the
+        # display label is Fleet's "computer name" — silently dropping one
+        # from the diff, and (b) break the changelog "View on graph" jump,
+        # which posts the node id to /api/correlate (rejects non-fleet_host_id
+        # ids). hostname stays in props so a rename surfaces as property drift.
         host_keys = ["hostname", "os_version", "platform", "ip", "last_seen",
                      "team_id", "team_name"]
         host_q = """
             MATCH (h:Host)
-            RETURN h.hostname AS hostname, h.os_version AS os_version,
+            RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname,
+                   h.os_version AS os_version,
                    h.platform AS platform, h.ip AS ip,
                    h.last_seen AS last_seen, h.team_id AS team_id,
                    h.team_name AS team_name
         """
         for rec in session.run(host_q):
-            hostname = rec["hostname"]
-            if not hostname:
+            fleet_host_id = rec["fleet_host_id"]
+            if fleet_host_id is None:
                 continue
             props = _coerce_props(host_keys, rec)
             lines.append({
                 "type": "host",
-                "id": _typed_id("host", hostname),
+                "id": _typed_id("host", fleet_host_id),
                 "props": props,
                 "hash": _node_hash(props),
             })
@@ -177,17 +199,18 @@ def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
             counts["labels"] += 1
 
         # --- Edges: HAS_LABEL (Host -> Label) ---
+        # Host endpoint keyed on fleet_host_id to match the host node id above.
         has_label_q = """
             MATCH (h:Host)-[:HAS_LABEL]->(l:Label)
-            RETURN h.hostname AS hname, l.fleet_id AS lfid
+            RETURN h.fleet_host_id AS hfid, l.fleet_id AS lfid
         """
         for rec in session.run(has_label_q):
-            if not rec["hname"] or rec["lfid"] is None:
+            if rec["hfid"] is None or rec["lfid"] is None:
                 continue
             lines.append({
                 "type": "edge",
                 "label": "HAS_LABEL",
-                "from": _typed_id("host", rec["hname"]),
+                "from": _typed_id("host", rec["hfid"]),
                 "to": _typed_id("label", rec["lfid"]),
             })
             counts["edges"] += 1
@@ -195,32 +218,32 @@ def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
         # --- Edges: USES (User -> Host) ---
         uses_q = """
             MATCH (u:User)-[:USES]->(h:Host)
-            RETURN u.username AS uname, h.hostname AS hname
+            RETURN u.username AS uname, h.fleet_host_id AS hfid
         """
         for rec in session.run(uses_q):
-            if not rec["uname"] or not rec["hname"]:
+            if not rec["uname"] or rec["hfid"] is None:
                 continue
             lines.append({
                 "type": "edge",
                 "label": "USES",
                 "from": _typed_id("user", rec["uname"]),
-                "to": _typed_id("host", rec["hname"]),
+                "to": _typed_id("host", rec["hfid"]),
             })
             counts["edges"] += 1
 
         # --- Edges: INSTALLED_ON (Software -> Host) ---
         inst_q = """
             MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-            RETURN s.name AS sname, h.hostname AS hname
+            RETURN s.name AS sname, h.fleet_host_id AS hfid
         """
         for rec in session.run(inst_q):
-            if not rec["sname"] or not rec["hname"]:
+            if not rec["sname"] or rec["hfid"] is None:
                 continue
             lines.append({
                 "type": "edge",
                 "label": "INSTALLED_ON",
                 "from": _typed_id("software", rec["sname"]),
-                "to": _typed_id("host", rec["hname"]),
+                "to": _typed_id("host", rec["hfid"]),
             })
             counts["edges"] += 1
 
@@ -254,7 +277,8 @@ def _safe_ts(ts: str) -> str:
 
 
 def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
-                   *, auth=None, retain: int = _RETAIN_DEFAULT) -> Path:
+                   *, auth=None, retain: int = _RETAIN_DEFAULT,
+                   retain_days: int = _RETAIN_DAYS_DEFAULT) -> Path:
     """Write a snapshot for the full graph state.
 
     Args:
@@ -262,7 +286,12 @@ def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
         ts: ISO timestamp string (becomes file slug).
         out_dir: directory to write into (created if missing).
         auth: optional (user, pwd) Bolt auth tuple.
-        retain: keep this many newest snapshots; older are pruned.
+        retain: hard cap on retained snapshot files (disk-bound safety valve).
+            <= 0 disables the count cap.
+        retain_days: keep snapshots written within this many days; older ones
+            are pruned. <= 0 disables age-based pruning. This is the primary
+            retention control — `retain` only kicks in when the file count
+            still exceeds the cap after age pruning.
 
     Returns the path to the written .jsonl.gz file.
     """
@@ -290,7 +319,7 @@ def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
     meta = {"ts": ts, **counts}
     _atomic_write_bytes(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
 
-    _prune_old(out_dir, retain=retain)
+    _prune_old(out_dir, retain=retain, retain_days=retain_days)
 
     logger.info(
         "snapshot written: %s (%d hosts, %d users, %d software, %d labels, %d edges)",
@@ -300,25 +329,51 @@ def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
     return snap_path
 
 
-def _prune_old(out_dir: Path, *, retain: int) -> None:
-    if retain <= 0:
-        return
+def _drop_snapshot(out_dir: Path, gz_path: Path) -> None:
+    """Unlink a snapshot's .jsonl.gz and its sibling .meta.json."""
+    slug = gz_path.name.removesuffix(".jsonl.gz")
+    meta_path = out_dir / f"{slug}.meta.json"
+    for p in (gz_path, meta_path):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _prune_old(out_dir: Path, *, retain: int,
+               retain_days: int = _RETAIN_DAYS_DEFAULT) -> None:
+    """Prune snapshots: age horizon first, then a count cap as a safety valve.
+
+    Age pruning uses file mtime (≈ write time, since each snapshot is written
+    fresh and never rewritten). Slugs sort lexicographically by ISO ts, so the
+    count-cap pass keeps the newest `retain` files.
+    """
     try:
         gz = sorted(out_dir.glob("*.jsonl.gz"))
     except OSError:
         return
-    if len(gz) <= retain:
-        return
-    for old in gz[:-retain]:
-        meta = old.with_suffix("")  # strip .gz
-        # meta path is <slug>.meta.json — derive slug from old filename
-        slug = old.name.removesuffix(".jsonl.gz")
-        meta_path = out_dir / f"{slug}.meta.json"
-        for p in (old, meta_path):
+
+    # --- Age horizon (primary control) ---
+    if retain_days > 0:
+        cutoff = time.time() - (retain_days * 24 * 60 * 60)
+        survivors = []
+        for p in gz:
             try:
-                p.unlink()
+                mtime = p.stat().st_mtime
             except OSError:
-                pass
+                # Can't stat — keep it rather than risk deleting live data.
+                survivors.append(p)
+                continue
+            if mtime < cutoff:
+                _drop_snapshot(out_dir, p)
+            else:
+                survivors.append(p)
+        gz = survivors
+
+    # --- Count cap (disk-bound safety valve) ---
+    if retain > 0 and len(gz) > retain:
+        for old in gz[:-retain]:
+            _drop_snapshot(out_dir, old)
 
 
 def list_snapshots(out_dir: Path) -> List[dict]:

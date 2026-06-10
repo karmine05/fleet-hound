@@ -75,6 +75,11 @@ services:
       - OODA_INTERVAL_SEC
       - OODA_FULL_SCAN_EVERY
       - OODA_TEAMS
+      # Snapshot retention — how far back the drift/changelog diff can reach.
+      # SNAPSHOT_RETAIN_DAYS is the primary control (age horizon, default 30);
+      # SNAPSHOT_RETAIN_MAX is a disk-bound file-count safety valve (default 5000).
+      - SNAPSHOT_RETAIN_DAYS
+      - SNAPSHOT_RETAIN_MAX
       - FLEET_URL
       - FLEET_API_TOKEN
       - FLEET_EMAIL

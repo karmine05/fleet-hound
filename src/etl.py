@@ -102,6 +102,11 @@ class ETLConfig:
     full_scan: bool = False
     state_path: str = ".state.json"
     snapshot_dir: str = "config/snapshots"
+    # Snapshot retention drives how far back the drift/changelog UI can diff.
+    # Age-based (days) is the primary control; the count cap is a disk-bound
+    # safety valve. Both env-overridable (SNAPSHOT_RETAIN_DAYS / _MAX).
+    snapshot_retain_days: int = int(os.environ.get("SNAPSHOT_RETAIN_DAYS", "30"))
+    snapshot_retain_max: int = int(os.environ.get("SNAPSHOT_RETAIN_MAX", "5000"))
     enrich_limit: Optional[int] = 250
     enrich_target_names: Optional[list[str]] = None
     skip_enrichment: bool = False
@@ -624,6 +629,8 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     current_ts,
                     Path(cfg.snapshot_dir),
                     auth=_mg_auth(),
+                    retain=cfg.snapshot_retain_max,
+                    retain_days=cfg.snapshot_retain_days,
                 )
                 result.snapshot_path = str(snap_path)
                 logger.info("etl: snapshot written to %s", snap_path)

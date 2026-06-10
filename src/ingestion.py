@@ -345,17 +345,34 @@ class MemgraphIngestion:
                     skipped_no_id += 1
                     continue
 
-                # Hostname is mutable display data; fleet_host_id is the MERGE
-                # key. Newly-enrolled hosts, MDM-managed mobile devices, and
-                # hosts that haven't reported osquery `system_info` yet can
-                # surface from Fleet's `/hosts` endpoint with an empty
-                # hostname. Previously we dropped them — which also dropped
-                # their software/user edges from the graph. Synthesize a
-                # placeholder so downstream MERGE/SET writes complete and the
-                # webviz UI has a stable display label until Fleet observes
-                # the real name; log the fleet_host_ids so an operator can
-                # investigate the Fleet-side root cause.
-                hostname = host.get('hostname')
+                # Display label resolution. We surface Fleet's "computer name"
+                # (the friendly device name shown in the Fleet UI, e.g.
+                # "Dhruv's MacBook Pro") rather than the raw network hostname.
+                # Fleet exposes it as `computer_name`; `display_name` is Fleet's
+                # own computed label (computer_name when set, else hostname), so
+                # it's the right fallback. The raw `hostname` is the final
+                # fallback before synthesizing a placeholder.
+                #
+                # This is purely a display value — node identity is keyed on
+                # fleet_host_id in _batch_create_hosts, so changing the source
+                # field can never fork a host into two nodes.
+                #
+                # Newly-enrolled hosts, MDM-managed mobile devices, and hosts
+                # that haven't reported osquery `system_info` yet can surface
+                # from Fleet's `/hosts` endpoint with all three fields empty.
+                # Previously we dropped them — which also dropped their
+                # software/user edges from the graph. Synthesize a placeholder
+                # so downstream MERGE/SET writes complete and the webviz UI has
+                # a stable label until Fleet observes the real name; log the
+                # fleet_host_ids so an operator can investigate the Fleet-side
+                # root cause.
+                hostname = (
+                    host.get('computer_name')
+                    or host.get('display_name')
+                    or host.get('hostname')
+                )
+                if hostname:
+                    hostname = hostname.strip()
                 if not hostname:
                     hostname = f"fleet-host-{fleet_host_id}"
                     synthesized_hostname_ids.append(fleet_host_id)

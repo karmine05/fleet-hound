@@ -99,3 +99,4 @@ README.md
 .gitignore
 AGENTS.md
 data/memory*
+agentdb.rvf*
