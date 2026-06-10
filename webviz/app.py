@@ -1091,6 +1091,11 @@ def search_all():
             if team_filter != 'all':
                 host_query += " AND toString(h.team_id) = $team_id"
                 params['team_id'] = team_filter
+            # Label scope: the matched software was already label-scoped, but this
+            # connected-host pass would otherwise pull in EVERY host with that
+            # software (any label) — leaking out-of-scope hosts onto the graph.
+            host_query += label_flt_fragment
+            params.update(label_flt_params)
 
             host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
 
@@ -1119,6 +1124,10 @@ def search_all():
             if team_filter != 'all':
                 host_query += " AND toString(h.team_id) = $team_id"
                 params['team_id'] = team_filter
+            # Label scope: matched users were label-scoped, but this connected-host
+            # pass would otherwise pull in EVERY host they use (any label).
+            host_query += label_flt_fragment
+            params.update(label_flt_params)
 
             host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
 
@@ -1221,6 +1230,12 @@ def search_all():
                         user_host_query += " WHERE toLower(h.platform) CONTAINS toLower($platform)"
                     params['platform'] = platform_filter
 
+                # Apply label scope to relationships (mirrors team/platform above)
+                # so edges to out-of-scope hosts are never emitted. WHERE always
+                # exists here (the enclosing guard requires a non-empty id list).
+                user_host_query += label_flt_fragment
+                params.update(label_flt_params)
+
                 user_host_query += " RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id"
 
                 user_host_result = session.run(user_host_query, **params)
@@ -1279,6 +1294,12 @@ def search_all():
                     else:
                         software_host_query += " WHERE toLower(h.platform) CONTAINS toLower($platform)"
                     params['platform'] = platform_filter
+
+                # Apply label scope to relationships (mirrors team/platform above)
+                # so INSTALLED edges to out-of-scope hosts are never emitted. WHERE
+                # always exists here (the enclosing guard requires a non-empty id list).
+                software_host_query += label_flt_fragment
+                params.update(label_flt_params)
 
                 software_host_query += " RETURN DISTINCT s.name AS software_name, h.fleet_host_id AS fleet_host_id"
 
