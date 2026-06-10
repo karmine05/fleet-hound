@@ -18,7 +18,7 @@ Fleet Hound pulls hosts, users, and installed-software inventory from a [Fleet](
 | **Universal Security Graph** | Models every host, user, and software install as nodes/edges in a Bolt-protocol graph DB. | `src/ingestion.py` → Memgraph (`bolt://localhost:7687`) |
 | **Differential ETL** | Tracks `last_run_timestamp` per team in `.state.json`, fetches only `updated_at` deltas on subsequent runs. Use `--full-scan` to override. | `main.py`, `src/etl.py`, `src/extractor.py` |
 | **Blast Radius & Path Tracing** | Given a compromised host, user, or piece of software, walks the graph to surface every reachable asset across host reach, user impact, lateral movement, and platform spread. | `GET /api/blast-radius`, `GET /api/path` |
-| **Shadow IT Detection** | Finds outlier software (low-host-count, uncategorized, or absent from a `whitelist.json`) and ranks risk per host/user. | `GET /api/shadow-it`, `categorize_software.py` |
+| **Shadow IT Detection** | Flags software a user *deliberately installed* that is rare across the fleet (≤ a per-platform host threshold), high-risk by category, or version-sprawled. Native apps + browser/IDE extensions are in scope; OS plumbing, dev-language deps, subprocess helpers, and (by default) Linux distro packages are filtered out. Whitelist suppresses approved names. | `GET /api/shadow-it`, `src/shadow_it_filter.py`, `categorize_software.py` |
 | **Wikidata Enrichment** | Continuous background worker hits Wikidata SPARQL to attach `category` + `description` properties to `Software` nodes. Single-leader across gunicorn workers via fcntl flock. | `webviz/enrich_worker.py`, `categorize_software.py` |
 | **Graph Snapshots & Diff** | Streams the full graph to gzipped JSONL per ETL run; UI surfaces node/edge churn between any two snapshots. | `src/snapshot.py`, `GET /api/snapshots`, `GET /api/diff` |
 | **Software Authorization Whitelist** | Operators mark software as approved, mutating Shadow IT scoring on the next read. Persisted atomically. | `POST /api/authorize-software` |
@@ -206,6 +206,8 @@ python3 categorize_software.py --limit 0   # all uncategorized
 | `DEBUG` | no | `true` to enable extractor + auth diagnostics. |
 | `ENRICHER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` | no | Wikidata categorizer worker tuning. |
 | `OODA_ENABLED` / `_INTERVAL_SEC` / `_FULL_SCAN_EVERY` / `_TEAMS` | no | Autonomous supervisor (see below). |
+| `SHADOW_IT_OUTLIER_PCT` | no | Outlier threshold as a fraction of a platform's hosts. Default `0.03` (3%). Software on ≤ `max(2, platform_hosts × pct)` hosts of its platform is flagged. |
+| `SHADOW_IT_INCLUDE_LINUX_PACKAGES` | no | `true`/`1`/`yes`/`on` includes Linux distro packages (`deb`/`rpm`) in Shadow IT detection. **Default OFF** — osquery can't distinguish a deliberate `apt install` from a transitive dependency, so the bucket is noisy. |
 
 See `.env.example` for the canonical list and defaults.
 
@@ -228,6 +230,21 @@ All routes are under `/api/`. With a token configured, send it as `Authorization
 | `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikidata enricher introspection. |
 
 ![Shadow IT Details](assets/PIC-1.png)
+
+### How Shadow IT detection works
+
+Premise: **ubiquitous software is sanctioned; rare software is suspect.** Three detectors run over the graph, all sharing one eligibility gate (`src/shadow_it_filter.py`).
+
+**Eligibility gate** — a candidate must be a *deliberate user install*:
+- **In scope:** native apps (`apps`/`programs`/`homebrew_packages`/`chocolatey_packages`) and browser/IDE extensions (`chrome`/`firefox`/`safari`/`ie` extensions, `vscode`/`atom`/`jetbrains` plugins).
+- **Filtered out:** OS plumbing (regex over `lib*`, kernel, CUDA, MS runtimes…), dev-language transitive deps (`npm`/`pip`/`gem`/`cargo`/`go_binaries`), subprocess noise (Electron `… Helper (GPU)`, auto-updaters, crash reporters, build/test binaries), junk display names, and — **by default** — Linux distro packages (`deb`/`rpm`; opt in with `SHADOW_IT_INCLUDE_LINUX_PACKAGES=true`).
+
+**Detectors:**
+1. **Outlier (rarity)** — flag software installed on ≤ `max(2, platform_hosts × SHADOW_IT_OUTLIER_PCT)` hosts of its platform. Per-platform so 1-of-10 Linux ≠ 1-of-100 Windows. `host_count == 1` → high risk, else medium.
+2. **High-risk category** — curated brand list (remote-access, personal file-sync, personal messaging, crypto miners, Tor/VPN). Word-boundary match on enriched Wikidata category first, then name. Always high risk.
+3. **Version sprawl** — >2 distinct versions of one title across the fleet (patch-hygiene signal).
+
+A `whitelist.json` of operator-approved names suppresses matches on the next read.
 
 See `webviz/README.md` for the full route list and request/response shapes.
 

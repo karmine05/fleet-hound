@@ -135,6 +135,35 @@ SYSTEM_PACKAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Non-user-facing software: subprocess bundles, auto-updaters, crash
+# reporters, build/test binaries, and OS-runtime redistributables that osquery
+# surfaces under user-app sources (`apps`/`programs`) but that NO user
+# deliberately installed. These are pure Shadow-IT noise.
+#
+# DELIBERATELY CONSERVATIVE (2026-06-10): this regex does NOT match bare
+# `agent`/`service`/`host`/`daemon` tokens, because those can be the
+# security-relevant software itself (a DLP agent, a Chrome Remote Desktop
+# host). Only unambiguous subprocess/artifact patterns are matched. Validated
+# against 1,628 live single-host titles: 476 dropped, 0 real apps lost.
+NON_USER_FACING_RE = re.compile(
+    r"^("
+    # Chromium/Electron subprocess bundles: "X Helper", "X Helper (GPU|Renderer|Plugin|Alerts)"
+    r".* helper( \(.*\))?$|.*helper \((gpu|renderer|plugin|alerts)\)$"
+    # Login / crash / update companions
+    r"|.*loginhelper$|.*crashpad.*|.* crash ?reporter$|.*crashreporter$"
+    r"|.* updater$|.*autoupdater$|.*[ _]update helper$"
+    # macOS system placeholders / launch jobs
+    r"|.*placeholder$|.*launchagent$|.*launchdaemon$"
+    # Build / unit-test binaries (e.g. OpenSSL checkout artifacts)
+    r"|buildtest[_ ].*|.*[_ ]test\.exe$|.*test\.exe$|.*_test$"
+    # Microsoft runtime/redistributable/locale plumbing the OS-regex misses
+    r"|microsoft 365 - .*|microsoft windows desktop runtime.*"
+    r"|microsoft \.net.*|microsoft visual c\+\+.*|microsoft edgewebview2.*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
 # Wikidata category tokens that indicate "this is OS plumbing, not an app".
 SYSTEM_CATEGORY_TOKENS = (
     "software library", "shared library", "system library",
@@ -147,7 +176,16 @@ SYSTEM_CATEGORY_TOKENS = (
 DEV_LANGUAGE_SOURCES = frozenset({
     "npm_packages", "python_packages", "gem_packages", "cargo_packages",
     "pkg_packages", "portage_packages",
+    # go_binaries are compiled dev artifacts from a `go install`/build tree,
+    # not a deliberate end-user app install — treat as transitive-dep noise.
+    "go_binaries",
 })
+# Linux distro package channels. osquery cannot distinguish a deliberate
+# `apt install` from a transitive dependency pulled in by another package, so
+# this bucket carries inherent noise. Shadow IT detection EXCLUDES it BY
+# DEFAULT; operators opt in via SHADOW_IT_INCLUDE_LINUX_PACKAGES=true (see
+# include_linux_packages()).
+LINUX_PACKAGE_SOURCES = frozenset({"deb_packages", "rpm_packages"})
 # Browser + IDE extension channels. As of 2026-06-10 these are first-class
 # Shadow IT candidates (see module docstring) — a rogue Chrome/VS Code
 # extension is a top exfiltration vector — so they feed BOTH runtime detection
@@ -155,6 +193,7 @@ DEV_LANGUAGE_SOURCES = frozenset({
 EXTENSION_SOURCES = frozenset({
     "chrome_extensions", "firefox_addons", "safari_extensions",
     "ie_extensions", "vscode_extensions", "atom_packages",
+    "jetbrains_plugins",
 })
 # Browser extension channels specifically (subset of EXTENSION_SOURCES) — used
 # to label a detection's software_type as "Browser Extension".
@@ -162,8 +201,9 @@ BROWSER_EXTENSION_SOURCES = frozenset({
     "chrome_extensions", "firefox_addons", "safari_extensions", "ie_extensions",
 })
 # IDE / editor extension channels — labelled "VSCode Extension" in the UI.
+# (JetBrains plugins included: same risk class — an unvetted editor plugin.)
 IDE_EXTENSION_SOURCES = frozenset({
-    "vscode_extensions", "atom_packages",
+    "vscode_extensions", "atom_packages", "jetbrains_plugins",
 })
 # Sources that ARE the primary user-installable app surface — native apps the
 # user actively chose to install.
@@ -270,6 +310,33 @@ def get_outlier_pct(env_var: str = "SHADOW_IT_OUTLIER_PCT") -> float:
     return pct
 
 
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def include_linux_packages(env_var: str = "SHADOW_IT_INCLUDE_LINUX_PACKAGES") -> bool:
+    """Whether Linux distro packages (deb/rpm) are eligible Shadow IT.
+
+    Default FALSE: osquery cannot tell a deliberate `apt install` from a
+    transitive dependency, so this bucket is excluded unless the operator
+    opts in with SHADOW_IT_INCLUDE_LINUX_PACKAGES=true (1/yes/on also accepted).
+    """
+    raw = (os.environ.get(env_var) or "").strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+    return raw.lower() in _TRUE_TOKENS
+
+
+def is_linux_package_only(sources) -> bool:
+    """True if every recorded source is a Linux distro package channel
+    (deb_packages/rpm_packages) — i.e. no native-app or extension source."""
+    if not sources:
+        return False
+    src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
+    if not src_set:
+        return False
+    return src_set.issubset(LINUX_PACKAGE_SOURCES)
+
+
 def compute_per_platform_thresholds(session, pct: float = None) -> dict:
     """Return {platform: outlier_threshold_int} for every distinct
     Host.platform value in the graph.
@@ -306,6 +373,10 @@ def is_system_package(name: str, db_categories=None, sources=None) -> bool:
     suppressed even if it arrived via an extension channel (defensive), but
     extension-only sources alone never trigger suppression.
 
+    Linux distro packages (deb/rpm) are suppressed BY DEFAULT (osquery can't
+    distinguish a deliberate install from a transitive dep). Set
+    SHADOW_IT_INCLUDE_LINUX_PACKAGES=true to include them.
+
     Used by /api/shadow-it to suppress false positives AND by
     categorize_software.py to skip enrichment of items that are never going
     to be Shadow IT anyway (the May 2026 fix that stopped Wikidata from
@@ -315,7 +386,24 @@ def is_system_package(name: str, db_categories=None, sources=None) -> bool:
         return False
     if is_non_app_source(sources):
         return True
-    if SYSTEM_PACKAGE_RE.match(name.lower().strip()):
+    # Linux distro packages (deb/rpm) are excluded by default — opt in via
+    # SHADOW_IT_INCLUDE_LINUX_PACKAGES. Only suppress when the software is
+    # EXCLUSIVELY Linux-packaged (mixed deb+apps keeps it eligible via the app
+    # source).
+    if is_linux_package_only(sources) and not include_linux_packages():
+        return True
+    nm = name.lower().strip()
+    # Junk display names: empty or punctuation/whitespace/unicode-mark only
+    # (e.g. a bare backtick or a stray U+200E left-to-right mark) — never a
+    # real user install.
+    if not any(c.isalnum() for c in nm):
+        return True
+    if SYSTEM_PACKAGE_RE.match(nm):
+        return True
+    # Subprocess bundles, updaters, crash reporters, build/test binaries,
+    # OS-runtime redistributables — surfaced under user-app sources but not a
+    # deliberate install.
+    if NON_USER_FACING_RE.match(nm):
         return True
     if db_categories:
         cat_text = " ".join(c.lower() for c in db_categories if isinstance(c, str))

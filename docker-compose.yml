@@ -69,6 +69,10 @@ services:
       # Shadow IT outlier threshold (fraction of platform hosts; default 0.03).
       # Drives /api/shadow-it detection AND enrichment-candidate selection.
       - SHADOW_IT_OUTLIER_PCT
+      # Include Linux distro packages (deb/rpm) in Shadow IT detection.
+      # Default OFF — osquery can't tell a deliberate install from a transitive
+      # dep, so this bucket is noisy. Set true/1/yes/on to opt in.
+      - SHADOW_IT_INCLUDE_LINUX_PACKAGES
       # OODA supervisor — autonomous Observe→Orient→Decide→Act cycles.
       # Requires FLEET_URL + FLEET_API_TOKEN (or FLEET_EMAIL/FLEET_PASSWORD).
       - OODA_ENABLED
