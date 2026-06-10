@@ -27,16 +27,16 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 logger = logging.getLogger(__name__)
 
 # Shadow IT filter primitives. Enrichment only targets software that COULD
-# plausibly be Shadow IT — never OS plumbing, dev-language transitive deps,
-# CUDA stacks, or browser extensions. Pre-2026-05-07 the candidate query
+# plausibly be Shadow IT — deliberate user installs: native apps AND
+# browser/IDE extensions (2026-06-10). Never OS plumbing, dev-language
+# transitive deps, or CUDA stacks. Pre-2026-05-07 the candidate query
 # selected ANY uncategorized software, which meant every ETL cycle hammered
 # Wikidata with 250 lookups for items it had zero chance of finding (NVIDIA
 # Container, libnvblas12, Microsoft Visual C++ ..., etc).
 from src.shadow_it_filter import (
-    USER_APP_SOURCES,
+    SHADOW_IT_SOURCES,
     compute_per_platform_thresholds,
     get_outlier_pct,
-    has_user_app_source,
     is_system_package,
 )
 from src.software_catalog import catalog_size as _catalog_size
@@ -329,7 +329,9 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
         #      Per-platform avoids over-flagging rare software on small
         #      platforms and under-flagging on large ones.
         #   2. Source filter: only software whose `sources` intersects
-        #      USER_APP_SOURCES (apps/programs/homebrew/chocolatey).
+        #      SHADOW_IT_SOURCES — native apps (apps/programs/homebrew/
+        #      chocolatey) plus browser/IDE extensions (chrome/firefox/safari/
+        #      ie/vscode/atom). Dev-language transitive deps stay excluded.
         #   3. Name-pattern filter: surviving names through is_system_package()
         #      to catch Linux distro packages that don't expose a clean
         #      `sources` value but match the OS-plumbing regex.
@@ -340,7 +342,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
             thresholds = compute_per_platform_thresholds(session, outlier_pct)
         limit_label = f"{limit} max" if limit else "ALL"
         logger.info(
-            "fetching shadow-IT candidates outlier_pct=%d%% min=2 user_app_sources_only limit=%s",
+            "fetching shadow-IT candidates outlier_pct=%d%% min=2 shadow_it_sources(apps+extensions) limit=%s",
             int(outlier_pct * 100), limit_label,
         )
         if not thresholds:
@@ -372,7 +374,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                         """
                         MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {platform: $platform})
                         WHERE s.category IS NULL
-                          AND any(src IN coalesce(s.sources, []) WHERE src IN $user_app_sources)
+                          AND any(src IN coalesce(s.sources, []) WHERE src IN $shadow_it_sources)
                           AND (s.last_categorization_attempt_iso IS NULL
                                OR s.last_categorization_attempt_iso < $cutoff_iso)
                         WITH s.name AS name,
@@ -385,7 +387,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                         """,
                         platform=platform,
                         threshold=threshold,
-                        user_app_sources=list(USER_APP_SOURCES),
+                        shadow_it_sources=list(SHADOW_IT_SOURCES),
                         cutoff_iso=cutoff_iso,
                     )
                     for rec in result:

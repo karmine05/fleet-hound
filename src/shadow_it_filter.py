@@ -5,10 +5,19 @@ Single source of truth for "is this software a Shadow-IT candidate?" Used by:
   - categorize_software.py — candidate selection for Wikidata enrichment
 
 The contract: a Shadow IT candidate is software the USER actively chose to
-install (`apps`/`programs`/`homebrew_packages`/`chocolatey_packages`),
-installed on a small fraction of the platform's hosts (the "outlier"
-threshold, configurable via SHADOW_IT_OUTLIER_PCT env var, default 3%),
-and not OS plumbing / dev-language transitive deps / browser extensions.
+install — native apps (`apps`/`programs`/`homebrew_packages`/
+`chocolatey_packages`) AND browser/IDE extensions (`chrome_extensions`/
+`firefox_addons`/`safari_extensions`/`ie_extensions`/`vscode_extensions`/
+`atom_packages`) — installed on a small fraction of the platform's hosts
+(the "outlier" threshold, configurable via SHADOW_IT_OUTLIER_PCT env var,
+default 3%), and not OS plumbing or dev-language transitive deps.
+
+Browser and IDE extensions are first-class Shadow IT (2026-06-10): an
+unvetted Chrome extension or VS Code extension is one of the highest-signal
+data-exfiltration vectors on an endpoint. They were previously bundled with
+dev-language transitive deps and suppressed wholesale — that gap is closed.
+Only dev-language package-manager deps (npm/pip/gem/cargo/...) remain noise:
+those are transitive build artifacts, not a user's deliberate install.
 
 Per-platform threshold rationale: a piece of software installed on 1 of 10
 Linux servers means something very different than 1 of 100 Windows
@@ -139,39 +148,89 @@ DEV_LANGUAGE_SOURCES = frozenset({
     "npm_packages", "python_packages", "gem_packages", "cargo_packages",
     "pkg_packages", "portage_packages",
 })
+# Browser + IDE extension channels. As of 2026-06-10 these are first-class
+# Shadow IT candidates (see module docstring) — a rogue Chrome/VS Code
+# extension is a top exfiltration vector — so they feed BOTH runtime detection
+# and Wikidata enrichment, exactly like native apps.
 EXTENSION_SOURCES = frozenset({
     "chrome_extensions", "firefox_addons", "safari_extensions",
     "ie_extensions", "vscode_extensions", "atom_packages",
 })
-# Sources that ARE the primary user-installable app surface — apps the user
-# actively chose to install. These are the highest-signal Shadow IT candidates
-# AND the only sources that should drive Wikidata enrichment.
+# Browser extension channels specifically (subset of EXTENSION_SOURCES) — used
+# to label a detection's software_type as "Browser Extension".
+BROWSER_EXTENSION_SOURCES = frozenset({
+    "chrome_extensions", "firefox_addons", "safari_extensions", "ie_extensions",
+})
+# IDE / editor extension channels — labelled "VSCode Extension" in the UI.
+IDE_EXTENSION_SOURCES = frozenset({
+    "vscode_extensions", "atom_packages",
+})
+# Sources that ARE the primary user-installable app surface — native apps the
+# user actively chose to install.
 USER_APP_SOURCES = frozenset({
     "apps",                  # macOS .app bundles
     "programs",              # Windows installed programs
     "homebrew_packages",     # macOS user-installed
     "chocolatey_packages",   # Windows user-installed
 })
+# The full set of sources eligible for Shadow IT detection AND Wikidata
+# enrichment: deliberately-installed native apps + browser/IDE extensions.
+# This is the union both the runtime endpoint and the enrichment candidate
+# query gate on. Dev-language transitive deps are intentionally excluded.
+SHADOW_IT_SOURCES = USER_APP_SOURCES | EXTENSION_SOURCES
 
 
 def is_non_app_source(sources) -> bool:
-    """True if every recorded source is a dev-language package manager or
-    a browser/IDE extension — i.e. not a user-installed app."""
+    """True if every recorded source is a dev-language package manager
+    (npm/pip/gem/cargo/...) — transitive build deps that are never a user's
+    deliberate install, hence never Shadow IT.
+
+    Note (2026-06-10): browser/IDE extensions are NO LONGER treated as
+    non-app noise. Software whose only sources are extension channels is a
+    Shadow IT candidate and must NOT be suppressed here.
+    """
     if not sources:
         return False
     src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
     if not src_set:
         return False
-    return src_set.issubset(DEV_LANGUAGE_SOURCES | EXTENSION_SOURCES)
+    return src_set.issubset(DEV_LANGUAGE_SOURCES)
 
 
 def has_user_app_source(sources) -> bool:
-    """True if at least one recorded source is a user-installable-app channel
-    (apps, programs, homebrew_packages, chocolatey_packages)."""
+    """True if at least one recorded source is a native user-installable-app
+    channel (apps, programs, homebrew_packages, chocolatey_packages)."""
     if not sources:
         return False
     src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
     return bool(src_set & USER_APP_SOURCES)
+
+
+def has_shadow_it_source(sources) -> bool:
+    """True if at least one recorded source is Shadow-IT-eligible — a native
+    app channel OR a browser/IDE extension channel. This is the gate used for
+    detection and enrichment-candidate selection."""
+    if not sources:
+        return False
+    src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
+    return bool(src_set & SHADOW_IT_SOURCES)
+
+
+def classify_extension_type(sources):
+    """Return a UI software_type label when `sources` indicates an extension:
+    'Browser Extension', 'VSCode Extension', or None if not an extension.
+
+    Browser sources win over IDE sources when both are present (rare), since
+    the browser exfiltration surface is the higher-priority signal.
+    """
+    if not sources:
+        return None
+    src_set = {s.lower().strip() for s in sources if isinstance(s, str) and s.strip()}
+    if src_set & BROWSER_EXTENSION_SOURCES:
+        return "Browser Extension"
+    if src_set & IDE_EXTENSION_SOURCES:
+        return "VSCode Extension"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +297,14 @@ def compute_per_platform_thresholds(session, pct: float = None) -> dict:
 
 
 def is_system_package(name: str, db_categories=None, sources=None) -> bool:
-    """True if a Software node represents OS plumbing, dev-language transitive
-    deps, or a browser/IDE extension — anything NOT a user-chosen end-user app.
+    """True if a Software node represents OS plumbing or dev-language
+    transitive deps — i.e. NOT a deliberate user install.
+
+    NOTE (2026-06-10): browser/IDE extensions are explicitly NOT suppressed
+    here anymore. They are deliberate user installs and therefore valid
+    Shadow IT candidates. A name that matches the OS-plumbing regex is still
+    suppressed even if it arrived via an extension channel (defensive), but
+    extension-only sources alone never trigger suppression.
 
     Used by /api/shadow-it to suppress false positives AND by
     categorize_software.py to skip enrichment of items that are never going

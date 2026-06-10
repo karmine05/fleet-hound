@@ -37,9 +37,11 @@ from src.shadow_it_filter import (
     DEV_LANGUAGE_SOURCES as _DEV_LANGUAGE_SOURCES,
     EXTENSION_SOURCES as _EXTENSION_SOURCES,
     MIN_OUTLIER_HOSTS as _MIN_OUTLIER_HOSTS,
+    SHADOW_IT_SOURCES as _SHADOW_IT_SOURCES,  # noqa: F401  (used by future endpoints)
     SYSTEM_CATEGORY_TOKENS as _SYSTEM_CATEGORY_TOKENS,
     SYSTEM_PACKAGE_RE as _SYSTEM_PACKAGE_RE,
     USER_APP_SOURCES as _USER_APP_SOURCES,
+    classify_extension_type as _classify_extension_type,
     compute_per_platform_thresholds as _compute_per_platform_thresholds,
     get_outlier_pct as _get_outlier_pct,
     has_user_app_source as _has_user_app_source,  # noqa: F401  (used by future endpoints)
@@ -2523,18 +2525,30 @@ def get_shadow_it():
         return jsonify({"error": "Invalid filter", "message": str(exc)}), 400
     
     # Software type detection patterns
-    def detect_software_type(software_name):
-        """Detect the type of software based on name patterns"""
+    def detect_software_type(software_name, sources=None):
+        """Detect the type of software.
+
+        The osquery install `source` is the authoritative signal — an
+        extension named "binhex.ninja" carries no name hint, only its
+        `chrome_extensions`/`vscode_extensions` source reveals what it is.
+        Source-based classification therefore runs FIRST; name heuristics are
+        the fallback for software with no usable source.
+        """
+        # Source-authoritative: browser / IDE extension channels.
+        ext_type = _classify_extension_type(sources)
+        if ext_type:
+            return ext_type
+
         name_lower = software_name.lower()
-        
-        # Browser Extensions
+
+        # Browser Extensions (name fallback)
         if any(x in name_lower for x in ['-extension', 'chrome extension', 'firefox addon', 'safari extension', 'edge extension']):
             return 'Browser Extension'
-        
-        # VSCode Extensions  
+
+        # VSCode Extensions (name fallback)
         if any(x in name_lower for x in ['vscode-', '.vscode', 'code-extension']):
             return 'VSCode Extension'
-        
+
         # Package Managers
         if name_lower.startswith('npm:') or name_lower.startswith('@'):
             return 'npm Package'
@@ -2698,11 +2712,13 @@ def get_shadow_it():
             
             result = session.run(outlier_query, **filter_params)
             for record in result:
-                # Skip OS-managed system packages, dev-language transitive deps,
-                # and browser/IDE extensions — none are user-chosen apps. The
-                # `sources` field carries the osquery install channel
-                # (apps, programs, deb_packages, npm_packages, vscode_extensions
-                # ...) and is the strongest signal.
+                # Skip OS-managed system packages and dev-language transitive
+                # deps — neither is a deliberate user install. Browser/IDE
+                # extensions are NOT skipped (2026-06-10): they are first-class
+                # Shadow IT. The `sources` field carries the osquery install
+                # channel (apps, programs, deb_packages, npm_packages,
+                # chrome_extensions, vscode_extensions ...) and is the strongest
+                # signal.
                 if _is_system_package(
                     record['software_name'],
                     record.get('db_category') or [],
@@ -2733,13 +2749,16 @@ def get_shadow_it():
                     if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                         continue
                 
-                # Detect software type
-                software_type = detect_software_type(record['software_name'])
+                # Detect software type (source-authoritative — extensions
+                # are identified by their install channel, not their name).
+                software_type = detect_software_type(
+                    record['software_name'], record.get('db_sources') or []
+                )
 
                 # Apply software type filter
                 if software_type_filter != 'all' and software_type != software_type_filter:
                     continue
-                
+
                 if risk_filter == 'all' or risk_filter == risk_level:
                     detections.append({
                         "id": f"outlier_{detection_id_counter}",
@@ -2784,9 +2803,10 @@ def get_shadow_it():
                 db_categories = record.get('db_category') or []
                 db_sources = record.get('db_sources') or []
 
-                # Skip OS-managed system packages, dev-language transitive deps,
-                # and browser/IDE extensions outright — none of these are
-                # Shadow IT regardless of name overlap with high-risk patterns.
+                # Skip OS-managed system packages and dev-language transitive
+                # deps outright — never Shadow IT regardless of name overlap
+                # with high-risk patterns. Browser/IDE extensions ARE evaluated
+                # (2026-06-10) so a high-risk extension still surfaces here.
                 if _is_system_package(record['software_name'], db_categories, db_sources):
                     continue
 
@@ -2840,13 +2860,15 @@ def get_shadow_it():
                         if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                             continue
                     
-                    # Detect software type
-                    software_type = detect_software_type(record['software_name'])
-                    
+                    # Detect software type (source-authoritative).
+                    software_type = detect_software_type(
+                        record['software_name'], db_sources
+                    )
+
                     # Apply software type filter
                     if software_type_filter != 'all' and software_type != software_type_filter:
                         continue
-                    
+
                     if risk_filter == 'all' or risk_filter == risk_level:
                         # Category-specific recommendations. Keys must match
                         # HIGH_RISK_PATTERNS exactly.
@@ -2898,9 +2920,10 @@ def get_shadow_it():
 
             result = session.run(version_sprawl_query, **filter_params)
             for record in result:
-                # System packages, dev-language deps, and extensions routinely
-                # show many versions across distro releases / lockfile drift —
-                # that's package-manager state, not Shadow IT.
+                # System packages and dev-language deps routinely show many
+                # versions across distro releases / lockfile drift — that's
+                # package-manager state, not Shadow IT. Extensions remain
+                # in-scope (2026-06-10).
                 if _is_system_package(
                     record['software_name'],
                     record.get('db_category') or [],
@@ -2936,13 +2959,15 @@ def get_shadow_it():
                     if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
                         continue
                 
-                # Detect software type
-                software_type = detect_software_type(record['software_name'])
+                # Detect software type (source-authoritative).
+                software_type = detect_software_type(
+                    record['software_name'], record.get('db_sources') or []
+                )
 
                 # Apply software type filter
                 if software_type_filter != 'all' and software_type != software_type_filter:
                     continue
-                
+
                 if risk_filter == 'all' or risk_filter == risk_level:
                     detections.append({
                         "id": f"sprawl_{detection_id_counter}",
