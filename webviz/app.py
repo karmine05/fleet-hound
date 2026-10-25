@@ -598,7 +598,10 @@ def get_software():
         result = session.run(
             """
             MATCH (s:Software)
-            RETURN s.name AS name, s.versions AS versions, s.last_version AS last_version
+            RETURN s.name AS name,
+                   coalesce(s.display_name, s.name) AS display_name,
+                   s.versions AS versions, s.last_version AS last_version,
+                   s.kind AS kind, s.extension_key AS extension_key
             LIMIT $limit
             """,
             limit=limit,
@@ -898,13 +901,15 @@ def search_all():
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
 
-    # Limit parameter
+    # Limit parameter. Hard-capped so an authenticated (or loopback) caller
+    # cannot `?limit=1000000` the whole graph into one response.
     try:
         limit_param = int(request.args.get('limit', 0))
-    except ValueError:
+    except (TypeError, ValueError):
         limit_param = 0
-    
-    # Default limits
+    if limit_param > 0:
+        limit_param = min(limit_param, 5000)
+
     cypher_limit = limit_param if limit_param > 0 else 100
     display_limit = limit_param if limit_param > 0 else 10
 
@@ -4159,14 +4164,17 @@ def not_found(error):
 
 @app.errorhandler(ClientError)
 def handle_database_error(error):
-    """Handle database client errors (e.g. invalid regex)"""
-    logger.error(f"Database error: {error}")
-    # Return 400 Bad Request for client errors (like bad regex)
-    return jsonify({
-        "error": "Database error", 
-        "message": str(error),
-        "code": "BAD_REQUEST"
-    }), 400
+    """Handle database client errors (e.g. invalid regex)."""
+    logger.error("Database error: %s", error)
+    payload = {
+        "error": "Database error",
+        "code": "BAD_REQUEST",
+    }
+    if DEBUG_ERROR_DETAILS:
+        payload["message"] = str(error)
+    else:
+        payload["message"] = "invalid query"
+    return jsonify(payload), 400
 
 @app.errorhandler(500)
 def internal_error(error):

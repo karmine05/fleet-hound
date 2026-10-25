@@ -8,13 +8,9 @@ services:
     # snapshots without warning; a major *downgrade* (e.g. 2.x engine over 3.x
     # data) fails to start the database at all. Verify with `SHOW VERSION`.
     image: memgraph/memgraph:3.14.0
-    # Sized for a 64GB / 14-core host. 3.x takes the limit in MiB and there is
-    # no explicit default: 0 means 90% of physical RAM (57G here), which would
-    # blow the 10G container cap and get the container OOM-killed. Concurrency
-    # flags from 2.x are gone in 3.x — bolt workers default to core count.
-    command:
-      - "--memory-limit"
-      - "8192"
+    # Memory cap lives in config/memgraph.conf (`--memory-limit=8192`). Do not
+    # set `command:` here: a Compose command replaces the image argv and
+    # causes Memgraph to ignore the conf (WAL, snapshots, query timeout).
     container_name: fleet-memgraph
     ports:
       - "127.0.0.1:7687:7687" # Bolt protocol (loopback; webviz talks over the compose network)
@@ -23,11 +19,17 @@ services:
       - memgraph-data:/var/lib/memgraph
       - memgraph-log:/var/log/memgraph
       - ./config/memgraph.conf:/etc/memgraph/memgraph.conf:ro
-    # command: handled by config file
+    environment:
+      - MEMGRAPH_USER
+      - MEMGRAPH_PASSWORD
     networks:
       - fleet-network
     healthcheck:
-      test: [ "CMD-SHELL", "echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false || exit 1" ]
+      test:
+        [
+          "CMD-SHELL",
+          "if [ -n \"$$MEMGRAPH_USER\" ] && [ -n \"$$MEMGRAPH_PASSWORD\" ]; then echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false --username=\"$$MEMGRAPH_USER\" --password=\"$$MEMGRAPH_PASSWORD\" || echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; else echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; fi || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5

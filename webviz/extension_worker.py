@@ -267,7 +267,8 @@ def _metadata_for(record: dict, cache_dir: str):
 def _write_result(driver, names, result: dict, extension_key: str) -> bool:
     query = """
         UNWIND $names AS n
-        MATCH (s:Software {name: n})
+        MATCH (s:Software)
+        WHERE s.name = n OR s.extension_key = n OR s.extension_key = $extension_key
         SET s.kind = 'browser_extension',
             s.extension_key = coalesce(s.extension_key, $extension_key),
             s.risk_score = $risk_score,

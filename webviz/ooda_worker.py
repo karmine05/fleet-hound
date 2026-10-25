@@ -51,7 +51,10 @@ from src.etl import (  # noqa: E402
     save_full_scan_cadence,
     should_force_full_scan,
 )
-from src.shadow_it_filter import SHADOW_IT_SOURCES  # noqa: E402
+from src.shadow_it_filter import (  # noqa: E402
+    SHADOW_IT_SOURCES,
+    compute_per_platform_thresholds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -239,36 +242,52 @@ def _decide_phase(driver) -> tuple[dict, dict]:
             summary["uncategorized"] = uncat
 
             # Shadow IT proxy: low-host-count software, uncategorized first.
-            # Gated to user-chosen channels (native apps + extensions) — without
-            # the source filter, every system package installed on <=3 hosts
-            # (libssl, apt, kernel modules) floods the findings list. No
-            # `sources IS NULL` arm: legacy sourceless rows can't be attributed
-            # to a user channel, so they are not shadow-IT candidates.
-            rows = session.run(
-                """
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE any(x IN s.sources WHERE x IN $eligible)
-                WITH s, count(DISTINCT h) AS host_count
-                WHERE host_count <= 3
-                RETURN s.name AS name,
-                       s.category AS category,
-                       host_count
-                ORDER BY (s.category IS NULL) DESC, host_count ASC, s.name ASC
-                LIMIT 50
-                """,
-                eligible=list(SHADOW_IT_SOURCES),
-            )
-            shadow = [
-                {
-                    "name": r["name"],
-                    "category": r["category"],
-                    "host_count": int(r["host_count"]),
-                }
-                for r in rows
-                if r.get("name")
-            ]
-            findings["shadow_it"] = shadow
-            summary["shadow_it_count"] = len(shadow)
+            # Same eligibility + per-platform threshold as /api/shadow-it so
+            # Decide findings don't disagree with the dashboard (a hardcoded
+            # `host_count <= 3` under-flagged a 200-host Windows fleet whose
+            # outlier floor is max(2, 200*0.03)=6).
+            thresholds = compute_per_platform_thresholds(session)
+            if not thresholds:
+                findings["shadow_it"] = []
+                summary["shadow_it_count"] = 0
+            else:
+                # UNWIND a list of {platform, threshold} rather than
+                # `$thresholds[platform]` — Memgraph map indexing is not
+                # guaranteed across 2.x/3.x and a missing key would drop
+                # the row silently.
+                threshold_rows = [
+                    {"platform": p, "threshold": t}
+                    for p, t in thresholds.items()
+                ]
+                rows = session.run(
+                    """
+                    UNWIND $threshold_rows AS tr
+                    MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {platform: tr.platform})
+                    WHERE any(x IN coalesce(s.sources, []) WHERE x IN $eligible)
+                    WITH s, tr.platform AS platform, tr.threshold AS threshold,
+                         count(DISTINCT h) AS host_count
+                    WHERE host_count <= threshold
+                    WITH s, min(host_count) AS host_count
+                    RETURN s.name AS name,
+                           s.category AS category,
+                           host_count
+                    ORDER BY (s.category IS NULL) DESC, host_count ASC, s.name ASC
+                    LIMIT 50
+                    """,
+                    eligible=list(SHADOW_IT_SOURCES),
+                    threshold_rows=threshold_rows,
+                )
+                shadow = [
+                    {
+                        "name": r["name"],
+                        "category": r["category"],
+                        "host_count": int(r["host_count"]),
+                    }
+                    for r in rows
+                    if r.get("name")
+                ]
+                findings["shadow_it"] = shadow
+                summary["shadow_it_count"] = len(shadow)
     except Exception as exc:
         logger.warning("ooda: decide queries failed: %s", exc)
         findings["error"] = f"{type(exc).__name__}: {exc}"

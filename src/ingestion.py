@@ -291,6 +291,14 @@ class MemgraphIngestion:
             except Exception as exc:
                 logger.warning("installed_on edge dedupe skipped: %s", exc)
 
+            # One-shot: rename existing extension nodes so s.name == s.extension_key.
+            # After this, MERGE (s:Software {name: extension_key}) hits the
+            # existing node instead of creating a parallel path-named one.
+            try:
+                self._migrate_extension_names_to_keys(session)
+            except Exception as exc:
+                logger.warning("extension_key name migration skipped: %s", exc)
+
     def create_graph_relationships(self, hosts_data, extractor, global_users=None):
         """
         Ingest hosts, users, software, and relationships into Memgraph.
@@ -533,6 +541,13 @@ class MemgraphIngestion:
                             }
                             if ext:
                                 entry.update(ext)
+                                # UNIQUE is still on Software.name. For extensions
+                                # the stable identity is extension_key, so that
+                                # becomes the MERGE key; the human title lives in
+                                # display_name (already set by derive_extension_identity).
+                                entry['name'] = ext['extension_key']
+                                if not entry.get('display_name'):
+                                    entry['display_name'] = name_lc
                                 vulns_json, vuln_count, max_cvss = summarize_vulnerabilities(
                                     s.get('vulnerabilities')
                                 )
@@ -838,6 +853,141 @@ class MemgraphIngestion:
             out[k] = sorted(pool, key=lambda n: (len(n), n))[0]
         return out
 
+    def _migrate_extension_names_to_keys(self, session) -> None:
+        """Rename existing extension nodes so s.name == s.extension_key.
+
+        Pre-this-change ingest MERGEd on the Fleet display/path name and stored
+        extension_key as a property. Going forward MERGE is on extension_key
+        (still via UNIQUE(name)). Without this rename the next cycle would
+        CREATE a second node keyed by the key and leave the old title-named
+        node as an orphan.
+
+        Groups by extension_key, picks one survivor (already named as the key
+        if present, else the canonical title), re-points INSTALLED_ON, then
+        SET survivor.name = extension_key.
+        """
+        rec = session.run(
+            """
+            MATCH (s:Software)
+            WHERE s.extension_key IS NOT NULL
+              AND s.extension_key STARTS WITH 'ext:'
+              AND s.name <> s.extension_key
+            RETURN count(s) AS n
+            """
+        ).single()
+        pending = int(rec["n"]) if rec and rec.get("n") else 0
+        if pending == 0:
+            return
+
+        logger.info("extension_key name migration: %d node(s) to rename", pending)
+        keys = [
+            r["k"]
+            for r in session.run(
+                """
+                MATCH (s:Software)
+                WHERE s.extension_key IS NOT NULL
+                  AND s.extension_key STARTS WITH 'ext:'
+                RETURN DISTINCT s.extension_key AS k
+                """
+            )
+            if r.get("k")
+        ]
+        renamed = 0
+        absorbed = 0
+        for key in keys:
+            nodes = list(session.run(
+                """
+                MATCH (s:Software {extension_key: $k})
+                RETURN s.name AS name
+                """,
+                k=key,
+            ))
+            names = [n["name"] for n in nodes if n.get("name")]
+            if not names:
+                continue
+            if key in names:
+                survivor = key
+            else:
+                clean = [n for n in names if not _is_pathy_name(n)]
+                pool = clean if clean else names
+                survivor = sorted(pool, key=lambda n: (len(n), n))[0]
+            dups = [n for n in names if n != survivor]
+            for dname in dups:
+                session.run(
+                    """
+                    MATCH (dup:Software {name: $dname})-[r:INSTALLED_ON]->(h:Host)
+                    MATCH (canon:Software {name: $survivor})
+                    MERGE (canon)-[nr:INSTALLED_ON]->(h)
+                    ON CREATE SET nr.first_seen = r.first_seen
+                    SET nr.version = coalesce(nr.version, r.version),
+                        nr.source = coalesce(nr.source, r.source),
+                        nr.browser = coalesce(nr.browser, r.browser),
+                        nr.extension_for = coalesce(nr.extension_for, r.extension_for),
+                        nr.installed_path = coalesce(nr.installed_path, r.installed_path),
+                        nr.extension_key = coalesce(nr.extension_key, r.extension_key, $k),
+                        nr.last_seen = CASE
+                            WHEN r.last_seen IS NOT NULL AND (nr.last_seen IS NULL OR r.last_seen > nr.last_seen)
+                            THEN r.last_seen ELSE nr.last_seen END,
+                        nr.first_seen = CASE
+                            WHEN r.first_seen IS NOT NULL AND (nr.first_seen IS NULL OR r.first_seen < nr.first_seen)
+                            THEN r.first_seen ELSE nr.first_seen END
+                    DELETE r
+                    """,
+                    dname=dname, survivor=survivor, k=key,
+                ).consume()
+                session.run(
+                    """
+                    MATCH (canon:Software {name: $survivor}), (dup:Software {name: $dname})
+                    SET canon.display_name = coalesce(canon.display_name, dup.display_name, dup.name),
+                        canon.versions = coalesce(canon.versions, []) + [
+                            v IN coalesce(dup.versions, []) WHERE NOT v IN coalesce(canon.versions, [])
+                        ],
+                        canon.sources = coalesce(canon.sources, []) + [
+                            v IN coalesce(dup.sources, []) WHERE NOT v IN coalesce(canon.sources, [])
+                        ]
+                    WITH dup
+                    DETACH DELETE dup
+                    """,
+                    survivor=survivor, dname=dname,
+                ).consume()
+                absorbed += 1
+            if survivor != key:
+                # UNIQUE(name) would reject SET name=key if a native package
+                # already owns that string (extremely unlikely for 'ext:...').
+                clash = session.run(
+                    "MATCH (s:Software {name: $k}) RETURN s.name AS n", k=key
+                ).single()
+                if clash is None:
+                    session.run(
+                        """
+                        MATCH (s:Software {name: $old})
+                        SET s.name = $k,
+                            s.display_name = coalesce(s.display_name, $old),
+                            s.kind = coalesce(s.kind, 'browser_extension'),
+                            s.extension_key = $k
+                        """,
+                        old=survivor, k=key,
+                    ).consume()
+                    renamed += 1
+                else:
+                    logger.warning(
+                        "extension_key migration: cannot rename %r -> %r (name taken)",
+                        survivor, key,
+                    )
+            else:
+                session.run(
+                    """
+                    MATCH (s:Software {name: $k})
+                    SET s.kind = coalesce(s.kind, 'browser_extension'),
+                        s.extension_key = $k
+                    """,
+                    k=key,
+                ).consume()
+        logger.info(
+            "extension_key name migration done renamed=%d absorbed=%d keys=%d",
+            renamed, absorbed, len(keys),
+        )
+
     def _batch_create_software_grouped(self, session, software_grouped_batch):
         """
         Optimized batch creation of software grouped by host.
@@ -846,31 +996,9 @@ class MemgraphIngestion:
         if not software_grouped_batch:
             return
 
-        # 0. Canonical extension names. Rewrite every extension row to the
-        # canonical name for its extension_key BEFORE anything else: node
-        # MERGE, rel MERGE and the stale-rel prune all key on `name`, so they
-        # only agree if the rewrite happens first.
-        ext_keys = sorted({
-            sw.get("extension_key")
-            for entry in software_grouped_batch
-            for sw in entry.get("software_list") or []
-            if sw.get("extension_key")
-        })
-        if ext_keys:
-            canonical_by_key = self._resolve_canonical_extension_names(
-                session, ext_keys, software_grouped_batch
-            )
-            if canonical_by_key:
-                for entry in software_grouped_batch:
-                    for sw in entry.get("software_list") or []:
-                        key = sw.get("extension_key")
-                        if key and key in canonical_by_key:
-                            sw["name"] = canonical_by_key[key]
-
-        # 0b. Deterministic last_version. The node's `last_version` is the
-        # highest version observed across hosts — not whichever host wrote
-        # last (old behavior). Per-host current versions live on the
-        # INSTALLED_ON edge, where they were always correct.
+        # 0. last_version is the highest version observed across hosts for this
+        # MERGE key (`name`, which for extensions is now extension_key). Per-host
+        # current versions live on the INSTALLED_ON edge.
         incoming_versions: dict = {}
         for entry in software_grouped_batch:
             for sw in entry.get("software_list") or []:
@@ -998,12 +1126,14 @@ class MemgraphIngestion:
         )
         if not nodes_ok:
             # The node MERGE is global to this batch: if it fails, the rel
-            # MERGE below matches no Software nodes and silently drops every
-            # rel for every host in the batch. Mark them failed so the ETL
-            # layer holds the .state.json watermark and re-sends next cycle.
+            # MERGE below matches no Software nodes. The stale-rel DELETE
+            # (`WHERE NOT s.name IN batch.software_names`) would then wipe
+            # every INSTALLED_ON edge for these hosts. Mark them failed and
+            # skip prune/rel-MERGE so the next cycle can rebuild.
             self.failed_software_host_ids.extend(
                 e['fleet_host_id'] for e in software_grouped_batch
             )
+            return
 
         # 3. Per-chunk pipeline: (a) prune stale rels (delta-delete), (b) MERGE
         # fresh rels, (c) stamp software_updated_at watermark.
@@ -1028,7 +1158,8 @@ class MemgraphIngestion:
         delete_stale_query = """
             UNWIND $batches AS batch
             MATCH (h:Host {fleet_host_id: batch.fleet_host_id})<-[r:INSTALLED_ON]-(s:Software)
-            WHERE NOT s.name IN batch.software_names
+            WHERE NOT s.name IN batch.keep_ids
+              AND NOT coalesce(s.extension_key, '') IN batch.keep_ids
             DELETE r
         """
         query_rels = """
@@ -1086,7 +1217,12 @@ class MemgraphIngestion:
                 delete_payload = [
                     {
                         'fleet_host_id': e['fleet_host_id'],
-                        'software_names': [sw['name'] for sw in e['software_list']],
+                        'keep_ids': list({
+                            key
+                            for sw in e['software_list']
+                            for key in (sw.get('name'), sw.get('extension_key'))
+                            if key
+                        }),
                     }
                     for e in c
                 ]

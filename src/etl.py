@@ -499,6 +499,7 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                 member_map = {}
 
         logger.info("etl: ingesting into Memgraph %s", cfg.memgraph_uri)
+        failed_sw_hosts: list = []
         with MemgraphIngestion(cfg.memgraph_uri) as ingestion:
             ingestion.create_constraints()
             # Streaming ingest — drains hosts_iter, populating known_host_ids
@@ -626,6 +627,15 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     logger.warning("etl: host reap failed: %s", msg)
                     result.host_reap_error = msg
 
+            # Capture any hosts whose software rows failed to reach Memgraph
+            # BEFORE the with-block closes the driver. Nested under snapshot
+            # this used to UnboundLocalError when skip_snapshot=True, and
+            # never ran if snapshot threw before the assignment.
+            failed_sw_hosts = list(ingestion.failed_software_host_ids)
+
+        if failed_sw_hosts:
+            result.failed_host_count = len(failed_sw_hosts)
+
         # Orient: enrichment kick. Best-effort — never breaks a cycle.
         if not cfg.skip_enrichment:
             result.enrichment_attempted = True
@@ -657,14 +667,6 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                 msg = f"{type(exc).__name__}: {exc}"
                 logger.warning("etl: snapshot write failed: %s", msg)
                 result.snapshot_error = msg
-
-            # Capture any hosts whose software rows failed to reach Memgraph.
-            # The ingestion instance accumulates them across all
-            # _batch_create_software_grouped calls this cycle.
-            failed_sw_hosts = list(ingestion.failed_software_host_ids)
-
-        if failed_sw_hosts:
-            result.failed_host_count = len(failed_sw_hosts)
 
         # Advance watermarks only after a complete extract+ingest. A truncated
         # /hosts walk used to bump last_run_timestamp anyway, so the next delta

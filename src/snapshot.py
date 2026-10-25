@@ -143,16 +143,20 @@ def _iter_graph(driver):
                     "hash": _node_hash(props),
                 }
 
-            sw_keys = ["name", "last_version", "versions", "category",
-                       "wikidata_description", "last_categorized", "sources"]
+            sw_keys = ["name", "display_name", "last_version", "versions", "category",
+                       "wikidata_description", "last_categorized", "sources",
+                       "extension_key", "kind"]
             sw_q = """
                 MATCH (s:Software)
-                RETURN s.name AS name, s.last_version AS last_version,
+                RETURN s.name AS name, s.display_name AS display_name,
+                       s.last_version AS last_version,
                        s.versions AS versions,
                        s.category AS category,
                        s.wikidata_description AS wikidata_description,
                        s.last_categorized AS last_categorized,
-                       s.sources AS sources
+                       s.sources AS sources,
+                       s.extension_key AS extension_key,
+                       s.kind AS kind
             """
             for rec in session.run(sw_q):
                 name = rec["name"]

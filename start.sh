@@ -60,6 +60,19 @@ OODA_ENABLED_VAL="$(read_env OODA_ENABLED || true)"
 PORT_VAL="$(read_env PORT || echo 8080)"
 PORT_VAL="${PORT_VAL:-8080}"
 BASE_URL="http://127.0.0.1:${PORT_VAL}"
+MEMGRAPH_USER_VAL="$(read_env MEMGRAPH_USER || true)"
+MEMGRAPH_PASSWORD_VAL="$(read_env MEMGRAPH_PASSWORD || true)"
+
+mg_ready() {
+    if [[ -n "${MEMGRAPH_USER_VAL}" && -n "${MEMGRAPH_PASSWORD_VAL}" ]]; then
+        echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole \
+            --host 127.0.0.1 --port 7687 --use-ssl=false \
+            --username="${MEMGRAPH_USER_VAL}" --password="${MEMGRAPH_PASSWORD_VAL}" \
+            &>/dev/null && return 0
+    fi
+    echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole \
+        --host 127.0.0.1 --port 7687 --use-ssl=false &>/dev/null
+}
 
 if [[ -z "${WEBVIZ_API_TOKEN_VAL}" ]]; then
     warn "WEBVIZ_API_TOKEN is empty — /api/* GETs will be loopback-only and OODA status check will be skipped."
@@ -72,13 +85,19 @@ info "Building + starting containers..."
 # --- Wait for Memgraph -----------------------------------------------------
 info "Waiting for Memgraph (Bolt 7687)..."
 for i in $(seq 1 60); do
-    if echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false &>/dev/null; then
+    if mg_ready; then
         ok "Memgraph is ready"
         break
     fi
     [[ $i -eq 60 ]] && { fail "Memgraph did not become ready. Check: ${DOCKER_COMPOSE[*]} logs memgraph"; exit 1; }
     sleep 2
 done
+
+if [[ -n "${MEMGRAPH_USER_VAL}" && -n "${MEMGRAPH_PASSWORD_VAL}" ]]; then
+    info "Ensuring Memgraph Bolt user ${MEMGRAPH_USER_VAL}..."
+    MEMGRAPH_USER="${MEMGRAPH_USER_VAL}" MEMGRAPH_PASSWORD="${MEMGRAPH_PASSWORD_VAL}" \
+        bash ./scripts/ensure_memgraph_user.sh
+fi
 
 # --- Wait for webviz -------------------------------------------------------
 info "Waiting for webviz (HTTP $BASE_URL/api/health)..."
