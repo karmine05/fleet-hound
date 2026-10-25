@@ -69,6 +69,14 @@ if [[ "$PURGE" -eq 1 ]]; then
         "./config/.state.json"
         "./config/whitelist.json"
         "./config/snapshots"
+        "./config/ooda_status.json"
+        "./config/ooda_findings.json"
+        "./config/ooda_cycles.jsonl"
+        "./config/enricher_status.json"
+        "./config/extension_status.json"
+        "./config/extension_cache"
+        "./config/audit.log"
+        "./config/.etl.lock"
     )
     removed=0
     for p in "${purge_paths[@]}"; do
@@ -81,6 +89,10 @@ if [[ "$PURGE" -eq 1 ]]; then
     if [[ "$removed" -eq 0 ]]; then
         info "  no host-side state artifacts to remove"
     fi
+else
+    info "Stopping containers (volumes preserved)..."
+    "${DOCKER_COMPOSE[@]}" stop
+    "${DOCKER_COMPOSE[@]}" down --remove-orphans
 fi
 
 ok "Stack stopped"

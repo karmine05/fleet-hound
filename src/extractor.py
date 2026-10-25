@@ -232,14 +232,27 @@ class FleetGraphExtractor:
                 # 502 path if CF gives up first.
                 resp = self._get("/api/v1/fleet/hosts", params=p_params, timeout=120)
                 if not resp or resp.status_code != 200:
-                    break
+                    status = resp.status_code if resp is not None else "no-resp"
+                    logger.warning(
+                        "host page fetch failed team=%s page=%d status=%s; "
+                        "stopping pagination so the ETL watermark is not advanced",
+                        team_id if team_id is not None else "all", page, status,
+                    )
+                    raise RuntimeError(
+                        f"Fleet /hosts truncated team={team_id} page={page} status={status}"
+                    )
 
                 try:
                     data = resp.json()
                 except ValueError:
-                    if self.debug:
-                        logger.warning("failed to parse hosts JSON")
-                    break
+                    logger.warning(
+                        "failed to parse hosts JSON team=%s page=%d; "
+                        "stopping pagination so the ETL watermark is not advanced",
+                        team_id if team_id is not None else "all", page,
+                    )
+                    raise RuntimeError(
+                        f"Fleet /hosts returned invalid JSON team={team_id} page={page}"
+                    )
 
                 page_hosts = data.get('hosts', [])
                 valid_hosts, stop = self._filter_hosts(page_hosts, current_since)

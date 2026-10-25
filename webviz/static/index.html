@@ -1255,6 +1255,80 @@
         }
 
         /* ========================================
+           EXTENSIONS VIEW
+           ======================================== */
+        #extensions-view {
+            padding: var(--space-5);
+            overflow-y: auto;
+            background: var(--bg-primary);
+        }
+
+        .extensions-dashboard {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            gap: var(--space-5);
+            height: 100%;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .extensions-main {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-4);
+            min-width: 0;
+        }
+
+        .extensions-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: var(--space-3);
+        }
+
+        .extension-signal {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            font-size: 10px;
+            letter-spacing: 0.02em;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            margin: 2px 2px 0 0;
+        }
+
+        .extension-signal.warn {
+            background: var(--warning-muted);
+            color: var(--warning);
+        }
+
+        .extension-signal.bad {
+            background: var(--danger-muted);
+            color: var(--danger);
+        }
+
+        .extension-signal.good {
+            background: var(--success-muted);
+            color: var(--success);
+        }
+
+        .signal-row {
+            padding: var(--space-2) 0;
+        }
+
+        .signal-row .signal-weight {
+            font-weight: var(--font-semibold);
+            min-width: 36px;
+            display: inline-block;
+        }
+
+        .extensions-worker {
+            font-size: var(--text-xs);
+            color: var(--text-secondary);
+        }
+
+        /* ========================================
            TABLE
            ======================================== */
         .detections-container {
@@ -1368,6 +1442,17 @@
         .badge-low {
             background: var(--risk-low-bg);
             color: var(--risk-low);
+        }
+
+        .badge-critical {
+            background: var(--risk-high-bg);
+            color: var(--risk-high);
+            box-shadow: 0 0 0 1px var(--risk-high) inset;
+        }
+
+        .badge-unassessed {
+            background: var(--bg-tertiary);
+            color: var(--text-tertiary);
         }
 
         .detection-category {
@@ -2046,6 +2131,8 @@
                     id="tab-blast-radius" data-view="blast-radius">Blast Radius</button>
             <button class="tab-btn" role="tab" aria-selected="false" aria-controls="shadow-it-view"
                     id="tab-shadow-it" data-view="shadow-it">Shadow IT</button>
+            <button class="tab-btn" role="tab" aria-selected="false" aria-controls="extensions-view"
+                    id="tab-extensions" data-view="extensions">Extensions</button>
             <button class="tab-btn" role="tab" aria-selected="false" aria-controls="changes-view"
                     id="tab-changes" data-view="changes">Changes</button>
         </nav>
@@ -2560,6 +2647,112 @@
                     <div class="changes-empty">Pick two snapshots and run diff.</div>
                 </div>
             </section>
+        </div>
+    </div>
+
+    <!-- Extensions View -->
+    <div id="extensions-view" class="view-container">
+        <div class="extensions-dashboard">
+            <aside class="sidebar" style="height: fit-content;">
+                <h3>Browser Extensions</h3>
+                <p class="extensions-worker" id="ext-worker-line" style="margin-top:4px;">Worker: -</p>
+                <div class="control-group">
+                    <label for="ext-search-input">Search</label>
+                    <input type="search" id="ext-search-input" placeholder="Name, ID, publisher…" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="control-group">
+                    <label for="ext-risk-filter">Risk</label>
+                    <select id="ext-risk-filter">
+                        <option value="all" selected>All</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                        <option value="unassessed">Unassessed</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="ext-store-filter">Store</label>
+                    <select id="ext-store-filter">
+                        <option value="all" selected>All</option>
+                        <option value="chrome">Chrome</option>
+                        <option value="edge">Edge</option>
+                        <option value="firefox">Firefox</option>
+                        <option value="safari">Safari</option>
+                        <option value="brave">Brave</option>
+                        <option value="vivaldi">Vivaldi</option>
+                        <option value="opera">Opera</option>
+                    </select>
+                </div>
+                <div class="control-group" style="display:flex; align-items:center; gap:6px;">
+                    <input type="checkbox" id="ext-include-builtin" style="margin:0;">
+                    <label for="ext-include-builtin" style="margin:0; cursor:pointer;">Include built-ins</label>
+                </div>
+                <button class="btn btn-primary btn-block" id="ext-refresh-btn" type="button" style="margin-top:8px;">Refresh intel</button>
+            </aside>
+            <section class="extensions-main">
+                <div class="extensions-metrics">
+                    <div class="shadow-metric risk-high">
+                        <div class="metric-label text-secondary">Critical</div>
+                        <div class="metric-value text-danger" id="ext-critical">-</div>
+                    </div>
+                    <div class="shadow-metric risk-high">
+                        <div class="metric-label text-secondary">High</div>
+                        <div class="metric-value" id="ext-high" style="color: var(--warning);">-</div>
+                    </div>
+                    <div class="shadow-metric risk-medium">
+                        <div class="metric-label text-secondary">Medium</div>
+                        <div class="metric-value text-warning" id="ext-medium">-</div>
+                    </div>
+                    <div class="shadow-metric risk-low">
+                        <div class="metric-label text-secondary">Low</div>
+                        <div class="metric-value text-success" id="ext-low">-</div>
+                    </div>
+                    <div class="shadow-metric">
+                        <div class="metric-label text-secondary">Total</div>
+                        <div class="metric-value" id="ext-total">-</div>
+                    </div>
+                    <div class="shadow-metric">
+                        <div class="metric-label text-secondary">Hosts affected</div>
+                        <div class="metric-value" id="ext-hosts">-</div>
+                    </div>
+                </div>
+                <div class="detections-container">
+                    <div class="detections-header">
+                        <h3>Extension Inventory</h3>
+                        <span class="hint" id="ext-summary-line">Click a row for signals and hosts</span>
+                    </div>
+                    <div style="max-height: 600px; overflow-y: auto;">
+                        <table class="detections-table" id="extensions-table">
+                            <thead>
+                                <tr>
+                                    <th>Extension</th>
+                                    <th>Store</th>
+                                    <th>Risk</th>
+                                    <th>Installs</th>
+                                    <th>Hosts</th>
+                                    <th>Publisher</th>
+                                    <th>Signals</th>
+                                </tr>
+                            </thead>
+                            <tbody id="extensions-tbody">
+                                <tr><td colspan="7"><div class="empty-state"><div class="empty-state-icon">&#8981;</div><div>Search or switch filters to load extensions</div></div></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Extension Details Modal -->
+    <div id="extension-details-modal" class="modal-overlay" onclick="closeExtensionDetails(event)">
+        <div class="modal-panel" onclick="event.stopPropagation()" style="max-width: 760px;">
+            <div class="modal-header">
+                <h2 id="ext-modal-title">Extension Details</h2>
+                <button class="modal-close" onclick="closeExtensionDetails()">&times;</button>
+            </div>
+            <div id="extension-details-body"></div>
         </div>
     </div>
 
@@ -5881,6 +6074,216 @@
             });
         }
 
+        // ========================================
+        // EXTENSIONS VIEW
+        // ========================================
+        const _EXT_SIGNAL_GOOD = new Set([
+            'browser-builtin', 'reputable-publisher', 'store-listed',
+            'verified-developer', 'manifest-v3', 'crx-hash-verified',
+            'install-popularity', 'store-rating', 'store-updated',
+            'low-installs-reputable-publisher',
+        ]);
+
+        function _extSignalClass(signal) {
+            const code = signal.code || '';
+            if (_EXT_SIGNAL_GOOD.has(code)) return 'good';
+            const weight = Number(signal.weight) || 0;
+            if (weight >= 25) return 'bad';
+            if (weight > 0) return 'warn';
+            return '';
+        }
+
+        function _extBadge(band) {
+            const safe = ['critical', 'high', 'medium', 'low'].includes(band) ? band : 'unassessed';
+            return `<span class="badge badge-${safe}">${escapeHtml((band || 'unassessed').toUpperCase())}</span>`;
+        }
+
+        async function loadExtensions() {
+            const searchEl = document.getElementById('ext-search-input');
+            const params = new URLSearchParams({
+                risk: document.getElementById('ext-risk-filter').value,
+                store: document.getElementById('ext-store-filter').value,
+                search: searchEl ? searchEl.value.trim() : '',
+                include_builtin: document.getElementById('ext-include-builtin').checked ? '1' : '0',
+            });
+
+            try {
+                const resp = await fetch(`/api/extensions?${params}`);
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'query failed');
+
+                const summary = data.summary || {};
+                document.getElementById('ext-critical').textContent = summary.critical ?? 0;
+                document.getElementById('ext-high').textContent = summary.high ?? 0;
+                document.getElementById('ext-medium').textContent = summary.medium ?? 0;
+                document.getElementById('ext-low').textContent = summary.low ?? 0;
+                document.getElementById('ext-total').textContent = summary.total ?? 0;
+                document.getElementById('ext-hosts').textContent = summary.affected_hosts ?? 0;
+
+                _renderExtensionWorkerLine(data.worker);
+                _renderExtensionsTable(data.extensions || []);
+            } catch (error) {
+                console.error('Error loading extensions:', error);
+                const tbody = document.getElementById('extensions-tbody');
+                tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-state-icon">&#9888;</div><div>${escapeHtml(error.message || 'Failed to load extensions')}</div></div></td></tr>`;
+            }
+        }
+
+        function _renderExtensionWorkerLine(worker) {
+            const line = document.getElementById('ext-worker-line');
+            if (!line) return;
+            if (!worker) { line.textContent = 'Worker: unavailable'; return; }
+            const state = worker.enabled ? (worker.running ? 'running' : 'idle') : 'disabled';
+            const tick = worker.last_tick_iso ? worker.last_tick_iso.replace('T', ' ').slice(0, 16) : 'never';
+            const err = worker.last_error ? ` · last error: ${worker.last_error}` : '';
+            line.textContent = `Worker: ${state} · last run ${tick}${err}`;
+        }
+
+        function _renderExtensionsTable(extensions) {
+            const tbody = document.getElementById('extensions-tbody');
+            if (!extensions.length) {
+                tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-state-icon">&#10003;</div><div>No browser extensions match the filters</div></div></td></tr>`;
+                return;
+            }
+            tbody.innerHTML = '';
+            extensions.forEach(ext => {
+                const row = document.createElement('tr');
+                row.onclick = () => showExtensionDetail(ext.extension_key);
+                const signals = (ext.risk_signals || []).slice(0, 4).map(s =>
+                    `<span class="extension-signal ${_extSignalClass(s)}">${escapeHtml(s.code)}${s.weight ? ` +${s.weight}` : ''}</span>`
+                ).join(' ');
+                const installs = ext.install_users == null ? '—' : Number(ext.install_users).toLocaleString();
+                const publisher = ext.publisher || ext.vendor || '—';
+                row.innerHTML = `
+                    <td><strong>${escapeHtml(ext.display_name || ext.name || ext.extension_key)}</strong>
+                        <div class="text-sm" style="color: var(--text-tertiary);">${escapeHtml(truncateText(ext.extension_id || '', 34))}</div></td>
+                    <td class="text-sm">${escapeHtml(ext.store || '—')}</td>
+                    <td>${_extBadge(ext.risk_band)}${ext.risk_score != null ? ` <span class="text-sm text-secondary">${ext.risk_score}</span>` : ''}</td>
+                    <td class="text-sm">${installs}</td>
+                    <td>${ext.host_count || 0}</td>
+                    <td class="text-sm">${escapeHtml(truncateText(publisher, 28))}${ext.publisher_reputable ? ' <span class="extension-signal good">known</span>' : ''}</td>
+                    <td class="text-sm">${signals || '<span style="color: var(--text-tertiary);">—</span>'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        async function showExtensionDetail(key) {
+            if (!key) return;
+            const modal = document.getElementById('extension-details-modal');
+            const body = document.getElementById('extension-details-body');
+            try {
+                const resp = await fetch(`/api/extensions/detail?key=${encodeURIComponent(key)}`);
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'not found');
+                const ext = data.extension || {};
+                document.getElementById('ext-modal-title').textContent = ext.display_name || ext.name || key;
+
+                const signals = (ext.risk_signals || []).map(s => {
+                    const cls = _extSignalClass(s);
+                    return `<div class="signal-row">
+                        <span class="extension-signal ${cls}">${cls || 'info'}</span>
+                        <span class="signal-weight">${s.weight != null ? (s.weight > 0 ? `+${s.weight}` : s.weight) : '0'}</span>
+                        <strong>${escapeHtml(s.code)}</strong> — <span class="text-sm" style="color: var(--text-secondary);">${escapeHtml(s.detail || '')}</span>
+                    </div>`;
+                }).join('') || '<p class="text-secondary">No signals recorded yet. Run "Refresh intel".</p>';
+
+                const vulns = (ext.vulnerabilities || []).map(v =>
+                    `<div class="signal-row"><span class="extension-signal ${Number(v.cvss_score) >= 7 ? 'bad' : 'warn'}">${escapeHtml(v.cve || 'CVE')}</span>
+                     CVSS ${v.cvss_score != null ? escapeHtml(String(v.cvss_score)) : '?'} ${v.details ? `— ${escapeHtml(truncateText(v.details, 120))}` : ''}</div>`
+                ).join('') || '<p class="text-secondary">No Fleet-reported vulnerabilities.</p>';
+
+                const hosts = (data.hosts || []).map(h => `
+                    <tr>
+                        <td class="text-sm">${escapeHtml(h.hostname || '')}</td>
+                        <td class="text-sm">${escapeHtml(h.version || '')}</td>
+                        <td class="text-sm" style="color: var(--text-tertiary);">${escapeHtml(truncateText(h.installed_path || h.source || '', 60))}</td>
+                    </tr>`).join('');
+
+                body.innerHTML = `
+                    <div class="detail-row">
+                        <div class="detail-label">Risk</div>
+                        <div class="detail-value">${_extBadge(ext.risk_band)} <strong style="margin-left:6px;">${ext.risk_score != null ? ext.risk_score : 'unassessed'}</strong>
+                            <span class="text-sm" style="color: var(--text-secondary); margin-left:8px;">
+                                capability ${ext.capability_score ?? '—'} · trust ${ext.trust_score ?? '—'} · threat ${ext.threat_score ?? '—'} · exposure ${ext.exposure_score ?? '—'}
+                            </span></div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-label">Identity</div>
+                        <div class="detail-value text-sm">
+                            key <code>${escapeHtml(ext.extension_key || key)}</code><br>
+                            store <strong>${escapeHtml(ext.store || '—')}</strong> (${escapeHtml(ext.store_status || 'unknown')}) ·
+                            latest ${escapeHtml(ext.latest_version || '—')} · MV${ext.manifest_version ?? '—'}<br>
+                            publisher <strong>${escapeHtml(ext.publisher || ext.vendor || '—')}</strong>${ext.publisher_reputable ? ' <span class="extension-signal good">known vendor</span>' : ''}
+                            ${ext.install_users != null ? ` · ${Number(ext.install_users).toLocaleString()} installs` : ' · install count unavailable'}
+                        </div>
+                    </div>
+                    ${ext.store_url ? `<div class="detail-row"><div class="detail-label">Store listing</div><div class="detail-value"><a href="${escapeHtml(ext.store_url)}" target="_blank" rel="noopener noreferrer" class="text-sm">${escapeHtml(ext.store_url)}</a></div></div>` : ''}
+                    <div class="detail-row">
+                        <div class="detail-label">Why this score</div>
+                        <div class="detail-value">${signals}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-label">Capabilities</div>
+                        <div class="detail-value">
+                            ${(ext.permissions || []).map(p => `<span class="extension-signal">${escapeHtml(p)}</span>`).join(' ') || '<span class="text-secondary text-sm">no permissions recorded</span>'}
+                            ${(ext.host_permissions || []).map(p => `<span class="extension-signal warn">${escapeHtml(p)}</span>`).join(' ')}
+                        </div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-label">Vulnerabilities</div>
+                        <div class="detail-value">${vulns}</div>
+                    </div>
+                    <div class="detail-row" style="border-bottom:none;">
+                        <div class="detail-label">Hosts (${data.host_count || 0})</div>
+                        <div class="detail-value" style="max-height: 200px; overflow-y: auto;">
+                            <table class="detections-table"><thead><tr><th>Host</th><th>Version</th><th>Path / source</th></tr></thead><tbody>${hosts || '<tr><td colspan="3" class="text-sm text-secondary">No hosts</td></tr>'}</tbody></table>
+                        </div>
+                    </div>
+                `;
+                modal.classList.add('visible');
+            } catch (error) {
+                showStatus(`Extension detail failed: ${error.message}`, true);
+            }
+        }
+
+        function closeExtensionDetails(event) {
+            const modal = document.getElementById('extension-details-modal');
+            if (event && event.target !== modal) return;
+            modal.classList.remove('visible');
+        }
+
+        function _wireExtensionsUI() {
+            ['ext-risk-filter', 'ext-store-filter'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.addEventListener('change', loadExtensions);
+            });
+            const builtin = document.getElementById('ext-include-builtin');
+            if (builtin) builtin.addEventListener('change', loadExtensions);
+            const search = document.getElementById('ext-search-input');
+            if (search) search.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') loadExtensions();
+            });
+            const refresh = document.getElementById('ext-refresh-btn');
+            if (refresh) refresh.addEventListener('click', async () => {
+                try {
+                    const resp = await fetch('/api/extensions/refresh', { method: 'POST' });
+                    if (resp.status === 429) {
+                        const data = await resp.json();
+                        showStatus(`Already refreshing — retry in ${data.retry_after_sec}s`);
+                    } else if (resp.ok) {
+                        showStatus('Extension intel refresh queued');
+                    } else {
+                        const data = await resp.json();
+                        showStatus(data.error || 'Refresh failed', true);
+                    }
+                    loadExtensions();
+                } catch (error) {
+                    showStatus('Refresh failed', true);
+                }
+            });
+        }
+
         // Hook into switchView so Changes tab loads on demand.
         const _switchViewBeforeChanges = window.switchView;
         window.switchView = function (name) {
@@ -5896,6 +6299,10 @@
             const newBtn = document.querySelector(`[data-view="${name}"]`);
             if (newBtn) newBtn.classList.add('active');
             _syncTabAria(name);
+            if (name === 'extensions' && !window._extensionsLoaded) {
+                window._extensionsLoaded = true;
+                loadExtensions();
+            }
             if (name === 'changes' && !window._changesLoaded) {
                 window._changesLoaded = true;
                 loadSnapshots().then(_populateSnapshotPickers);
@@ -5951,6 +6358,8 @@
             _wireEnricherUI();
             refreshEnricherStatus();
             _enricherTimer = setInterval(refreshEnricherStatus, 30000);
+
+            _wireExtensionsUI();
 
             // The original switchView() doesn't know about the Changes tab,
             // so wire a direct click handler that reapplies the active class +

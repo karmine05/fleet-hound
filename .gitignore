@@ -83,6 +83,7 @@ benchmark_ingestion.py
 config/whitelist.json
 test_wikidata.py
 docs/*
+!docs/extension-threat-intel.md
 .state.json
 .etl.lock
 pytest.ini

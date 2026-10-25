@@ -273,7 +273,7 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
 def run_query_with_retry(session, query, params, max_retries=3):
     for attempt in range(max_retries):
         try:
-            session.run(query, **params)
+            session.run(query, **params).consume()
             return True
         except (TransientError, ServiceUnavailable, SessionExpired) as e:
             if attempt < max_retries - 1:

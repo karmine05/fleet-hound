@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.13-slim-bookworm
 
 WORKDIR /app
 
@@ -12,6 +12,7 @@ COPY webviz/ ./webviz/
 # snapshot.diff API + enrich_worker import these from /app at runtime.
 COPY src/ ./src/
 COPY categorize_software.py ./categorize_software.py
+COPY main.py ./main.py
 
 # Config dir is mounted as a volume in docker-compose; pre-create + own it so
 # the non-root user can write whitelist.json / audit.log without chmod gymnastics.
@@ -34,14 +35,14 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD python -c "import sys, urllib.request; r = urllib.request.urlopen('http://localhost:8080/api/health', timeout=5); sys.exit(0 if r.status == 200 else 1)" || exit 1
 
-# Gunicorn: bind 0.0.0.0 (container network), 4 workers, JSON-friendly access log
-# format, and a graceful timeout so SIGTERM doesn't tear up in-flight ingestion
-# queries.
+# Gunicorn: bind 0.0.0.0 (container network). Two sync workers is enough for
+# this dashboard and leaves RAM for the in-process OODA/enricher/extension
+# threads. Timeout is 120s so a blast-radius query doesn't get killed mid-walk.
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8080", \
-     "--workers", "4", \
+     "--workers", "2", \
      "--worker-class", "sync", \
-     "--timeout", "60", \
+     "--timeout", "120", \
      "--graceful-timeout", "30", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \

@@ -51,6 +51,7 @@ from src.etl import (  # noqa: E402
     save_full_scan_cadence,
     should_force_full_scan,
 )
+from src.shadow_it_filter import SHADOW_IT_SOURCES  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -238,9 +239,15 @@ def _decide_phase(driver) -> tuple[dict, dict]:
             summary["uncategorized"] = uncat
 
             # Shadow IT proxy: low-host-count software, uncategorized first.
+            # Gated to user-chosen channels (native apps + extensions) — without
+            # the source filter, every system package installed on <=3 hosts
+            # (libssl, apt, kernel modules) floods the findings list. No
+            # `sources IS NULL` arm: legacy sourceless rows can't be attributed
+            # to a user channel, so they are not shadow-IT candidates.
             rows = session.run(
                 """
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                WHERE any(x IN s.sources WHERE x IN $eligible)
                 WITH s, count(DISTINCT h) AS host_count
                 WHERE host_count <= 3
                 RETURN s.name AS name,
@@ -248,7 +255,8 @@ def _decide_phase(driver) -> tuple[dict, dict]:
                        host_count
                 ORDER BY (s.category IS NULL) DESC, host_count ASC, s.name ASC
                 LIMIT 50
-                """
+                """,
+                eligible=list(SHADOW_IT_SOURCES),
             )
             shadow = [
                 {

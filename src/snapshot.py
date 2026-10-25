@@ -25,7 +25,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 from neo4j import GraphDatabase
 
@@ -89,165 +89,159 @@ def _coerce_props(record_keys, record) -> dict:
     return out
 
 
-def _stream_graph(driver) -> Tuple[List[dict], List[dict], dict]:
-    """Pull the full graph as (lines, edge_count_by_label_dict).
+def _iter_graph(driver):
+    """Yield graph lines one at a time; counts are filled as the iterator is consumed.
 
-    Returns a tuple of (json_lines, counts) where json_lines are dicts ready
-    to be JSON-encoded and counts is {hosts, users, software, labels, edges}.
+    write_snapshot gzips incrementally so a large INSTALLED_ON set never has to
+    live in Python RAM as both a list and a compressed buffer.
     """
-    lines: List[dict] = []
     counts = {"hosts": 0, "users": 0, "software": 0, "labels": 0, "edges": 0}
 
-    with driver.session() as session:
-        # --- Hosts ---
-        # Node identity is keyed on fleet_host_id to match the live graph
-        # endpoints (/api/graph, /api/correlate all use `host_<fleet_host_id>`).
-        # Keying on the (mutable, non-unique) hostname would (a) collide two
-        # distinct hosts that share a display name — now likely since the
-        # display label is Fleet's "computer name" — silently dropping one
-        # from the diff, and (b) break the changelog "View on graph" jump,
-        # which posts the node id to /api/correlate (rejects non-fleet_host_id
-        # ids). hostname stays in props so a rename surfaces as property drift.
-        host_keys = ["hostname", "os_version", "platform", "ip", "last_seen",
-                     "team_id", "team_name"]
-        host_q = """
-            MATCH (h:Host)
-            RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname,
-                   h.os_version AS os_version,
-                   h.platform AS platform, h.ip AS ip,
-                   h.last_seen AS last_seen, h.team_id AS team_id,
-                   h.team_name AS team_name
-        """
-        for rec in session.run(host_q):
-            fleet_host_id = rec["fleet_host_id"]
-            if fleet_host_id is None:
-                continue
-            props = _coerce_props(host_keys, rec)
-            lines.append({
-                "type": "host",
-                "id": _typed_id("host", fleet_host_id),
-                "props": props,
-                "hash": _node_hash(props),
-            })
-            counts["hosts"] += 1
+    def _lines():
+        with driver.session() as session:
+            # --- Hosts ---
+            # Node identity is keyed on fleet_host_id to match the live graph
+            # endpoints (/api/graph, /api/correlate all use `host_<fleet_host_id>`).
+            host_keys = ["hostname", "os_version", "platform", "ip", "last_seen",
+                         "team_id", "team_name"]
+            host_q = """
+                MATCH (h:Host)
+                RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname,
+                       h.os_version AS os_version,
+                       h.platform AS platform, h.ip AS ip,
+                       h.last_seen AS last_seen, h.team_id AS team_id,
+                       h.team_name AS team_name
+            """
+            for rec in session.run(host_q):
+                fleet_host_id = rec["fleet_host_id"]
+                if fleet_host_id is None:
+                    continue
+                props = _coerce_props(host_keys, rec)
+                counts["hosts"] += 1
+                yield {
+                    "type": "host",
+                    "id": _typed_id("host", fleet_host_id),
+                    "props": props,
+                    "hash": _node_hash(props),
+                }
 
-        # --- Users ---
-        user_keys = ["username", "email", "fullname"]
-        user_q = """
-            MATCH (u:User)
-            RETURN u.username AS username, u.email AS email, u.fullname AS fullname
-        """
-        for rec in session.run(user_q):
-            username = rec["username"]
-            if not username:
-                continue
-            props = _coerce_props(user_keys, rec)
-            lines.append({
-                "type": "user",
-                "id": _typed_id("user", username),
-                "props": props,
-                "hash": _node_hash(props),
-            })
-            counts["users"] += 1
+            user_keys = ["username", "email", "fullname"]
+            user_q = """
+                MATCH (u:User)
+                RETURN u.username AS username, u.email AS email, u.fullname AS fullname
+            """
+            for rec in session.run(user_q):
+                username = rec["username"]
+                if not username:
+                    continue
+                props = _coerce_props(user_keys, rec)
+                counts["users"] += 1
+                yield {
+                    "type": "user",
+                    "id": _typed_id("user", username),
+                    "props": props,
+                    "hash": _node_hash(props),
+                }
 
-        # --- Software ---
-        sw_keys = ["name", "last_version", "category", "wikidata_description",
-                   "last_categorized", "sources"]
-        sw_q = """
-            MATCH (s:Software)
-            RETURN s.name AS name, s.last_version AS last_version,
-                   s.category AS category,
-                   s.wikidata_description AS wikidata_description,
-                   s.last_categorized AS last_categorized,
-                   s.sources AS sources
-        """
-        for rec in session.run(sw_q):
-            name = rec["name"]
-            if not name:
-                continue
-            props = _coerce_props(sw_keys, rec)
-            lines.append({
-                "type": "software",
-                "id": _typed_id("software", name),
-                "props": props,
-                "hash": _node_hash(props),
-            })
-            counts["software"] += 1
+            sw_keys = ["name", "last_version", "versions", "category",
+                       "wikidata_description", "last_categorized", "sources"]
+            sw_q = """
+                MATCH (s:Software)
+                RETURN s.name AS name, s.last_version AS last_version,
+                       s.versions AS versions,
+                       s.category AS category,
+                       s.wikidata_description AS wikidata_description,
+                       s.last_categorized AS last_categorized,
+                       s.sources AS sources
+            """
+            for rec in session.run(sw_q):
+                name = rec["name"]
+                if not name:
+                    continue
+                props = _coerce_props(sw_keys, rec)
+                counts["software"] += 1
+                yield {
+                    "type": "software",
+                    "id": _typed_id("software", name),
+                    "props": props,
+                    "hash": _node_hash(props),
+                }
 
-        # --- Labels (added v1.27 — see plan section 1A) ---
-        label_keys = ["fleet_id", "name", "description", "label_type",
-                      "membership_type", "query"]
-        label_q = """
-            MATCH (l:Label)
-            RETURN l.fleet_id AS fleet_id, l.name AS name,
-                   l.description AS description,
-                   l.label_type AS label_type,
-                   l.membership_type AS membership_type,
-                   l.query AS query
-        """
-        for rec in session.run(label_q):
-            fleet_id = rec["fleet_id"]
-            if fleet_id is None:
-                continue
-            props = _coerce_props(label_keys, rec)
-            lines.append({
-                "type": "label",
-                "id": _typed_id("label", fleet_id),
-                "props": props,
-                "hash": _node_hash(props),
-            })
-            counts["labels"] += 1
+            label_keys = ["fleet_id", "name", "description", "label_type",
+                          "membership_type", "query"]
+            label_q = """
+                MATCH (l:Label)
+                RETURN l.fleet_id AS fleet_id, l.name AS name,
+                       l.description AS description,
+                       l.label_type AS label_type,
+                       l.membership_type AS membership_type,
+                       l.query AS query
+            """
+            for rec in session.run(label_q):
+                fleet_id = rec["fleet_id"]
+                if fleet_id is None:
+                    continue
+                props = _coerce_props(label_keys, rec)
+                counts["labels"] += 1
+                yield {
+                    "type": "label",
+                    "id": _typed_id("label", fleet_id),
+                    "props": props,
+                    "hash": _node_hash(props),
+                }
 
-        # --- Edges: HAS_LABEL (Host -> Label) ---
-        # Host endpoint keyed on fleet_host_id to match the host node id above.
-        has_label_q = """
-            MATCH (h:Host)-[:HAS_LABEL]->(l:Label)
-            RETURN h.fleet_host_id AS hfid, l.fleet_id AS lfid
-        """
-        for rec in session.run(has_label_q):
-            if rec["hfid"] is None or rec["lfid"] is None:
-                continue
-            lines.append({
-                "type": "edge",
-                "label": "HAS_LABEL",
-                "from": _typed_id("host", rec["hfid"]),
-                "to": _typed_id("label", rec["lfid"]),
-            })
-            counts["edges"] += 1
+            has_label_q = """
+                MATCH (h:Host)-[:HAS_LABEL]->(l:Label)
+                RETURN h.fleet_host_id AS hfid, l.fleet_id AS lfid
+            """
+            for rec in session.run(has_label_q):
+                if rec["hfid"] is None or rec["lfid"] is None:
+                    continue
+                counts["edges"] += 1
+                yield {
+                    "type": "edge",
+                    "label": "HAS_LABEL",
+                    "from": _typed_id("host", rec["hfid"]),
+                    "to": _typed_id("label", rec["lfid"]),
+                }
 
-        # --- Edges: USES (User -> Host) ---
-        uses_q = """
-            MATCH (u:User)-[:USES]->(h:Host)
-            RETURN u.username AS uname, h.fleet_host_id AS hfid
-        """
-        for rec in session.run(uses_q):
-            if not rec["uname"] or rec["hfid"] is None:
-                continue
-            lines.append({
-                "type": "edge",
-                "label": "USES",
-                "from": _typed_id("user", rec["uname"]),
-                "to": _typed_id("host", rec["hfid"]),
-            })
-            counts["edges"] += 1
+            uses_q = """
+                MATCH (u:User)-[:USES]->(h:Host)
+                RETURN u.username AS uname, h.fleet_host_id AS hfid
+            """
+            for rec in session.run(uses_q):
+                if not rec["uname"] or rec["hfid"] is None:
+                    continue
+                counts["edges"] += 1
+                yield {
+                    "type": "edge",
+                    "label": "USES",
+                    "from": _typed_id("user", rec["uname"]),
+                    "to": _typed_id("host", rec["hfid"]),
+                }
 
-        # --- Edges: INSTALLED_ON (Software -> Host) ---
-        inst_q = """
-            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-            RETURN s.name AS sname, h.fleet_host_id AS hfid
-        """
-        for rec in session.run(inst_q):
-            if not rec["sname"] or rec["hfid"] is None:
-                continue
-            lines.append({
-                "type": "edge",
-                "label": "INSTALLED_ON",
-                "from": _typed_id("software", rec["sname"]),
-                "to": _typed_id("host", rec["hfid"]),
-            })
-            counts["edges"] += 1
+            inst_q = """
+                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                RETURN s.name AS sname, h.fleet_host_id AS hfid
+            """
+            for rec in session.run(inst_q):
+                if not rec["sname"] or rec["hfid"] is None:
+                    continue
+                counts["edges"] += 1
+                yield {
+                    "type": "edge",
+                    "label": "INSTALLED_ON",
+                    "from": _typed_id("software", rec["sname"]),
+                    "to": _typed_id("host", rec["hfid"]),
+                }
 
-    return lines, counts
+    return _lines(), counts
+
+
+def _stream_graph(driver) -> Tuple[List[dict], dict]:
+    """Materialize the full graph. Prefer `_iter_graph` for large fleets."""
+    lines_iter, counts = _iter_graph(driver)
+    return list(lines_iter), counts
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -302,20 +296,33 @@ def write_snapshot(memgraph_uri: str, ts: str, out_dir: Path,
 
     driver = GraphDatabase.driver(memgraph_uri, auth=auth)
     try:
-        lines, counts = _stream_graph(driver)
+        lines_iter, counts = _iter_graph(driver)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=snap_path.name + ".", suffix=".tmp", dir=str(out_dir)
+        )
+        try:
+            with os.fdopen(fd, "wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as gz:
+                    for entry in lines_iter:
+                        gz.write(json.dumps(entry, separators=(",", ":"), default=str).encode("utf-8"))
+                        gz.write(b"\n")
+                raw.flush()
+                os.fsync(raw.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, snap_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     finally:
         driver.close()
 
-    buf = b""
-    chunks = []
-    for entry in lines:
-        chunks.append(json.dumps(entry, separators=(",", ":"), default=str).encode("utf-8"))
-    buf = b"\n".join(chunks)
-    if buf:
-        buf += b"\n"
-    gz = gzip.compress(buf, compresslevel=6)
-
-    _atomic_write_bytes(snap_path, gz)
     meta = {"ts": ts, **counts}
     _atomic_write_bytes(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
 

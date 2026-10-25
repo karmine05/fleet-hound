@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -158,6 +159,10 @@ try:
     ENRICHER_BATCH_SIZE = int(os.environ.get("ENRICHER_BATCH_SIZE", "25"))
 except ValueError:
     ENRICHER_BATCH_SIZE = 25
+try:
+    ENRICHER_PARALLELISM = int(os.environ.get("ENRICHER_PARALLELISM", "4"))
+except ValueError:
+    ENRICHER_PARALLELISM = 4
 ENRICHER_LOCK_PATH = os.environ.get("ENRICHER_LOCK_PATH", "/tmp/fleet-hound-enricher.lock")
 ENRICHER_TRIGGER_PATH = os.environ.get("ENRICHER_TRIGGER_PATH", "/tmp/fleet-hound-enricher.trigger")
 # Status file lives under /app/config (the bind-mounted volume) so all 4
@@ -167,6 +172,37 @@ ENRICHER_STATUS_PATH = os.environ.get("ENRICHER_STATUS_PATH", "/app/config/enric
 # Manual /api/enricher/trigger rate limit (seconds between accepted triggers).
 # Enforced cross-worker via trigger-file mtime.
 ENRICHER_MANUAL_TRIGGER_COOLDOWN = 30.0
+
+# Browser-extension intel worker tunables. Same leader-elected pattern as the
+# enricher; defaults to enabled because the feature is read-only and every
+# network source is cached/degradable. Interval defaults to 6h (store metadata
+# TTL is 24h; the worker only re-fetches when the watermark is stale).
+EXTENSION_WORKER_ENABLED = _bool_env("EXTENSION_WORKER_ENABLED", True)
+try:
+    EXTENSION_WORKER_INTERVAL_SEC = int(os.environ.get("EXTENSION_WORKER_INTERVAL_SEC", "21600"))
+except ValueError:
+    EXTENSION_WORKER_INTERVAL_SEC = 21600
+try:
+    EXTENSION_WORKER_BATCH_SIZE = int(os.environ.get("EXTENSION_WORKER_BATCH_SIZE", "50"))
+except ValueError:
+    EXTENSION_WORKER_BATCH_SIZE = 50
+try:
+    EXTENSION_WORKER_PARALLELISM = int(os.environ.get("EXTENSION_WORKER_PARALLELISM", "4"))
+except ValueError:
+    EXTENSION_WORKER_PARALLELISM = 4
+EXTENSION_WORKER_LOCK_PATH = os.environ.get(
+    "EXTENSION_WORKER_LOCK_PATH", "/tmp/fleet-hound-extensions.lock"
+)
+EXTENSION_WORKER_TRIGGER_PATH = os.environ.get(
+    "EXTENSION_WORKER_TRIGGER_PATH", "/tmp/fleet-hound-extensions.trigger"
+)
+EXTENSION_WORKER_STATUS_PATH = os.environ.get(
+    "EXTENSION_WORKER_STATUS_PATH", "/app/config/extension_status.json"
+)
+EXTENSION_CACHE_DIR = os.environ.get(
+    "EXTENSION_CACHE_DIR", "/app/config/extension_cache"
+)
+EXTENSION_MANUAL_TRIGGER_COOLDOWN = 30.0
 
 # OODA supervisor tunables (read once at import time).
 OODA_ENABLED = _bool_env("OODA_ENABLED", False)
@@ -439,7 +475,12 @@ def _enforce_auth():
 
     if WEBVIZ_API_TOKEN:
         supplied = _extract_token_from_request()
-        if not supplied or not hmac.compare_digest(supplied, WEBVIZ_API_TOKEN):
+        # Hash both sides so compare_digest never raises on unequal lengths
+        # (a short token used to 500 instead of 401).
+        if not hmac.compare_digest(
+            hashlib.sha256(supplied.encode("utf-8")).digest(),
+            hashlib.sha256(WEBVIZ_API_TOKEN.encode("utf-8")).digest(),
+        ):
             return jsonify({"error": "Unauthorized"}), 401
         return None
 
@@ -504,12 +545,29 @@ def _validate_user_regex(pattern: str) -> tuple[bool, str]:
         return False, f"invalid regex: {exc}"
     return True, ""
 
+def _bounded_limit(default: int = 5000, hard_cap: int = 20000) -> int:
+    try:
+        limit = int(request.args.get("limit", default))
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, hard_cap))
+
+
 @app.route("/api/hosts")
 def get_hosts():
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+    limit = _bounded_limit()
     with driver.session() as session:
-        result = session.run("MATCH (h:Host) RETURN h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.ip AS ip, h.last_seen AS last_seen")
+        result = session.run(
+            """
+            MATCH (h:Host)
+            RETURN h.hostname AS hostname, h.os_version AS os_version,
+                   h.platform AS platform, h.ip AS ip, h.last_seen AS last_seen
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
         return jsonify([r.data() for r in result])
 
 @app.route("/api/users")
@@ -517,13 +575,15 @@ def get_users():
     """Get users per host - only users that are connected to hosts"""
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+    limit = _bounded_limit()
     with driver.session() as session:
         result = session.run("""
-            MATCH (u:User)-[:USES]->(h:Host) 
-            RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname, 
+            MATCH (u:User)-[:USES]->(h:Host)
+            RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname,
                    h.hostname AS hostname, h.platform AS platform
             ORDER BY h.hostname, u.username
-        """)
+            LIMIT $limit
+        """, limit=limit)
         users = [r.data() for r in result]
         # Filter out any users that don't have proper host connections
         filtered_users = [user for user in users if user.get('hostname')]
@@ -533,8 +593,16 @@ def get_users():
 def get_software():
     if not driver:
         return jsonify({"error": "Database connection failed"}), 500
+    limit = _bounded_limit()
     with driver.session() as session:
-        result = session.run("MATCH (s:Software) RETURN s.name AS name, s.versions AS versions, s.last_version AS last_version")
+        result = session.run(
+            """
+            MATCH (s:Software)
+            RETURN s.name AS name, s.versions AS versions, s.last_version AS last_version
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
         return jsonify([r.data() for r in result])
 
 @app.route("/api/teams")
@@ -2450,11 +2518,12 @@ def health_check():
     """Health check endpoint for monitoring.
 
     Doubles as the autonomy bootstrap: the Docker healthcheck hits this
-    every 30s, so the enricher and OODA supervisor boot on the first
-    healthcheck after startup without requiring an operator request.
+    every 30s, so the enricher / OODA / extension workers boot on the first
+    healthcheck after startup without requiring an operator request. They
+    only boot once the DB probe succeeds — a worker started against an
+    unreachable Memgraph would burn its leader election and first cycle on
+    guaranteed failures.
     """
-    _ensure_enricher_started()
-    _ensure_ooda_started()
     if not driver:
         return jsonify({
             "status": "unhealthy",
@@ -2465,11 +2534,6 @@ def health_check():
         with driver.session() as session:
             result = session.run("RETURN 1")
             result.single()
-        return jsonify({
-            "status": "healthy",
-            "database": "connected",
-            "memgraph_uri": MEMGRAPH_URI
-        }), 200
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         payload = {
@@ -2480,6 +2544,15 @@ def health_check():
             payload["error"] = str(e)
         return jsonify(payload), 503
 
+    _ensure_enricher_started()
+    _ensure_ooda_started()
+    _ensure_extension_worker_started()
+    return jsonify({
+        "status": "healthy",
+        "database": "connected",
+        "memgraph_uri": MEMGRAPH_URI
+    }), 200
+
 @app.route("/api/authorize-software", methods=['POST'])
 def authorize_software():
     """Authorize a software (whitelist it)"""
@@ -2488,7 +2561,7 @@ def authorize_software():
         if not isinstance(data, dict):
             return jsonify({"error": "Invalid JSON body"}), 400
 
-        software_name = (data.get('software_name') or '').strip()
+        software_name = (data.get('software_name') or '').strip().lower()
         
         if not software_name:
             return jsonify({"error": "Software name required"}), 400
@@ -2707,7 +2780,9 @@ def get_shadow_it():
 
         if whitelist:
             whitelist_clause = "AND NOT s.name IN $whitelist"
-            filter_params['whitelist'] = whitelist
+            # Graph names are lowercased at ingestion; normalize legacy
+            # mixed-case entries so the exclusion actually matches.
+            filter_params['whitelist'] = [w.lower() for w in whitelist]
 
         filter_params.update(label_flt_params)
         
@@ -3467,6 +3542,7 @@ def _ensure_enricher_started():
                 _get_driver,
                 interval_sec=ENRICHER_INTERVAL_SEC,
                 batch_size=ENRICHER_BATCH_SIZE,
+                parallelism=ENRICHER_PARALLELISM,
                 lock_path=ENRICHER_LOCK_PATH,
                 trigger_path=ENRICHER_TRIGGER_PATH,
                 status_path=ENRICHER_STATUS_PATH,
@@ -3655,6 +3731,378 @@ def _stop_ooda():
             _OODA_STOP.set()
         except Exception:
             pass
+
+
+# ----------------------------------------------------------------------------
+# Browser-extension inventory + risk
+# ----------------------------------------------------------------------------
+# Read-only view over the fields ingestion now preserves plus the scores written
+# by extension_worker. Grouping is by `extension_key` (ext:<store>:<id>) because
+# one canonical extension can exist as several :Software nodes when Fleet
+# reports different install paths/versions.
+_EXT_WHERE = "(s.kind = 'browser_extension' OR s.extension_key STARTS WITH 'ext:')"
+
+_EXTENSION_STOP = None
+_EXTENSION_INIT_DONE = False
+_EXTENSION_INIT_LOCK = threading.Lock()
+
+
+def _ensure_extension_worker_started():
+    """Start the extension worker on first /api request. Idempotent."""
+    global _EXTENSION_STOP, _EXTENSION_INIT_DONE
+    if _EXTENSION_INIT_DONE:
+        return
+    with _EXTENSION_INIT_LOCK:
+        if _EXTENSION_INIT_DONE:
+            return
+        try:
+            from extension_worker import start_worker
+        except Exception as exc:
+            logger.error("extension worker import failed: %s", exc)
+            _EXTENSION_INIT_DONE = True
+            return
+        try:
+            _, stop_evt = start_worker(
+                _get_driver,
+                interval_sec=EXTENSION_WORKER_INTERVAL_SEC,
+                batch_size=EXTENSION_WORKER_BATCH_SIZE,
+                parallelism=EXTENSION_WORKER_PARALLELISM,
+                lock_path=EXTENSION_WORKER_LOCK_PATH,
+                trigger_path=EXTENSION_WORKER_TRIGGER_PATH,
+                status_path=EXTENSION_WORKER_STATUS_PATH,
+                cache_dir=EXTENSION_CACHE_DIR,
+                enabled=EXTENSION_WORKER_ENABLED,
+            )
+            _EXTENSION_STOP = stop_evt
+        except Exception as exc:
+            logger.error("extension worker start failed: %s", exc, exc_info=True)
+        _EXTENSION_INIT_DONE = True
+
+
+@atexit.register
+def _stop_extension_worker():
+    if _EXTENSION_STOP is not None:
+        try:
+            _EXTENSION_STOP.set()
+        except Exception:
+            pass
+
+
+def _ext_bool_arg(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extension_filter_clause(args) -> tuple[str, dict]:
+    """Shared WHERE builder for the list + summary queries."""
+    clauses = [_EXT_WHERE]
+    params: dict = {}
+
+    risk = (args.get("risk") or "all").strip().lower()
+    if risk in ("low", "medium", "high", "critical"):
+        clauses.append("s.risk_band = $risk")
+        params["risk"] = risk
+    elif risk == "unassessed":
+        clauses.append("s.risk_band IS NULL")
+
+    store = (args.get("store") or "all").strip().lower()
+    if store not in ("", "all"):
+        clauses.append("s.store = $store")
+        params["store"] = store
+
+    known_bad = (args.get("known_bad") or "").strip().lower()
+    if known_bad in ("1", "true", "yes", "on"):
+        clauses.append("coalesce(s.known_bad, false) = true")
+
+    if not _ext_bool_arg(args.get("include_builtin")):
+        clauses.append("coalesce(s.is_builtin, false) = false")
+
+    search = (args.get("search") or "").strip()
+    if search:
+        clauses.append(
+            "("
+            "toLower(coalesce(s.display_name, '')) CONTAINS toLower($q) OR "
+            "toLower(s.name) CONTAINS toLower($q) OR "
+            "toLower(coalesce(s.extension_id, '')) CONTAINS toLower($q) OR "
+            "toLower(coalesce(s.publisher, '')) CONTAINS toLower($q)"
+            ")"
+        )
+        params["q"] = search
+
+    return " AND ".join(clauses), params
+
+
+def _ext_signals_from_props(props: dict) -> list:
+    raw = props.get("risk_signals_json")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _ext_group_rows(rows) -> list[dict]:
+    """Collapse per-node rows into one row per canonical extension key."""
+    groups: dict[str, dict] = {}
+    for row in rows:
+        props = row.get("props") or {}
+        key = props.get("extension_key") or f"name:{props.get('name')}"
+        existing = groups.get(key)
+        if existing is None:
+            existing = groups[key] = {
+                "extension_key": key,
+                "name": props.get("name"),
+                "display_name": props.get("display_name") or props.get("name"),
+                "store": props.get("store"),
+                "extension_id": props.get("extension_id"),
+                "browser": props.get("browser"),
+                "vendor": props.get("vendor"),
+                "publisher": props.get("publisher"),
+                "publisher_reputable": bool(props.get("publisher_reputable")),
+                "is_builtin": bool(props.get("is_builtin")),
+                "known_bad": bool(props.get("known_bad")),
+                "store_status": props.get("store_status"),
+                "store_url": props.get("store_url"),
+                "latest_version": props.get("latest_version"),
+                "install_users": props.get("install_users"),
+                "rating": props.get("rating"),
+                "rating_count": props.get("rating_count"),
+                "category": props.get("category"),
+                "manifest_version": props.get("manifest_version"),
+                "permissions": props.get("permissions") or [],
+                "host_permissions": props.get("host_permissions") or [],
+                "content_script_matches": props.get("content_script_matches") or [],
+                "risk_score": props.get("risk_score"),
+                "risk_band": props.get("risk_band"),
+                "capability_score": props.get("capability_score"),
+                "trust_score": props.get("trust_score"),
+                "threat_score": props.get("threat_score"),
+                "exposure_score": props.get("exposure_score"),
+                "risk_signals": _ext_signals_from_props(props),
+                "vulnerability_count": props.get("vulnerability_count") or 0,
+                "max_cvss": props.get("max_cvss"),
+                "intel_refreshed_at": props.get("intel_refreshed_at"),
+                "intel_error": props.get("intel_error"),
+                "hostnames": set(),
+                "versions": set(),
+            }
+        for host in row.get("hosts") or []:
+            if host:
+                existing["hostnames"].add(host)
+        for version in row.get("versions") or []:
+            if version:
+                existing["versions"].add(version)
+        # Several nodes can map to one key; prefer the scored one.
+        if props.get("risk_score") is not None and existing.get("risk_score") is None:
+            existing["risk_score"] = props.get("risk_score")
+            existing["risk_band"] = props.get("risk_band")
+            existing["risk_signals"] = _ext_signals_from_props(props)
+
+    out = []
+    for group in groups.values():
+        hostnames = sorted(group.pop("hostnames"))
+        versions = sorted(group.pop("versions"))
+        group["host_count"] = len(hostnames)
+        group["hostnames"] = hostnames[:50]
+        group["versions"] = versions[:20]
+        out.append(group)
+    out.sort(key=lambda g: (g.get("risk_score") is None,
+                            -(g.get("risk_score") or 0),
+                            -g.get("host_count", 0)))
+    return out
+
+
+@app.route("/api/extensions")
+def get_extensions():
+    """Browser-extension inventory with risk scores, grouped by canonical key.
+
+    Query params: risk (low|medium|high|critical|unassessed|all), store,
+    search, known_bad, include_builtin.
+    """
+    _ensure_extension_worker_started()
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+    try:
+        limit = int(request.args.get("limit", 1000))
+    except ValueError:
+        limit = 1000
+    limit = max(1, min(limit, 5000))
+
+    where, params = _extension_filter_clause(request.args)
+    list_query = f"""
+        MATCH (s:Software)
+        WHERE {where}
+        OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
+        WITH s, count(DISTINCT h) AS host_count,
+             collect(DISTINCT r.version) AS versions,
+             collect(DISTINCT h.hostname) AS hosts
+        RETURN properties(s) AS props, host_count, versions, hosts
+        ORDER BY host_count DESC
+        LIMIT $limit
+    """
+    band_query = f"""
+        MATCH (s:Software)
+        WHERE {where}
+        RETURN coalesce(s.risk_band, 'unassessed') AS band,
+               count(DISTINCT coalesce(s.extension_key, 'name:' + s.name)) AS n
+    """
+    host_query = f"""
+        MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+        WHERE {where}
+        RETURN count(DISTINCT h) AS n
+    """
+
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(list_query, **params, limit=limit)]
+            band_rows = [dict(record) for record in session.run(band_query, **params)]
+            host_row = session.run(host_query, **params).single()
+    except (ServiceUnavailable, TransientError) as exc:
+        _reset_driver()
+        logger.error("extensions list unavailable: %s", exc)
+        return jsonify({"error": "Database temporarily unavailable"}), 503
+    except Exception as exc:
+        logger.error("extensions list failed: %s", exc, exc_info=True)
+        return jsonify({
+            "error": "Extensions query failed",
+            "message": str(exc) if DEBUG_ERROR_DETAILS else None,
+        }), 500
+
+    extensions = _ext_group_rows(rows)
+    summary = {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
+               "unassessed": 0, "affected_hosts": int(host_row["n"]) if host_row else 0}
+    for band in band_rows:
+        name = band.get("band") or "unassessed"
+        count = int(band.get("n") or 0)
+        if name in summary:
+            summary[name] = count
+        summary["total"] += count
+
+    return jsonify({
+        "extensions": extensions,
+        "summary": summary,
+        "total": summary["total"],
+        "worker": _extension_status_snapshot(),
+    })
+
+
+def _extension_status_snapshot() -> dict:
+    try:
+        from extension_worker import read_status, queue_remaining as _qr
+        snap = read_status(EXTENSION_WORKER_STATUS_PATH)
+        snap["enabled"] = EXTENSION_WORKER_ENABLED
+        snap["interval_sec"] = EXTENSION_WORKER_INTERVAL_SEC
+        snap["queue_remaining"] = _qr(_get_driver)
+        return snap
+    except Exception as exc:
+        logger.error("extension status failed: %s", exc)
+        return {
+            "enabled": EXTENSION_WORKER_ENABLED, "running": False,
+            "interval_sec": EXTENSION_WORKER_INTERVAL_SEC, "queue_remaining": 0,
+            "last_error": str(exc) if DEBUG_ERROR_DETAILS else None,
+        }
+
+
+@app.route("/api/extensions/status")
+def extensions_status():
+    _ensure_extension_worker_started()
+    return jsonify(_extension_status_snapshot())
+
+
+@app.route("/api/extensions/refresh", methods=["POST"])
+def extensions_refresh():
+    _ensure_extension_worker_started()
+    if not EXTENSION_WORKER_ENABLED:
+        return jsonify({"error": "Extension worker disabled"}), 503
+    try:
+        from extension_worker import fire_trigger as _fire
+    except Exception as exc:
+        logger.error("extension worker import failed at trigger time: %s", exc)
+        return jsonify({"error": "Extension worker unavailable"}), 503
+    fired, retry_after = _fire(
+        EXTENSION_WORKER_TRIGGER_PATH,
+        cooldown_sec=EXTENSION_MANUAL_TRIGGER_COOLDOWN,
+    )
+    if not fired:
+        return jsonify({"error": "Rate limited", "retry_after_sec": int(retry_after)}), 429
+    audit_log("extensions_refresh", "manual extension intel refresh requested")
+    return ("", 204)
+
+
+@app.route("/api/extensions/detail")
+def extension_detail():
+    _ensure_extension_worker_started()
+    key = (request.args.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": "key parameter required"}), 400
+    if not driver:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    name_fallback = key[5:] if key.startswith("name:") else key
+    query = """
+        MATCH (s:Software)
+        WHERE s.extension_key = $key OR s.name = $name_fallback
+        OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
+        RETURN properties(s) AS props,
+               collect(DISTINCT {
+                   hostname: h.hostname,
+                   version: r.version,
+                   source: r.source,
+                   browser: r.browser,
+                   installed_path: r.installed_path,
+                   first_seen: r.first_seen,
+                   last_seen: r.last_seen
+               }) AS hosts
+    """
+    try:
+        with driver.session() as session:
+            records = [dict(record) for record in session.run(
+                query, key=key, name_fallback=name_fallback
+            )]
+    except Exception as exc:
+        logger.error("extension detail failed: %s", exc, exc_info=True)
+        return jsonify({
+            "error": "Extension query failed",
+            "message": str(exc) if DEBUG_ERROR_DETAILS else None,
+        }), 500
+
+    if not records:
+        return jsonify({"error": "Extension not found"}), 404
+
+    nodes = [row.get("props") or {} for row in records]
+    hosts: dict[str, dict] = {}
+    for row in records:
+        for host in row.get("hosts") or []:
+            if not isinstance(host, dict) or not host.get("hostname"):
+                continue
+            existing = hosts.get(host["hostname"])
+            if existing is None or (host.get("last_seen") or "") > (existing.get("last_seen") or ""):
+                hosts[host["hostname"]] = host
+
+    primary = max(nodes, key=lambda p: (p.get("risk_score") or -1))
+    merged = dict(primary)
+    # The worker writes NULL (property removed) for fields a store doesn't
+    # publish; give the UI stable keys anyway.
+    for field in ("risk_band", "risk_score", "capability_score", "trust_score",
+                  "threat_score", "exposure_score", "install_users",
+                  "manifest_version", "rating", "rating_count", "publisher",
+                  "store_status", "store_url", "latest_version", "category"):
+        merged.setdefault(field, None)
+    merged["extension_key"] = primary.get("extension_key") or key
+    merged["risk_signals"] = _ext_signals_from_props(primary)
+    merged["risk_signals_json"] = None
+    try:
+        merged["vulnerabilities"] = json.loads(primary.get("vulnerabilities_json") or "[]")
+    except (TypeError, ValueError):
+        merged["vulnerabilities"] = []
+    host_list = sorted(hosts.values(), key=lambda h: h.get("hostname") or "")
+    return jsonify({
+        "extension": merged,
+        "hosts": host_list,
+        "host_count": len(host_list),
+        "node_count": len(nodes),
+    })
 
 
 @app.route("/api/relationships")

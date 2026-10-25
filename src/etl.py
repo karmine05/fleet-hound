@@ -66,6 +66,7 @@ def _etl_file_lock(lock_path: str):
                     f"another ETL is in progress (lock held: {lock_path})"
                 ) from e
             raise
+        os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
         yield
@@ -176,6 +177,10 @@ class ETLResult:
     host_reap_attempted: bool = False
     host_reap_stats: Optional[dict] = None
     host_reap_error: Optional[str] = None
+    # Partial software-write telemetry — hosts whose software rows failed to
+    # reach Memgraph this cycle. Non-zero means the .state.json watermark was
+    # held so the next delta cycle re-sends those hosts.
+    failed_host_count: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -204,6 +209,7 @@ class ETLResult:
             "host_reap_attempted": self.host_reap_attempted,
             "host_reap_stats": self.host_reap_stats,
             "host_reap_error": self.host_reap_error,
+            "failed_host_count": self.failed_host_count,
         }
 
 
@@ -322,8 +328,14 @@ def should_force_full_scan(
     if now is None:
         now = datetime.now(timezone.utc)
 
+    # 0 disables periodic full-scans. The elapsed-time safety net must also
+    # stay off in that case: `full_scan_every * interval_sec * 1.5` collapses
+    # to 0 and would otherwise force a full scan on every cycle.
+    if full_scan_every <= 0:
+        return (False, None)
+
     # Count threshold (primary trigger).
-    if full_scan_every > 0 and cycles_since_full_scan >= full_scan_every:
+    if cycles_since_full_scan >= full_scan_every:
         return (True, "count")
 
     # Elapsed-time guard (secondary trigger / post-restart safety net).
@@ -435,20 +447,27 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
 
         known_host_ids: set = set()
         hosts_seen = 0
+        host_pages_seen = 0
+        host_extract_truncated = False
 
         def _streaming_host_iter():
-            nonlocal hosts_seen
-            for page in extractor.extract_host_pages(
-                team_ids=cfg.team_ids,
-                since=global_since,
-                since_map=since_map,
-            ):
-                for h in page:
-                    hosts_seen += 1
-                    hid = h.get('id')
-                    if hid is not None:
-                        known_host_ids.add(hid)
-                    yield h
+            nonlocal hosts_seen, host_pages_seen, host_extract_truncated
+            try:
+                for page in extractor.extract_host_pages(
+                    team_ids=cfg.team_ids,
+                    since=global_since,
+                    since_map=since_map,
+                ):
+                    host_pages_seen += 1
+                    for h in page:
+                        hosts_seen += 1
+                        hid = h.get('id')
+                        if hid is not None:
+                            known_host_ids.add(hid)
+                        yield h
+            except Exception:
+                host_extract_truncated = True
+                raise
         hosts_iter = _streaming_host_iter()
         logger.info("etl: extracted users=%d; host extraction will stream", len(users))
 
@@ -639,27 +658,57 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                 logger.warning("etl: snapshot write failed: %s", msg)
                 result.snapshot_error = msg
 
-        # Advance watermarks.
-        if cfg.team_ids:
-            state.setdefault("team_syncs", {})
-            for tid in cfg.team_ids:
-                state["team_syncs"][str(tid)] = current_ts
-            result.teams_synced = list(cfg.team_ids)
+            # Capture any hosts whose software rows failed to reach Memgraph.
+            # The ingestion instance accumulates them across all
+            # _batch_create_software_grouped calls this cycle.
+            failed_sw_hosts = list(ingestion.failed_software_host_ids)
+
+        if failed_sw_hosts:
+            result.failed_host_count = len(failed_sw_hosts)
+
+        # Advance watermarks only after a complete extract+ingest. A truncated
+        # /hosts walk used to bump last_run_timestamp anyway, so the next delta
+        # cycle skipped every host that wasn't updated after this failed run.
+        # Same hazard in the other direction: a partial software write (a chunk
+        # that survived retry but still failed) leaves some INSTALLED_ON rows
+        # missing — advancing the watermark would make the extractor consider
+        # those hosts up to date and never re-send them.
+        if host_extract_truncated:
+            result.error = (
+                result.error
+                or "Fleet host extraction truncated; watermark not advanced"
+            )
+            logger.warning("etl: skipping watermark save after truncated host extract")
+        elif result.failed_host_count:
+            result.error = (
+                result.error
+                or f"Partial software writes on {result.failed_host_count} host(s); watermark not advanced"
+            )
+            logger.warning(
+                "etl: skipping watermark save after partial software writes (hosts=%d)",
+                result.failed_host_count,
+            )
         else:
-            state["last_run_timestamp"] = current_ts
-            try:
-                all_teams = extractor.extract_teams()
+            if cfg.team_ids:
                 state.setdefault("team_syncs", {})
-                synced = []
-                for t in all_teams:
-                    tid = t.get("id")
-                    if tid is not None:
-                        state["team_syncs"][str(tid)] = current_ts
-                        synced.append(int(tid))
-                result.teams_synced = synced
-            except Exception as exc:
-                logger.warning("etl: failed to refresh per-team watermarks: %s", exc)
-        save_state(cfg.state_path, state)
+                for tid in cfg.team_ids:
+                    state["team_syncs"][str(tid)] = current_ts
+                result.teams_synced = list(cfg.team_ids)
+            else:
+                state["last_run_timestamp"] = current_ts
+                try:
+                    all_teams = extractor.extract_teams()
+                    state.setdefault("team_syncs", {})
+                    synced = []
+                    for t in all_teams:
+                        tid = t.get("id")
+                        if tid is not None:
+                            state["team_syncs"][str(tid)] = current_ts
+                            synced.append(int(tid))
+                    result.teams_synced = synced
+                except Exception as exc:
+                    logger.warning("etl: failed to refresh per-team watermarks: %s", exc)
+            save_state(cfg.state_path, state)
 
     except Exception as exc:
         msg = f"{type(exc).__name__}: {exc}"

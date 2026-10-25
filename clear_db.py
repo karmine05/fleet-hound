@@ -197,6 +197,8 @@ def _drop_all_indexes(session) -> int:
     fallback = [
         "DROP INDEX ON :Label(name);",
         "DROP INDEX ON :Host(hostname);",
+        "DROP INDEX ON :Software(extension_key);",
+        "DROP INDEX ON :Software(kind);",
     ]
     for cypher in fallback:
         try:

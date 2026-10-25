@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,11 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
 # Use absolute import — Dockerfile copies prod/categorize_software.py to /app/.
 sys.path.insert(0, "/app")
-from categorize_software import EnrichResult, get_software_info  # noqa: E402
+from categorize_software import (  # noqa: E402
+    EnrichResult,
+    SHADOW_IT_SOURCES,
+    get_software_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +125,7 @@ def _pick_uncategorized(driver, batch_size: int):
                 """
                 MATCH (s:Software)
                 WHERE s.category IS NULL
+                  AND any(x IN s.sources WHERE x IN $eligible)
                 OPTIONAL MATCH (s)-[:INSTALLED_ON]->(h:Host)
                 WITH s.name AS name, COUNT(DISTINCT h) AS host_count
                 RETURN name
@@ -127,6 +133,7 @@ def _pick_uncategorized(driver, batch_size: int):
                 LIMIT $limit
                 """,
                 limit=int(batch_size),
+                eligible=list(SHADOW_IT_SOURCES),
             )
             return [r["name"] for r in result if r.get("name")]
     except (TransientError, ServiceUnavailable, SessionExpired) as exc:
@@ -150,7 +157,7 @@ def _write_categories(driver, name: str, categories, description) -> bool:
                 name=name,
                 category=list(categories) if categories else [],
                 desc=description,
-            )
+            ).consume()
         return True
     except (TransientError, ServiceUnavailable, SessionExpired) as exc:
         logger.warning("enricher: write_categories transient error for %s: %s", name, exc)
@@ -225,11 +232,57 @@ class _SharedStatus:
             self._flush_locked()
 
 
+_LOCAL = threading.local()
+
+
+def _fetch_batch(names, *, parallelism: int, stop_event: threading.Event):
+    """Resolve metadata for `names` concurrently.
+
+    Each worker thread gets its own requests.Session (sessions are not
+    thread-safe) and paces itself after every lookup, so parallelism
+    multiplies throughput within a short batch rather than hammering
+    Wikipedia continuously. DB writes stay on the caller's thread — one
+    writer at a time, same as before.
+    """
+    def _lookup(name):
+        http = getattr(_LOCAL, "http", None)
+        if http is None:
+            http = requests.Session()
+            _LOCAL.http = http
+        try:
+            status_code, payload = get_software_info(name, http)
+        except Exception as exc:
+            logger.warning("enricher: lookup error for %r: %s", name, exc)
+            return None
+        time.sleep(0.2)  # per-thread pacing toward the Wikipedia API
+        if status_code == EnrichResult.HIT and payload:
+            categories, desc = payload
+            if categories or desc:
+                return (name, categories, desc)
+        return None
+
+    hits = []
+    with ThreadPoolExecutor(max_workers=max(1, int(parallelism)),
+                            thread_name_prefix="enrich") as pool:
+        futures = {pool.submit(_lookup, n): n for n in names}
+        for fut in as_completed(futures):
+            if stop_event.is_set():
+                break
+            try:
+                hit = fut.result()
+            except Exception as exc:
+                logger.warning("enricher: lookup failed for %r: %s", futures[fut], exc)
+                continue
+            if hit:
+                hits.append(hit)
+    return hits
+
+
 def _loop(driver_provider, status: _SharedStatus, *,
           interval_sec: float, batch_size: int,
+          parallelism: int = 4,
           stop_event: threading.Event,
           trigger_path: str):
-    http = requests.Session()
     last_trigger_seen = _trigger_mtime(trigger_path)
     try:
         while not stop_event.is_set():
@@ -244,20 +297,12 @@ def _loop(driver_provider, status: _SharedStatus, *,
                     if items:
                         logger.info("enricher: tick picked %d uncategorized items", len(items))
                     enriched = 0
-                    for name in items:
+                    for name, categories, desc in _fetch_batch(
+                            items, parallelism=parallelism, stop_event=stop_event):
                         if stop_event.is_set():
                             break
-                        try:
-                            status_code, payload = get_software_info(name, http)
-                        except Exception as exc:
-                            logger.warning("enricher: lookup error for %r: %s", name, exc)
-                            status_code, payload = EnrichResult.TRANSIENT, None
-                        if status_code == EnrichResult.HIT and payload:
-                            categories, desc = payload
-                            if categories or desc:
-                                if _write_categories(driver, name, categories, desc):
-                                    enriched += 1
-                        time.sleep(0.2)
+                        if _write_categories(driver, name, categories, desc):
+                            enriched += 1
                     if enriched:
                         status.add_enriched(enriched)
                     status.update(
@@ -289,6 +334,7 @@ def _loop(driver_provider, status: _SharedStatus, *,
 def start_worker(driver_provider, *,
                  interval_sec: int = 300,
                  batch_size: int = 25,
+                 parallelism: int = 4,
                  lock_path: str = LOCK_PATH_DEFAULT,
                  trigger_path: str = TRIGGER_PATH_DEFAULT,
                  status_path: str = STATUS_PATH_DEFAULT,
@@ -325,14 +371,15 @@ def start_worker(driver_provider, *,
         kwargs=dict(
             interval_sec=float(interval_sec),
             batch_size=int(batch_size),
+            parallelism=int(parallelism),
             stop_event=stop_event,
             trigger_path=trigger_path,
         ),
         daemon=True,
     )
     t.start()
-    logger.info("enricher: started (interval=%ss, batch=%d, lock=%s, trigger=%s, status=%s)",
-                interval_sec, batch_size, lock_path, trigger_path, status_path)
+    logger.info("enricher: started (interval=%ss, batch=%d, parallelism=%d, lock=%s, trigger=%s, status=%s)",
+                interval_sec, batch_size, parallelism, lock_path, trigger_path, status_path)
     return status, stop_event
 
 

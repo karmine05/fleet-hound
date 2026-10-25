@@ -16,6 +16,49 @@ logger = logging.getLogger(__name__)
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
 
+from src.extension_intel import derive_extension_identity, summarize_vulnerabilities
+
+
+def _version_key(version) -> tuple:
+    """Sort key for dotted version strings.
+
+    `ponytail:` numeric-segment comparison where a pre-release suffix ranks
+    below the bare number ("1.2.0-beta" < "1.2.0") and is lex-ordered under
+    equal numerics ("1.2.0-alpha" < "1.2.0-beta"); purely non-numeric
+    segments rank lowest. Correct for x.y.z[-suffix], which is what this
+    fleet reports. Not a full semver parser (alpha < beta < rc ordering is
+    approximate); upgrade if that ever matters for a decision, not display.
+    """
+    parts = []
+    for seg in str(version or "").split("."):
+        if not seg:
+            parts.append((0, -1, 0, ""))
+            continue
+        num = ""
+        for ch in seg:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if num:
+            suffix = seg[len(num):]
+            parts.append((0, int(num), 0 if suffix else 1, suffix))
+        else:
+            parts.append((1, 0, 0, seg))
+    return tuple(parts) or ((0, -1, 0, ""),)
+
+
+def _is_pathy_name(name) -> bool:
+    """True when a software `name` is really an install path in disguise."""
+    n = str(name or "")
+    if "\\" in n or "/" in n:
+        return True
+    # "C:" or "C:\/" drive prefix — but "a:b" without a following separator
+    # is a (weird) name, not a path.
+    if len(n) >= 2 and n[0].isalpha() and n[1] == ":":
+        return len(n) == 2 or n[2] in "\\/"
+    return False
+
 
 @dataclass
 class LabelSyncStats:
@@ -127,6 +170,13 @@ class MemgraphIngestion:
         # ThreadPoolExecutor fan-out in _batch_create_software_grouped.
         self.max_retries = 6
         self._retry_base_sec = 0.5
+        # fleet_host_ids whose software rows failed to write (chunk-level
+        # errors after retry). The ETL layer uses this to decide whether the
+        # .state.json watermark may advance: if a host's software write
+        # partially failed, its INSTALLED_ON rows are incomplete and the
+        # watermark must NOT move past this extract, or the missing rows are
+        # never re-sent (the extractor considers the host up to date).
+        self.failed_software_host_ids: list = []
 
     def close(self):
         """Close the underlying database driver."""
@@ -179,6 +229,11 @@ class MemgraphIngestion:
             indexes = [
                 "CREATE INDEX ON :Label(name);",
                 "CREATE INDEX ON :Host(hostname);",
+                # Browser-extension inventory: the API/worker look up by
+                # canonical key and by refresh watermark. Both are additive
+                # indexes on :Software; the UNIQUE(name) constraint stands.
+                "CREATE INDEX ON :Software(extension_key);",
+                "CREATE INDEX ON :Software(kind);",
             ]
             for idx in indexes:
                 try:
@@ -457,19 +512,44 @@ class MemgraphIngestion:
                             if not raw:
                                 continue
                             name_lc = raw.strip().lower()
-                            if not name_lc or name_lc in seen_lower:
+                            # Browser extensions are identified by store + ID,
+                            # not by the (often path-shaped) Fleet name. Dedupe
+                            # on the canonical key when present so two extensions
+                            # that share a name aren't collapsed on one host.
+                            ext = derive_extension_identity(s)
+                            dedupe_key = (ext or {}).get('extension_key') or name_lc
+                            if not name_lc or dedupe_key in seen_lower:
                                 # Skip per-host duplicates that only differ in
                                 # casing (Fleet can report the same package via
                                 # multiple osquery `source` channels). Keep
                                 # the first instance — its `source` will be
                                 # MERGE-accumulated by _batch_create_software_grouped.
                                 continue
-                            seen_lower.add(name_lc)
-                            cleaned_software.append({
+                            seen_lower.add(dedupe_key)
+                            entry = {
                                 'name': name_lc,
                                 'version': s.get('version') or 'unknown',
                                 'source': (s.get('source') or '').strip(),
-                            })
+                            }
+                            if ext:
+                                entry.update(ext)
+                                vulns_json, vuln_count, max_cvss = summarize_vulnerabilities(
+                                    s.get('vulnerabilities')
+                                )
+                                entry['vulnerabilities_json'] = vulns_json
+                                entry['vulnerability_count'] = vuln_count
+                                entry['max_cvss'] = max_cvss
+                                sig = s.get('signature_information')
+                                if sig:
+                                    try:
+                                        entry['signature_information_json'] = json.dumps(
+                                            sig, separators=(',', ':'), default=str
+                                        )[:4000]
+                                    except (TypeError, ValueError):
+                                        entry['signature_information_json'] = None
+                                entry['generated_cpe'] = s.get('generated_cpe') or None
+                                entry['vendor'] = s.get('vendor') or None
+                            cleaned_software.append(entry)
                         if cleaned_software:
                             software_grouped_batch.append({
                                 'fleet_host_id': fleet_host_id,
@@ -668,58 +748,6 @@ class MemgraphIngestion:
         """
         self._execute_with_retry(session, query, {'rels': user_rel_batch}, "create user relationship batch")
 
-    def _batch_create_software(self, session, software_batch):
-        """Batch create software and relationships using UNWIND with retry logic."""
-        if not software_batch:
-            return
-
-        # 1. Deduplicate software nodes to minimize MERGE/SET operations.
-        # Key includes `source` so distinct install channels for the same
-        # (name, version) (e.g., python3 from deb_packages on one host and from
-        # homebrew_packages on another) all flow through and accumulate on the
-        # node's `sources` list.
-        unique_software_map = {}
-        for sw in software_batch:
-            key = (sw['name'], sw['version'], sw.get('source', ''))
-            if key not in unique_software_map:
-                unique_software_map[key] = sw
-
-        unique_software_batch = list(unique_software_map.values())
-
-        # 2. Efficiently update Software nodes and versions
-        query_nodes = """
-            UNWIND $software AS sw
-            MERGE (s:Software {name: sw.name})
-            ON CREATE SET s.versions = [sw.version],
-                         s.first_version = sw.version,
-                         s.last_version = sw.version,
-                         s.sources = CASE
-                             WHEN sw.source IS NULL OR sw.source = '' THEN []
-                             ELSE [sw.source] END
-            ON MATCH SET s.versions = CASE
-                WHEN s.versions IS NULL THEN [sw.version]
-                WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
-                ELSE s.versions END,
-                s.last_version = sw.version,
-                s.sources = CASE
-                    WHEN sw.source IS NULL OR sw.source = '' THEN coalesce(s.sources, [])
-                    WHEN s.sources IS NULL THEN [sw.source]
-                    WHEN NOT sw.source IN s.sources THEN s.sources + [sw.source]
-                    ELSE s.sources END
-        """
-        self._execute_with_retry(session, query_nodes, {'software': unique_software_batch}, "create software nodes")
-
-        # 3. Create relationships using MATCH on both endpoints to avoid ghost hosts.
-        # Host MATCH is keyed by fleet_host_id (stable identity); hosts must be
-        # ingested via _batch_create_hosts before this runs.
-        query_rels = """
-            UNWIND $software AS sw
-            MATCH (s:Software {name: sw.name})
-            MATCH (h:Host {fleet_host_id: sw.fleet_host_id})
-            MERGE (s)-[:INSTALLED_ON]->(h)
-        """
-        self._execute_with_retry(session, query_rels, {'software': software_batch}, "create software rels")
-
     def _extract_user_identifiers(self, host):
         """Extract user identifiers from host data.
 
@@ -764,6 +792,52 @@ class MemgraphIngestion:
     # execution.
     _SOFTWARE_REL_PARALLELISM = max(1, int(os.environ.get("INGEST_SW_PARALLELISM", "4")))
 
+    def _resolve_canonical_extension_names(
+        self, session, ext_keys, software_grouped_batch
+    ) -> dict:
+        """Pick one canonical `name` per extension_key.
+
+        The same Chrome/Edge ID can arrive under several names: a clean
+        display name from one host, a path-shaped name from another. The
+        Software MERGE key is `name`, so without this every variant becomes
+        its own node and the extension inventory fragments.
+
+        Candidates = existing node names + names arriving in this batch. A
+        path-shaped name never beats a clean one; ties break on length, then
+        lexicographic order, so the choice is deterministic across cycles.
+        Returns {extension_key: canonical_name} ({} on query failure — the
+        caller then falls back to current per-name behavior).
+        """
+        candidates: dict = {}
+        try:
+            for rec in session.run(
+                "MATCH (s:Software) WHERE s.extension_key IN $keys "
+                "RETURN s.extension_key AS k, s.name AS name",
+                keys=list(ext_keys),
+            ).data():
+                if rec.get("k") and rec.get("name"):
+                    candidates.setdefault(rec["k"], set()).add(rec["name"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("canonical extension-name resolve failed: %s", exc)
+            return {}
+        for entry in software_grouped_batch:
+            for sw in entry.get("software_list") or []:
+                k = sw.get("extension_key")
+                if k and sw.get("name"):
+                    candidates.setdefault(k, set()).add(sw["name"])
+        out = {}
+        for k, names in candidates.items():
+            names = {str(n) for n in names if n}
+            if not names:
+                continue
+            clean = [n for n in names if not _is_pathy_name(n)]
+            pool = clean if clean else names
+            # (len, name) tie-break: fully deterministic across cycles —
+            # same-length names must NOT resolve by set iteration order,
+            # or two cycles could pick different canonicals and re-fragment.
+            out[k] = sorted(pool, key=lambda n: (len(n), n))[0]
+        return out
+
     def _batch_create_software_grouped(self, session, software_grouped_batch):
         """
         Optimized batch creation of software grouped by host.
@@ -771,6 +845,74 @@ class MemgraphIngestion:
         """
         if not software_grouped_batch:
             return
+
+        # 0. Canonical extension names. Rewrite every extension row to the
+        # canonical name for its extension_key BEFORE anything else: node
+        # MERGE, rel MERGE and the stale-rel prune all key on `name`, so they
+        # only agree if the rewrite happens first.
+        ext_keys = sorted({
+            sw.get("extension_key")
+            for entry in software_grouped_batch
+            for sw in entry.get("software_list") or []
+            if sw.get("extension_key")
+        })
+        if ext_keys:
+            canonical_by_key = self._resolve_canonical_extension_names(
+                session, ext_keys, software_grouped_batch
+            )
+            if canonical_by_key:
+                for entry in software_grouped_batch:
+                    for sw in entry.get("software_list") or []:
+                        key = sw.get("extension_key")
+                        if key and key in canonical_by_key:
+                            sw["name"] = canonical_by_key[key]
+
+        # 0b. Deterministic last_version. The node's `last_version` is the
+        # highest version observed across hosts — not whichever host wrote
+        # last (old behavior). Per-host current versions live on the
+        # INSTALLED_ON edge, where they were always correct.
+        incoming_versions: dict = {}
+        for entry in software_grouped_batch:
+            for sw in entry.get("software_list") or []:
+                n, v = sw.get("name"), sw.get("version")
+                if n and v:
+                    cur = incoming_versions.get(n)
+                    if cur is None or _version_key(v) > _version_key(cur):
+                        incoming_versions[n] = v
+        if incoming_versions:
+            existing_versions: dict = {}
+            try:
+                for rec in session.run(
+                    "MATCH (s:Software) WHERE s.name IN $names "
+                    "RETURN s.name AS name, s.last_version AS lv",
+                    names=list(incoming_versions),
+                ).data():
+                    if rec.get("lv"):
+                        existing_versions[rec["name"]] = rec["lv"]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("last_version pre-read failed: %s", exc)
+            for entry in software_grouped_batch:
+                for sw in entry.get("software_list") or []:
+                    n, v = sw.get("name"), sw.get("version")
+                    if not n or not v:
+                        continue
+                    # Every row for a name carries the SAME value: max of the
+                    # batch and the existing node version. Then the node
+                    # query's ON CREATE / ON MATCH are order-independent —
+                    # whichever UNWIND row hits the node first or last writes
+                    # the true maximum. (Comparing each row's own version
+                    # instead let a lower later row clobber a higher one.)
+                    incoming = incoming_versions[n]
+                    existing = existing_versions.get(n)
+                    if existing is not None and _version_key(existing) > _version_key(incoming):
+                        sw["last_version"] = existing
+                    else:
+                        sw["last_version"] = incoming
+
+        # Single ingest timestamp for this flush: node first/last_seen and the
+        # per-host INSTALLED_ON watermark all share it, which makes "installed
+        # this cycle" queries trivial.
+        seen_at = datetime.now(timezone.utc).isoformat()
 
         # 1. Flatten for Node Creation (Deduplicated globally for this batch)
         # We want to ensure all Software nodes exist before linking. Done in
@@ -788,27 +930,80 @@ class MemgraphIngestion:
         unique_software_list = list(unique_software_map.values())
 
         # 2. Create/Update Software Nodes
+        #
+        # Extension fields (kind/store/extension_key/permissions later) are
+        # additive: the MERGE key stays `name` so every existing query and the
+        # UNIQUE constraint keep working. Native software rows carry NULL for
+        # all of these and the CASE guards keep their node untouched.
         query_nodes = """
             UNWIND $software AS sw
             MERGE (s:Software {name: sw.name})
             ON CREATE SET s.versions = [sw.version],
                           s.first_version = sw.version,
-                          s.last_version = sw.version,
+                          s.last_version = coalesce(sw.last_version, sw.version),
                           s.sources = CASE
                               WHEN sw.source IS NULL OR sw.source = '' THEN []
-                              ELSE [sw.source] END
+                              ELSE [sw.source] END,
+                          s.first_seen = $seen_at,
+                          s.last_seen = $seen_at,
+                          s.kind = sw.kind,
+                          s.store = sw.store,
+                          s.extension_key = sw.extension_key,
+                          s.extension_id = sw.extension_id,
+                          s.browser = sw.browser,
+                          s.extension_for = sw.extension_for,
+                          s.display_name = sw.display_name,
+                          s.installed_paths = sw.installed_paths,
+                          s.generated_cpe = sw.generated_cpe,
+                          s.vendor = sw.vendor,
+                          s.signature_information_json = sw.signature_information_json,
+                          s.vulnerabilities_json = sw.vulnerabilities_json,
+                          s.vulnerability_count = sw.vulnerability_count,
+                          s.max_cvss = sw.max_cvss,
+                          s.is_builtin = sw.is_builtin
             ON MATCH SET s.versions = CASE
                 WHEN s.versions IS NULL THEN [sw.version]
                 WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
                 ELSE s.versions END,
-                s.last_version = sw.version,
+                s.last_version = CASE
+                    WHEN sw.last_version IS NOT NULL THEN sw.last_version
+                    ELSE s.last_version END,
+                s.last_seen = $seen_at,
+                s.first_seen = coalesce(s.first_seen, $seen_at),
                 s.sources = CASE
                     WHEN sw.source IS NULL OR sw.source = '' THEN coalesce(s.sources, [])
                     WHEN s.sources IS NULL THEN [sw.source]
                     WHEN NOT sw.source IN s.sources THEN s.sources + [sw.source]
-                    ELSE s.sources END
+                    ELSE s.sources END,
+                s.kind = CASE WHEN sw.kind IS NOT NULL THEN sw.kind ELSE s.kind END,
+                s.store = CASE WHEN sw.store IS NOT NULL THEN sw.store ELSE s.store END,
+                s.extension_key = CASE WHEN sw.extension_key IS NOT NULL THEN sw.extension_key ELSE s.extension_key END,
+                s.extension_id = CASE WHEN sw.extension_id IS NOT NULL THEN sw.extension_id ELSE s.extension_id END,
+                s.browser = CASE WHEN sw.browser IS NOT NULL THEN sw.browser ELSE s.browser END,
+                s.extension_for = CASE WHEN sw.extension_for IS NOT NULL THEN sw.extension_for ELSE s.extension_for END,
+                s.display_name = CASE WHEN sw.display_name IS NOT NULL THEN sw.display_name ELSE s.display_name END,
+                s.installed_paths = CASE WHEN sw.installed_paths IS NOT NULL THEN sw.installed_paths ELSE s.installed_paths END,
+                s.generated_cpe = CASE WHEN sw.generated_cpe IS NOT NULL THEN sw.generated_cpe ELSE s.generated_cpe END,
+                s.vendor = CASE WHEN sw.vendor IS NOT NULL THEN sw.vendor ELSE s.vendor END,
+                s.signature_information_json = CASE WHEN sw.signature_information_json IS NOT NULL THEN sw.signature_information_json ELSE s.signature_information_json END,
+                s.vulnerabilities_json = CASE WHEN sw.vulnerabilities_json IS NOT NULL THEN sw.vulnerabilities_json ELSE s.vulnerabilities_json END,
+                s.vulnerability_count = CASE WHEN sw.vulnerability_count IS NOT NULL THEN sw.vulnerability_count ELSE s.vulnerability_count END,
+                s.max_cvss = CASE WHEN sw.max_cvss IS NOT NULL THEN sw.max_cvss ELSE s.max_cvss END,
+                s.is_builtin = CASE WHEN sw.kind IS NOT NULL THEN sw.is_builtin ELSE s.is_builtin END
         """
-        self._execute_with_retry(session, query_nodes, {'software': unique_software_list}, "create software nodes")
+        nodes_ok = self._execute_with_retry(
+            session, query_nodes,
+            {'software': unique_software_list, 'seen_at': seen_at},
+            "create software nodes",
+        )
+        if not nodes_ok:
+            # The node MERGE is global to this batch: if it fails, the rel
+            # MERGE below matches no Software nodes and silently drops every
+            # rel for every host in the batch. Mark them failed so the ETL
+            # layer holds the .state.json watermark and re-sends next cycle.
+            self.failed_software_host_ids.extend(
+                e['fleet_host_id'] for e in software_grouped_batch
+            )
 
         # 3. Per-chunk pipeline: (a) prune stale rels (delta-delete), (b) MERGE
         # fresh rels, (c) stamp software_updated_at watermark.
@@ -842,7 +1037,15 @@ class MemgraphIngestion:
             WITH h, batch
             UNWIND batch.software_list AS sw
             MATCH (s:Software {name: sw.name})
-            MERGE (s)-[:INSTALLED_ON]->(h)
+            MERGE (s)-[r:INSTALLED_ON]->(h)
+            ON CREATE SET r.first_seen = $seen_at
+            SET r.last_seen = $seen_at,
+                r.version = sw.version,
+                r.source = sw.source,
+                r.browser = CASE WHEN sw.browser IS NOT NULL THEN sw.browser ELSE r.browser END,
+                r.extension_for = CASE WHEN sw.extension_for IS NOT NULL THEN sw.extension_for ELSE r.extension_for END,
+                r.installed_path = CASE WHEN sw.installed_path IS NOT NULL THEN sw.installed_path ELSE r.installed_path END,
+                r.extension_key = CASE WHEN sw.extension_key IS NOT NULL THEN sw.extension_key ELSE r.extension_key END
         """
         mark_synced_query = """
             UNWIND $batches AS b
@@ -898,7 +1101,9 @@ class MemgraphIngestion:
 
                 label_m = f"create grouped software rels (chunk hosts={len(c)} sw_rows={rows})"
                 ok = self._execute_with_retry(
-                    worker_session, query_rels, {'batches': c}, label_m
+                    worker_session, query_rels,
+                    {'batches': c, 'seen_at': seen_at},
+                    label_m,
                 )
                 if not ok:
                     with failed_lock:
@@ -945,6 +1150,12 @@ class MemgraphIngestion:
                 "host_software_rels_failed hosts=%d fleet_host_ids=%s%s",
                 len(failed_host_ids), preview, more,
             )
+            # Accumulate for the ETL layer: it must NOT advance the
+            # .state.json watermark when any host's software rows failed,
+            # otherwise those rows are never re-sent. ETL resets the list
+            # at the start of each cycle.
+            with failed_lock:
+                self.failed_software_host_ids.extend(failed_host_ids)
 
         # 4. Orphan accounting: count entries whose fleet_host_id had no :Host
         # node at MATCH time (parity with label-orphan telemetry from 260519-j0t).

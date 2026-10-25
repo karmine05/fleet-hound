@@ -3,11 +3,22 @@ name: fleet-hound
 services:
   # Memgraph Database
   memgraph:
-    image: memgraph/memgraph:latest
+    # Pin the exact release the data volume was created with. `:latest` can
+    # jump a major version on a recreate and break Bolt clients / on-disk
+    # snapshots without warning; a major *downgrade* (e.g. 2.x engine over 3.x
+    # data) fails to start the database at all. Verify with `SHOW VERSION`.
+    image: memgraph/memgraph:3.14.0
+    # Sized for a 64GB / 14-core host. 3.x takes the limit in MiB and there is
+    # no explicit default: 0 means 90% of physical RAM (57G here), which would
+    # blow the 10G container cap and get the container OOM-killed. Concurrency
+    # flags from 2.x are gone in 3.x — bolt workers default to core count.
+    command:
+      - "--memory-limit"
+      - "8192"
     container_name: fleet-memgraph
     ports:
-      - "7687:7687" # Bolt protocol
-      - "7444:7444" # Monitoring
+      - "127.0.0.1:7687:7687" # Bolt protocol (loopback; webviz talks over the compose network)
+      - "127.0.0.1:7444:7444" # Monitoring
     volumes:
       - memgraph-data:/var/lib/memgraph
       - memgraph-log:/var/log/memgraph
@@ -20,8 +31,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 40s
     restart: unless-stopped
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 10G
+        reservations:
+          cpus: "1.0"
+          memory: 4G
 
   # Fleet-Bloodhound Web Dashboard
   webviz:
@@ -66,6 +91,14 @@ services:
       - ENRICHER_ENABLED
       - ENRICHER_INTERVAL_SEC
       - ENRICHER_BATCH_SIZE
+      - ENRICHER_PARALLELISM
+      # Browser-extension intel worker — anonymous store metadata + risk scores.
+      # Defaults: enabled, 6h interval, 50 extensions/cycle, cache under /app/config.
+      - EXTENSION_WORKER_ENABLED
+      - EXTENSION_WORKER_INTERVAL_SEC
+      - EXTENSION_WORKER_BATCH_SIZE
+      - EXTENSION_WORKER_PARALLELISM
+      - EXTENSION_CACHE_DIR
       # Shadow IT outlier threshold (fraction of platform hosts; default 0.03).
       # Drives /api/shadow-it detection AND enrichment-candidate selection.
       - SHADOW_IT_OUTLIER_PCT
@@ -97,6 +130,26 @@ services:
     networks:
       - fleet-network
     restart: unless-stopped
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5); sys.exit(0 if r.status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
 
 networks:
   fleet-network:
