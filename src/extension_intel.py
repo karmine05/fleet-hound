@@ -417,6 +417,28 @@ def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset]:
         return names, chrome_ids, amo_ids, edge_ext_ids
 
 
+def store_install_verified(store, extension_id, paths) -> bool:
+    """True when the host-reported install paths show a store install.
+
+    Store-ID trust is about the listing, not the installed copy: an unpacked
+    extension can claim a listed ID by copying its manifest `key`. Store
+    installs live in the browser's managed directory
+    (Chromium: <profile>/Extensions/<id>/<version>; Firefox:
+    <profile>/extensions/<id>.xpi); unpacked ones load from anywhere else.
+    Needs at least one store path and no other path; unreported (empty)
+    paths are ignored, and no paths at all is not evidence.
+    """
+    if not extension_id:
+        return False
+    if store == "firefox":
+        store_path = re.compile(r"[\\/]extensions[\\/]" + re.escape(extension_id) + r"\.xpi$")
+    else:
+        store_path = re.compile(r"[\\/]Extensions[\\/]" + re.escape(extension_id)
+                                + r"[\\/][^\\/]+[\\/]?$")
+    reported = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
+    return bool(reported) and all(store_path.search(p) for p in reported)
+
+
 def publisher_is_reputable(*values) -> bool:
     """True when a store-sourced developer/publisher NAME is a known publisher.
 
@@ -444,8 +466,9 @@ def amo_author_is_reputable(author_ids) -> bool:
 
 def edge_extension_is_reputable(extension_id, store_status) -> bool:
     """Edge exposes no publisher ID, so trust is per listed extension ID, and
-    only while the Edge store reports that ID as a public listing (a
-    sideloaded copy reusing the ID gets nothing)."""
+    only while the Edge store reports that ID as a public listing. Whether the
+    installed copy came from the store is checked separately
+    (store_install_verified)."""
     _, _, _, edge_ext_ids = known_publishers()
     return store_status == "public" and bool(extension_id) and extension_id in edge_ext_ids
 
@@ -807,7 +830,17 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         reputable = edge_extension_is_reputable(record.get("extension_id"), meta.get("status"))
     else:
         reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
+    sideload_signal = None
+    if reputable and meta.get("store") in ("chrome", "firefox", "edge"):
+        if not store_install_verified(meta.get("store"), record.get("extension_id"),
+                                      record.get("install_paths")):
+            reputable = False
+            sideload_signal = {"code": "not-store-install", "weight": 0,
+                               "detail": "publisher is known, but no host shows a store install "
+                                         "(unpacked or unreported path); publisher trust not applied"}
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
+    if sideload_signal:
+        trust_signals.append(sideload_signal)
     threat, threat_signals = _threat_score(meta, record, blocklist_entry)
     signals.extend(threat_signals)
 
@@ -1566,6 +1599,8 @@ def _self_check() -> None:
     tiny_known = analyze_extension({
         "store": "firefox", "extension_id": "{ce9f4b1f-24b8-4e9a-9051-b9e472b1b2f2}",
         "name": "clear browsing data", "host_count": 1,
+        "install_paths": ["/home/a/.mozilla/firefox/p.default/extensions/"
+                          "{ce9f4b1f-24b8-4e9a-9051-b9e472b1b2f2}.xpi"],
         "store_meta": {"store": "firefox", "status": "public", "users": 41_759,
                        "developer": "Mozilla", "author_ids": [101]},
     })
@@ -1581,15 +1616,24 @@ def _self_check() -> None:
     assert not publisher_is_reputable("Bad Amo"), "string author IDs are rejected"
     # Edge: listed extension ID + public listing; the developer name alone earns nothing.
     edge_meta = {"store": "edge", "status": "public", "developer": "Microsoft Corporation"}
+    edge_path = ["/Users/a/Library/Application Support/Microsoft Edge/Default/Extensions/"
+                 "jmjflgjpcpepeafmmgdpfkogkghcpiha/1.0_0"]
     listed = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
-                                "name": "x", "host_count": 1, "store_meta": edge_meta})
+                                "name": "x", "host_count": 1, "store_meta": edge_meta,
+                                "install_paths": edge_path})
     other = analyze_extension({"store": "edge", "extension_id": "b" * 32, "name": "x",
                                "host_count": 1, "store_meta": edge_meta})
     gone = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
-                              "name": "x", "host_count": 1,
+                              "name": "x", "host_count": 1, "install_paths": edge_path,
                               "store_meta": {**edge_meta, "status": "not_found"}})
     assert listed["publisher_reputable"] and not other["publisher_reputable"]
-    assert not gone["publisher_reputable"], "sideloaded copy of a listed ID is not trusted"
+    assert not gone["publisher_reputable"], "listed ID no longer on the store is not trusted"
+    # An unpacked copy claiming the listed ID (manifest `key`) loses store trust.
+    sideloaded = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
+                                    "name": "x", "host_count": 2, "store_meta": edge_meta,
+                                    "install_paths": edge_path + ["/Users/b/dev/copy/dist"]})
+    assert not sideloaded["publisher_reputable"]
+    assert any(s["code"] == "not-store-install" for s in sideloaded["risk_signals"])
 
     typo = analyze_extension({
         "store": "chrome", "extension_id": "a" * 32,
