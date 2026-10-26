@@ -361,7 +361,9 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset]:
             logger.warning("known_publishers: skipping entry %d (%s): %s",
                            idx, (entry or {}).get("name") if isinstance(entry, dict) else entry, exc)
             continue
-        for n in [entry["name"], *(entry.get("match_names") or [])]:
+        # Only explicit match_names are name-trusted; `name` is a label. Entries
+        # verified by Chrome ID alone must not become trusted names elsewhere.
+        for n in entry.get("match_names") or []:
             if _normalise_publisher(n):
                 names.add(_normalise_publisher(n))
         chrome_ids.update(ids)
@@ -1473,14 +1475,14 @@ def _self_check() -> None:
     import tempfile
     # Self-check uses its own publisher fixture, independent of the operator list.
     fixture = {"publishers": [
-        {"name": "Google", "match_names": ["Google Ireland"], "added_at": "2026-10-26T00:00:00Z",
+        {"name": "Google", "match_names": ["Google", "Google Ireland"], "added_at": "2026-10-26T00:00:00Z",
          "chrome_publisher_ids": ["udcdd80226b381e8c9845d3e7861f0e71"]},
-        {"name": "Meta", "added_at": "2026-10-26T00:00:00Z"},
-        {"name": "Mozilla", "added_at": "2026-10-26T00:00:00Z"},
-        {"name": "AdGuard", "added_at": "2026-10-26T00:00:00Z"},
-        {"name": "1Password", "match_names": ["AgileBits"], "added_at": "2026-10-26T00:00:00Z",
+        {"name": "Meta", "match_names": ["Meta"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "Mozilla", "match_names": ["Mozilla"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "AdGuard", "match_names": ["AdGuard"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "1Password", "match_names": ["1Password", "AgileBits"], "added_at": "2026-10-26T00:00:00Z",
          "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"]},
-        {"name": "DuckDuckGo", "match_names": ["Duck Duck Go"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "DuckDuckGo", "match_names": ["DuckDuckGo", "Duck Duck Go"], "added_at": "2026-10-26T00:00:00Z"},
         {"name": "No Timestamp"},                                                   # skipped
         {"name": "Bad Id", "added_at": "2026-10-26T00:00:00Z", "chrome_publisher_ids": ["x"]},  # skipped
     ]}
@@ -1489,6 +1491,13 @@ def _self_check() -> None:
     tmp.close()
     os.environ["KNOWN_PUBLISHERS_FILE"] = tmp.name
     assert not publisher_is_reputable("No Timestamp") and not publisher_is_reputable("Bad Id")
+    fixture["publishers"].append({"name": "ChromeOnly", "added_at": "2026-10-26T00:00:00Z",
+                                  "chrome_publisher_ids": ["u" + "2" * 32]})
+    with open(tmp.name, "w") as fh:
+        json.dump(fixture, fh)
+    os.utime(tmp.name, (os.path.getmtime(tmp.name) + 2,) * 2)
+    assert not publisher_is_reputable("ChromeOnly"), "Chrome-ID-only entry must not trust its name"
+    assert chrome_publisher_is_reputable("u" + "2" * 32)
 
     builtin = analyze_extension({
         "store": "chrome", "extension_id": "ghbmnnjooekpmoecnnnilnnbdlolhkhi",
@@ -1630,7 +1639,7 @@ def _self_check() -> None:
             raise AssertionError("network call for invalid id")
     assert fetch_chrome_metadata("../publisher/x", client=_NoNet())["error"] == "invalid chrome extension id"
     # Edits to the file are picked up without a restart (mtime change).
-    fixture["publishers"].append({"name": "Late Addition", "added_at": "2026-10-27T00:00:00Z"})
+    fixture["publishers"].append({"name": "Late Addition", "match_names": ["Late Addition"], "added_at": "2026-10-27T00:00:00Z"})
     with open(tmp.name, "w") as fh:
         json.dump(fixture, fh)
     os.utime(tmp.name, (os.path.getmtime(tmp.name) + 5,) * 2)
