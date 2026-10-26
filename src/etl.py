@@ -20,7 +20,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -215,6 +215,9 @@ class ETLResult:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_WATERMARK_SKEW_MARGIN = timedelta(minutes=5)
 
 
 def _now_compact() -> str:
@@ -435,6 +438,10 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
     since_map = {} if cfg.full_scan else (state.get("team_syncs", {}) if isinstance(state, dict) else {})
     global_since = None if cfg.full_scan else state.get("last_run_timestamp")
     current_ts = _now_compact()
+    # Watermark is compared against Fleet's DB clock; back it off so hosts
+    # updated within a few minutes of clock skew are re-fetched, not skipped.
+    # Re-ingesting a host is idempotent, so the overlap is harmless.
+    watermark_ts = (datetime.now(timezone.utc) - _WATERMARK_SKEW_MARGIN).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     try:
         extractor = FleetGraphExtractor(
@@ -524,7 +531,16 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
             all_member_ids: set = set()
             for ids in member_map.values():
                 all_member_ids.update(ids)
-            orphan_ids = sorted(all_member_ids - known_host_ids)
+            # Orphan = label member with no :Host node in the graph. Checking
+            # only this cycle's hosts counted every quiet host on a delta run.
+            with ingestion.driver.session() as _s:
+                present_ids = {
+                    r["id"] for r in _s.run(
+                        "MATCH (h:Host) WHERE h.fleet_host_id IN $ids RETURN h.fleet_host_id AS id",
+                        ids=sorted(all_member_ids),
+                    )
+                }
+            orphan_ids = sorted(all_member_ids - present_ids)
             result.label_orphan_count = len(orphan_ids)
             logger.info(
                 "etl: label orphan ids detected=%d (host ids in Fleet membership with no :Host node)",
@@ -707,7 +723,7 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         else:
             state.setdefault("team_syncs", {})
             for tid in cfg.team_ids:
-                state["team_syncs"][str(tid)] = current_ts
+                state["team_syncs"][str(tid)] = watermark_ts
             result.teams_synced = list(cfg.team_ids)
             save_state(cfg.state_path, state)
 

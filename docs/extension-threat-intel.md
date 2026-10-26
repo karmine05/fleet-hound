@@ -201,10 +201,10 @@ Rollback: keep `name` and `extension_id` on every node. Take a snapshot before m
 |---|---|---|---|---|---|
 | Chrome update2 | exists/removed, latest version, SHA-256, size, CRX URL | `https://clients2.google.com/service/update2/crx?response=updatecheck&prodversion=131.0&acceptformat=crx2,crx3&x=id%3D{ID}%26uc` | none | ✅ | `status="ok"` or `error-unknownApplication`; parse XML |
 | Chrome CRX | `manifest.json` (permissions, hosts, MV, update_url), file list | `codebase` URL from update2 | none | ✅ | Follow redirects only to `clients2.google.com` / `storage.googleapis.com`; SHA-256 matches update2 `hash_sha256` |
-| Edge product details | name, version, users, rating, developer, category, privacyData, manifest JSON, isMV2 | `https://microsoftedge.microsoft.com/addons/getproductdetailsbycrxid/{ID}` | none | ✅ | Can return a JSON body with HTTP 404 — parse the body, treat `null`/empty as not found |
+| Edge product details | name, version, users, rating, developer, category, privacyData, manifest JSON, isMV2 | `https://microsoftedge.microsoft.com/addons/getproductdetailsbycrxid/{ID}` | none | ✅ | Can return a JSON body with HTTP 404 — only HTTP 200 is `public`; 404 or `null`/empty is `not_found` |
 | Edge CRX | — | — | — | ❌ | Download endpoint returns HTTP 500; use detail JSON manifest |
 | AMO addon API | name, version, permissions, host_permissions, optional_permissions, hash, size, users, ratings, status | `https://addons.mozilla.org/api/v5/addons/addon/{GUID}/` | none | ✅ | URL-encode GUID; 404 = built-in, 401 = unlisted/self-distributed |
-| Mozilla blocklist | 1,014 records: guid, why, versionRange, severity | `https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/addons/records` | none | ✅ | Cache 6-12h |
+| Mozilla blocklist | 1,014 records: guid, why, versionRange, severity | `https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/addons/records` | none | ✅ | Cache 6-12h. Paginate via the `Next-Page` header. `guid` may be a `/regex/` (matched against the extension ID); `versionRange` (`minVersion`/`maxVersion`, `*` = unbounded) is checked against installed versions, and an unknown installed version counts as blocked |
 | Safari / App Store | containing app metadata | `https://itunes.apple.com/lookup?bundleId={BUNDLE}` | none | ⚠️ | Extensions are app-embedded; map via `installed_paths` / bundle ID; detection-only |
 | VS Code Marketplace | metadata, versions, stats | `POST https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery` | none | ✅ | Unofficial; adjacent scope |
 | Open VSX | metadata, versions | `https://open-vsx.org/api/{publisher}/{name}` | none | ✅ | Adjacent scope |
@@ -336,6 +336,7 @@ TTLs:
 
 - Per-source circuit breaker: 3 consecutive failures → skip source for 1h; status shows degraded.
 - Backoff with jitter on 429/5xx.
+- Implemented today: a per-store, per-cycle breaker. A 429 (or 503 with `Retry-After`) from a store trips it; that store's remaining items are skipped, not cached and not stamped (`intel_refreshed_ts` unchanged), so they retry next cycle. `last_cycle` reports `deferred` and `rate_limited_stores`.
 - One extension failure does not abort the batch.
 - Manifest parse failure → `risk_signals += "manifest-unparseable"`, risk ≥ 60.
 - Never follow arbitrary redirects (SSRF); allowlist store domains.
@@ -369,7 +370,8 @@ TTLs:
 | `storage`, `contextMenus`, `alarms`, `notifications`, `sidePanel` | +1 each |
 | Host `<all_urls>` / `*://*/*` | +20 |
 | Content script on `<all_urls>` | +10 |
-| No host permissions | ×0.6 |
+| Optional permission | ×0.5 of its weight; optional total capped at the required-permission total |
+| No host permissions and no content-script matches | ×0.6 |
 
 **Trust (0-100, higher = better):**
 
@@ -379,7 +381,7 @@ TTLs:
 | Unlisted | +5 |
 | Removed / not found | 0 |
 | Sideloaded | 0 |
-| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) | +15 |
+| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH | +15 |
 | MV3 | +10 |
 | Updated < 12 months | +15 |
 | Updated 12-24 months | +5 |
@@ -417,7 +419,7 @@ TTLs:
 **Composite:**
 
 ```python
-risk = round(0.40 * cap + 0.25 * (100 - trust) + 0.25 * threat + 0.10 * exposure)
+risk = round(0.35 * cap + 0.25 * (100 - trust) + 0.25 * threat + 0.15 * exposure)
 if threat >= 80:
     risk = max(risk, 85)
 ```

@@ -1,4 +1,5 @@
 import atexit
+import fcntl
 import functools
 import hashlib
 import hmac
@@ -697,10 +698,16 @@ def authorize_software():
                 "message": "software_name must be <= 500 characters",
             }), 400
             
-        whitelist = _normalize_whitelist(load_whitelist())
-        if software_name not in whitelist:
-            whitelist.append(software_name)
-            save_whitelist(whitelist)
+        # Lock the read-modify-write: concurrent approvals across gunicorn
+        # workers/threads would otherwise drop each other's entries.
+        with open(WHITELIST_FILE + ".lock", "a") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            whitelist = _normalize_whitelist(load_whitelist())
+            added = software_name not in whitelist
+            if added:
+                whitelist.append(software_name)
+                save_whitelist(whitelist)
+        if added:
             audit_log("AUTHORIZE", f"Authorized software: {software_name}")
             logger.info(f"Authorized software: {software_name}")
             

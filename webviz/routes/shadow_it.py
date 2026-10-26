@@ -18,7 +18,7 @@ from webviz.app import WHITELIST_FILE, _normalize_whitelist, _whitelist_clause, 
 
 bp = Blueprint("shadow_it", __name__)
 
-def _shadow_it_users_by_software(session, software_names):
+def _shadow_it_users_by_software(session, software_names, scope_clause="", scope_params=None):
     """Map software name -> sorted list of usernames on hosts that have it.
 
     Batched form of the per-software user lookup that used to run once per
@@ -33,10 +33,11 @@ def _shadow_it_users_by_software(session, software_names):
     rows = session.run(
         """
         MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-        WHERE s.name IN $names
+        WHERE s.name IN $names """ + scope_clause + """
         RETURN s.name AS name, COLLECT(DISTINCT u.username) AS users
         """,
         names=names,
+        **(scope_params or {}),
     )
     return {r["name"]: sorted(r["users"] or []) for r in rows}
 
@@ -265,6 +266,8 @@ def _get_shadow_it_uncached():
             filter_params['whitelist'] = whitelist
 
         filter_params.update(label_flt_params)
+        # Same host scope for affected_users, so user counts match affected_hosts.
+        user_scope = f"{team_clause} {platform_clause} {label_clause}"
         
         # ===== DETECTION 1: Outlier Software (installed on very few hosts) =====
         if detection_type_filter in ['all', 'outlier']:
@@ -291,9 +294,7 @@ def _get_shadow_it_uncached():
             outlier_rows = list(session.run(outlier_query, **filter_params))
             # Batch the per-software user lookup (replaces the N+1 pattern:
             # one query for every candidate instead of one per candidate).
-            outlier_users_by_name = _shadow_it_users_by_software(
-                session, [r['software_name'] for r in outlier_rows]
-            )
+            outlier_users_by_name = _shadow_it_users_by_software(session, [r['software_name'] for r in outlier_rows], user_scope, filter_params)
             for record in outlier_rows:
                 # Skip OS-managed system packages and dev-language transitive
                 # deps — neither is a deliberate user install. Browser/IDE
@@ -433,7 +434,7 @@ def _get_shadow_it_uncached():
                     r['software_name']: r
                     for r in session.run(detail_query, matched_names=matched_names, **filter_params)
                 }
-            high_risk_users_by_name = _shadow_it_users_by_software(session, matched_names)
+            high_risk_users_by_name = _shadow_it_users_by_software(session, matched_names, user_scope, filter_params)
             for record, matched_category in high_risk_matches:
                 detail = host_detail.get(record['software_name'])
                 record['hosts'] = detail['hosts'] if detail else []
@@ -529,9 +530,7 @@ def _get_shadow_it_uncached():
 
             version_sprawl_rows = list(session.run(version_sprawl_query, **filter_params))
             # Batched user lookup (replaces the per-candidate N+1 query).
-            version_sprawl_users_by_name = _shadow_it_users_by_software(
-                session, [r['software_name'] for r in version_sprawl_rows]
-            )
+            version_sprawl_users_by_name = _shadow_it_users_by_software(session, [r['software_name'] for r in version_sprawl_rows], user_scope, filter_params)
             for record in version_sprawl_rows:
                 # System packages and dev-language deps routinely show many
                 # versions across distro releases / lockfile drift — that's

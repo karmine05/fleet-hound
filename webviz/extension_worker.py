@@ -35,6 +35,7 @@ try:  # Docker layout: /app/webviz + /app/src on sys.path
         analyze_extension,
         fetch_mozilla_blocklist,
         fetch_store_metadata,
+        match_blocklist,
         signals_json,
     )
 except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
@@ -44,6 +45,7 @@ except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
         analyze_extension,
         fetch_mozilla_blocklist,
         fetch_store_metadata,
+        match_blocklist,
         signals_json,
     )
 
@@ -248,17 +250,63 @@ def _group_rows(rows):
     return list(groups.values())
 
 
-def _metadata_for(record: dict, cache_dir: str):
-    if record.get("is_builtin") or not record.get("extension_id"):
-        return {"store": record.get("store"), "status": "builtin"}
+class _StoreBreaker:
+    """Per-cycle, thread-safe set of stores that answered 429 / 503+Retry-After.
+
+    Once tripped, remaining items for that store are skipped (not fetched, not
+    stamped) so they are retried next cycle instead of hammering the store.
+    """
+
+    # Chromium-family stores share the Chrome update2 endpoint.
+    _ENDPOINT = {"brave": "chrome", "opera": "chrome", "vivaldi": "chrome", "chromium": "chrome"}
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tripped: set[str] = set()
+
+    def _key(self, store) -> str:
+        store = str(store or "unknown").lower()
+        return self._ENDPOINT.get(store, store)
+
+    def is_tripped(self, store) -> bool:
+        with self._lock:
+            return self._key(store) in self._tripped
+
+    def trip(self, store) -> bool:
+        """Return True only for the call that tripped it (log once)."""
+        key = self._key(store)
+        with self._lock:
+            if key in self._tripped:
+                return False
+            self._tripped.add(key)
+            return True
+
+    def tripped(self) -> list[str]:
+        with self._lock:
+            return sorted(self._tripped)
+
+
+def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = None):
     store = record.get("store") or "unknown"
+    if record.get("is_builtin"):
+        return {"store": store, "status": "builtin"}
+    if not record.get("extension_id"):
+        return {"store": store, "status": "unknown", "error": "missing extension id"}
     extension_id = record["extension_id"]
     version = record.get("last_version") or ""
     cache_key = f"v2:{store}:{extension_id}:{version}"
     cached = _cache_get(cache_dir, cache_key, METADATA_TTL_SEC)
     if cached is not None:
         return cached
+    if breaker is not None and breaker.is_tripped(store):
+        return {"store": store, "status": "unknown", "rate_limited": True,
+                "error": "store rate limited earlier this cycle; deferred"}
     meta = fetch_store_metadata(store, extension_id)
+    if meta.get("rate_limited"):
+        if breaker is not None and breaker.trip(store):
+            logger.warning("extension worker: %s store rate limited (%s); deferring "
+                           "its remaining items to next cycle", store, meta.get("error"))
+        return meta
     if not meta.get("error") or meta.get("status") == "public":
         _cache_set(cache_dir, cache_key, meta)
     return meta
@@ -315,7 +363,7 @@ def _write_result(driver, names, result: dict, extension_key: str) -> bool:
 
 
 def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
-                 stop_event: threading.Event):
+                 stop_event: threading.Event, breaker: _StoreBreaker | None = None):
     """Fetch store metadata + score one extension identity (no DB writes).
 
     Safe to run in a thread pool: each group owns its record dict, cache
@@ -333,11 +381,17 @@ def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
     if stop_event.is_set():
         return group, None, None
     try:
-        meta = _metadata_for(record, cache_dir)
+        meta = _metadata_for(record, cache_dir, breaker)
+        if meta.get("rate_limited"):
+            # No result => not written, intel_refreshed_ts not advanced => retried next cycle.
+            return group, None, None
         record["store_meta"] = meta
+        versions = record["versions"] or [record.get("last_version")]
         result = analyze_extension(
             record,
-            blocklist_entry=blocklist.get(record.get("extension_id") or ""),
+            blocklist_entry=match_blocklist(
+                blocklist, record.get("extension_id") or "", versions
+            ),
             fleet_host_count=total_hosts,
         )
         return group, result, None
@@ -368,12 +422,14 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
 
     scored = 0
     errors = 0
+    deferred = 0
+    breaker = _StoreBreaker()
     with ThreadPoolExecutor(max_workers=max(1, int(parallelism)),
                             thread_name_prefix="ext") as pool:
         futures = [
             pool.submit(_score_group, group, blocklist=blocklist,
                         total_hosts=total_hosts, cache_dir=cache_dir,
-                        stop_event=stop_event)
+                        stop_event=stop_event, breaker=breaker)
             for group in groups
         ]
         for fut in as_completed(futures):
@@ -388,6 +444,7 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
                 logger.warning("extension scoring failed key=%s: %s", group["key"], exc)
                 continue
             if result is None:
+                deferred += 1
                 continue
             try:
                 _write_result(driver, group["names"], result, group["key"])
@@ -406,6 +463,8 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
         "groups_seen": len(groups),
         "scored": scored,
         "errors": errors,
+        "deferred": deferred,
+        "rate_limited_stores": breaker.tripped(),
         "total_hosts": total_hosts,
         "blocklist_entries": len(blocklist),
         "tick_iso": datetime.now(timezone.utc).isoformat(),
