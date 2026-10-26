@@ -294,8 +294,8 @@ def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = 
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     extension_id = record["extension_id"]
     version = record.get("last_version") or ""
-    # v3: Chrome metadata gained `publisher` (detail page); v2 entries lack it.
-    cache_key = f"v3:{store}:{extension_id}:{version}"
+    # v4: Chrome metadata gained `publisher_id` (trust is by ID); older entries lack it.
+    cache_key = f"v4:{store}:{extension_id}:{version}"
     cached = _cache_get(cache_dir, cache_key, METADATA_TTL_SEC)
     if cached is not None:
         return cached

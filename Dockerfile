@@ -17,6 +17,9 @@ COPY main.py ./main.py
 
 # Config dir is mounted as a volume in docker-compose; pre-create + own it so
 # the non-root user can write whitelist.json / audit.log without chmod gymnastics.
+# Default known-publisher list for deployments that don't bind-mount config/
+# (compose mounts ./config over /app/config, so the repo copy is what is used).
+COPY config/known_publishers.json /app/config/known_publishers.json
 RUN mkdir -p /app/config /app/config/snapshots \
  && chown -R webviz:webviz /app
 
