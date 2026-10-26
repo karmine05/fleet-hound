@@ -210,8 +210,9 @@ def _pick_stale(driver, limit: int, cutoff_ts: float):
         OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
         WITH s, count(DISTINCT h) AS host_count,
              collect(DISTINCT r.version) AS versions,
-             collect(DISTINCT h.hostname) AS hosts
-        RETURN properties(s) AS props, host_count, versions, hosts
+             collect(DISTINCT h.hostname) AS hosts,
+             collect(DISTINCT r.installed_path) AS paths
+        RETURN properties(s) AS props, host_count, versions, hosts, paths
         ORDER BY host_count DESC
         LIMIT $limit
     """
@@ -238,6 +239,7 @@ def _group_rows(rows):
             "names": [],
             "hostnames": set(),
             "versions": set(),
+            "paths": set(),
             "props": props,
         })
         group["names"].append(props.get("name"))
@@ -247,6 +249,9 @@ def _group_rows(rows):
         for version in row.get("versions") or []:
             if version:
                 group["versions"].add(version)
+        for path in row.get("paths") or []:
+            if path:
+                group["paths"].add(path)
     return list(groups.values())
 
 
@@ -375,6 +380,8 @@ def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
     record = dict(props)
     record["host_count"] = len(group["hostnames"])
     record["versions"] = sorted(group["versions"])
+    # Per-host install paths: store trust needs evidence of a store install.
+    record["install_paths"] = sorted(group["paths"])
     # Nodes predating the ingestion change have no `store`; recover it from
     # the canonical key so the right adapter is still chosen.
     if not record.get("store") and str(group["key"]).startswith("ext:"):
