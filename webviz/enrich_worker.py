@@ -44,6 +44,7 @@ sys.path.insert(0, "/app")
 from categorize_software import (  # noqa: E402
     ENRICH_FAILURE_COOLDOWN_DAYS,
     EnrichResult,
+    purge_non_software_descriptions,
     SHADOW_IT_SOURCES,
     get_software_info,
 )
@@ -309,6 +310,16 @@ def _loop(driver_provider, status: _SharedStatus, *,
           stop_event: threading.Event,
           trigger_path: str):
     last_trigger_seen = _trigger_mtime(trigger_path)
+    # One-shot per leader start: drop enrichments written before the
+    # software-relevance gate (idempotent, cheap once clean).
+    try:
+        driver = driver_provider()
+        if driver is not None:
+            purged = purge_non_software_descriptions(driver)
+            if purged:
+                logger.info("enricher: cleared %d non-software Wikipedia descriptions", len(purged))
+    except Exception as exc:
+        logger.warning("enricher: description purge skipped: %s", exc)
     try:
         while not stop_event.is_set():
             tick_started = time.time()
