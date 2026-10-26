@@ -106,7 +106,6 @@ def main() -> int:
     )
     parser.add_argument('--fleet-url', help='Fleet server URL (default: from .env)')
     parser.add_argument('--email', help='Fleet user email (default: from .env)')
-    parser.add_argument('--password', help='Fleet user password (default: from .env)')
     parser.add_argument('--api-token', help='Fleet API token (preferred)')
     parser.add_argument('--memgraph-uri', help='Memgraph URI (default: from .env or bolt://localhost:7687)')
     parser.add_argument('--insecure', action='store_true', help='Disable TLS verification (dev only)')
@@ -120,7 +119,8 @@ def main() -> int:
 
     fleet_url = args.fleet_url or env_vars.get('FLEET_URL')
     email = args.email or env_vars.get('FLEET_EMAIL')
-    password = args.password or env_vars.get('FLEET_PASSWORD')
+    # No --password flag: a CLI password leaks via `ps` and shell history.
+    password = env_vars.get('FLEET_PASSWORD')
     api_token = args.api_token or env_vars.get('FLEET_API_TOKEN')
     memgraph_uri = args.memgraph_uri or env_vars.get('MEMGRAPH_URI', 'bolt://localhost:7687')
     insecure = args.insecure or str_to_bool(env_vars.get('INSECURE', 'false'))

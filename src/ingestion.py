@@ -648,25 +648,6 @@ class MemgraphIngestion:
             elapsed = time.time() - start_time
             logger.info("ingestion completed elapsed=%.2fs", elapsed)
 
-    def print_stats(self):
-        with self.driver.session() as session:
-            counts = {}
-            queries = {
-                "hosts": "MATCH (h:Host) RETURN count(h) AS c",
-                "users": "MATCH (u:User) RETURN count(u) AS c",
-                "software": "MATCH (s:Software) RETURN count(s) AS c",
-                "usesRels": "MATCH ()-[r:USES]->() RETURN count(r) AS c",
-                "installedRels": "MATCH ()-[r:INSTALLED_ON]->() RETURN count(r) AS c"
-            }
-            for label, cypher in queries.items():
-                rec = session.run(cypher).single()  # type: ignore[arg-type]
-                counts[label] = rec["c"] if rec else 0
-            logger.info(
-                "ingestion stats hosts=%d users=%d software=%d uses=%d installed_on=%d",
-                counts['hosts'], counts['users'], counts['software'],
-                counts['usesRels'], counts['installedRels'],
-            )
-
     def _execute_with_retry(self, session, query, params, operation_name="operation"):
         """Execute a query with retry logic for transient errors.
 
@@ -838,52 +819,6 @@ class MemgraphIngestion:
     _SOFTWARE_REL_PARALLELISM = max(1, int(os.environ.get("INGEST_SW_PARALLELISM", "4")))
     # Rows per Software node MERGE; mirrors SOFTWARE_REL_CHUNK_ROWS for the rel writes.
     _SOFTWARE_NODE_CHUNK = 5000
-
-    def _resolve_canonical_extension_names(
-        self, session, ext_keys, software_grouped_batch
-    ) -> dict:
-        """Pick one canonical `name` per extension_key.
-
-        The same Chrome/Edge ID can arrive under several names: a clean
-        display name from one host, a path-shaped name from another. The
-        Software MERGE key is `name`, so without this every variant becomes
-        its own node and the extension inventory fragments.
-
-        Candidates = existing node names + names arriving in this batch. A
-        path-shaped name never beats a clean one; ties break on length, then
-        lexicographic order, so the choice is deterministic across cycles.
-        Returns {extension_key: canonical_name} ({} on query failure — the
-        caller then falls back to current per-name behavior).
-        """
-        candidates: dict = {}
-        try:
-            for rec in session.run(
-                "MATCH (s:Software) WHERE s.extension_key IN $keys "
-                "RETURN s.extension_key AS k, s.name AS name",
-                keys=list(ext_keys),
-            ).data():
-                if rec.get("k") and rec.get("name"):
-                    candidates.setdefault(rec["k"], set()).add(rec["name"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("canonical extension-name resolve failed: %s", exc)
-            return {}
-        for entry in software_grouped_batch:
-            for sw in entry.get("software_list") or []:
-                k = sw.get("extension_key")
-                if k and sw.get("name"):
-                    candidates.setdefault(k, set()).add(sw["name"])
-        out = {}
-        for k, names in candidates.items():
-            names = {str(n) for n in names if n}
-            if not names:
-                continue
-            clean = [n for n in names if not _is_pathy_name(n)]
-            pool = clean if clean else names
-            # (len, name) tie-break: fully deterministic across cycles —
-            # same-length names must NOT resolve by set iteration order,
-            # or two cycles could pick different canonicals and re-fragment.
-            out[k] = sorted(pool, key=lambda n: (len(n), n))[0]
-        return out
 
     def _migrate_extension_names_to_keys(self, session) -> None:
         """Rename existing extension nodes so s.name == s.extension_key.

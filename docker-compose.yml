@@ -92,7 +92,7 @@ services:
       - WEBVIZ_REQUIRE_AUTH
       - WEBVIZ_ALLOW_ANONYMOUS_READ
       - WEBVIZ_DEBUG_ERRORS
-      # Wikidata enricher — autonomous Orient-phase categorizer.
+      # Wikipedia enricher — autonomous Orient-phase categorizer.
       - ENRICHER_ENABLED
       - ENRICHER_INTERVAL_SEC
       - ENRICHER_BATCH_SIZE

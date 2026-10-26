@@ -44,7 +44,7 @@ injection on those fields is defended at the parametrization layer.
 """
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Tuple
+from typing import Mapping, Tuple
 
 
 _ALLOWED_LABEL_OPS = frozenset({"AND", "OR"})

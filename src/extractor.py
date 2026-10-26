@@ -293,16 +293,6 @@ class FleetGraphExtractor:
                 valid.append(host)
         return valid, stop
 
-    def extract_software_per_host(self, host_id):
-        resp = self._get(f"/api/v1/fleet/hosts/{host_id}/software")
-        if resp and resp.status_code == 200:
-            try:
-                return resp.json().get('software', [])
-            except ValueError:
-                if self.debug:
-                    logger.warning("failed to parse software JSON host_id=%s", host_id)
-        return []
-
     def extract_labels(self, skip_all_builtins: bool = False):
         """Fetch all labels from Fleet's /api/v1/fleet/labels endpoint.
 
@@ -446,48 +436,3 @@ class FleetGraphExtractor:
                 logger.warning("extract_host_by_id host_id=%s unexpected_shape (no 'host' key)", host_id)
             return None
         return host
-
-    def extract_users_for_host(self, host_id):
-        """Attempt to retrieve per-host user list via detail endpoint.
-
-        Tries multiple parameter variants because Fleet may differ by version.
-        Returns list of username strings.
-        """
-        candidates = []
-        # Variants to try
-        variants = [
-            {"additional_info_filters": "users"},
-            {"include": "users"},
-            {}
-        ]
-        for params in variants:
-            resp = self._get(f"/api/v1/fleet/hosts/{host_id}", params=params)
-            if not resp or resp.status_code != 200:
-                continue
-            try:
-                data = resp.json()
-            except ValueError:
-                continue
-            # Possible locations
-            raw_users = data.get('users') or data.get('host_users') or data.get('logged_in_users')
-            if isinstance(raw_users, list):
-                for u in raw_users:
-                    if isinstance(u, dict):
-                        name = u.get('username') or u.get('user') or u.get('name') or u.get('login')
-                        if name:
-                            candidates.append(name)
-                    elif isinstance(u, str):
-                        candidates.append(u)
-            # Sometimes a count instead of list; ignore counts
-            if candidates:
-                break
-        # Deduplicate
-        out = []
-        seen = set()
-        for c in candidates:
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
-        if self.debug:
-            logger.debug("users for host_id=%s users=%s", host_id, out)
-        return out

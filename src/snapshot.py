@@ -242,12 +242,6 @@ def _iter_graph(driver):
     return _lines(), counts
 
 
-def _stream_graph(driver) -> Tuple[List[dict], dict]:
-    """Materialize the full graph. Prefer `_iter_graph` for large fleets."""
-    lines_iter, counts = _iter_graph(driver)
-    return list(lines_iter), counts
-
-
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))

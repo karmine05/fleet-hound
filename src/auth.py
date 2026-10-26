@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 import requests
 
@@ -60,17 +60,3 @@ class FleetAuthenticator:
                 logger.warning("token not found in response keys=%s", list(data.keys()))
             return token
         return None
-
-    def probe_login(self, email: str, password: str) -> Tuple[int, str]:
-        """Return (status_code, truncated_body) for diagnostics without parsing token."""
-        url = f"{self.fleet_url}/api/v1/fleet/login"
-        try:
-            r = self._session.post(
-                url,
-                json={"email": email, "password": password},
-                verify=self.verify,
-                timeout=self.timeout,
-            )
-            return r.status_code, r.text[:500]
-        except requests.exceptions.RequestException as e:
-            return 0, f"error: {e}"

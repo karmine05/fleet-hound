@@ -5,7 +5,7 @@
 [![Platform: Fleet](https://img.shields.io/badge/Platform-Fleet-blue?style=for-the-badge&logo=fleet)](https://fleetdm.com)
 [![Graph: Memgraph](https://img.shields.io/badge/Graph-Memgraph-brightgreen?style=for-the-badge&logo=neo4j)](https://memgraph.com)
 
-Fleet Hound pulls hosts, users, and installed-software inventory from a [Fleet](https://fleetdm.com) MDM/osquery server, builds an `(:User)-[:USES]->(:Host)<-[:INSTALLED_ON]-(:Software)` graph in [Memgraph](https://memgraph.com), enriches software nodes with [Wikidata](https://www.wikidata.org) categories, and serves a Flask dashboard for blast-radius queries, Shadow IT detection, extension risk, and per-snapshot graph diffs.
+Fleet Hound pulls hosts, users, and installed-software inventory from a [Fleet](https://fleetdm.com) MDM/osquery server, builds an `(:User)-[:USES]->(:Host)<-[:INSTALLED_ON]-(:Software)` graph in [Memgraph](https://memgraph.com), enriches software nodes with [Wikipedia](https://www.wikipedia.org) categories, and serves a Flask dashboard for blast-radius queries, Shadow IT detection, extension risk, and per-snapshot graph diffs.
 
 Everything ships as two containers. There is no host-side Python install, virtualenv, or dev server in the supported path.
 
@@ -23,7 +23,7 @@ Everything ships as two containers. There is no host-side Python install, virtua
 | **Blast Radius & Path Tracing** | Walks the graph from a compromised host, identity, or package to surface host reach, user impact, lateral movement, and platform spread. | `GET /api/blast-radius`, `GET /api/path` |
 | **Shadow IT Detection** | Flags software a user deliberately installed that is rare across the fleet, high-risk by category, or version-sprawled. | `GET /api/shadow-it`, `src/shadow_it_filter.py` |
 | **Extension Threat Intel** | Scores every browser extension (capability, trust, blocklist, rarity, install base) and plots prevalence × risk. | `src/extension_intel.py`, `webviz/extension_worker.py`, `GET /api/extensions` |
-| **Wikidata Enrichment** | Background worker attaches `category` + `description` to `Software` nodes; single-leader across gunicorn workers via `fcntl` flock. | `webviz/enrich_worker.py`, `categorize_software.py` |
+| **Wikipedia Enrichment** | Background worker attaches `category` + `description` to `Software` nodes; single-leader across gunicorn workers via `fcntl` flock. | `webviz/enrich_worker.py`, `categorize_software.py` |
 | **Graph Snapshots & Diff** | Streams the full graph to gzipped JSONL per ETL run; the UI diffs any two snapshots by node, edge, and property. | `src/snapshot.py`, `GET /api/snapshots`, `GET /api/diff` |
 | **Software Authorization** | Operators approve software, mutating Shadow IT scoring on the next read. Persisted atomically. | `POST /api/authorize-software` |
 | **Autonomous OODA loop** | Optional in-container supervisor driving Observe→Orient→Decide→Act cycles on a timer. | `webviz/ooda_worker.py` |
@@ -90,7 +90,7 @@ Snapshot timeline, delta ribbon, and a filterable diff. Ids are searchable; each
                             │ Bolt
                             ▼
                    ┌──────────────────┐    ┌──────────────────┐
-                   │   Memgraph       │◀───│ enrich_worker    │  (Wikidata SPARQL)
+                   │   Memgraph       │◀───│ enrich_worker    │  (Wikipedia REST API)
                    │   :7687          │    │ extension_worker │  (store metadata)
                    └────────┬─────────┘    └──────────────────┘
                             │ Bolt
@@ -159,7 +159,7 @@ docker compose exec -T webviz python main.py
 docker compose exec -T webviz python main.py --full-scan
 docker compose exec -T webviz python main.py --teams 1,2
 
-# Wikidata enrichment only
+# Wikipedia enrichment only
 docker compose exec -T webviz python categorize_software.py --limit 0
 
 # Wipe the graph + watermarks, then re-baseline
@@ -183,13 +183,13 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 |------|---------|
 | `--fleet-url URL` | Fleet base URL. Falls back to `FLEET_URL`. |
 | `--api-token TOKEN` | Fleet API token (recommended). Falls back to `FLEET_API_TOKEN`. |
-| `--email`, `--password` | Legacy email/password login against `POST /api/v1/fleet/login`. |
+| `--email` | Legacy email/password login against `POST /api/v1/fleet/login`; the password comes from `FLEET_PASSWORD` only (no CLI flag, so it never lands in `ps` or shell history). |
 | `--memgraph-uri URI` | Bolt URI. Default in-container `bolt://memgraph:7687`. |
 | `--insecure` | Skip TLS verification (self-signed Fleet certs only). |
 | `--debug-auth` | Print auth status code + a 300-char body snippet. |
 | `--teams 1,2,3` | Fleet team IDs to scan. **Required**: falls back to `OODA_TEAMS`, prompts on a TTY, otherwise exits listing the teams. ETL never scans all teams by default. |
 | `--full-scan` | Ignore the watermark and re-fetch every host. |
-| `--complete-enrichment` | Enrich every uncategorized `Software` node via Wikidata (slow). |
+| `--complete-enrichment` | Enrich every uncategorized `Software` node via Wikipedia (slow). |
 | `--enrich-software "Slack,Zoom"` | Force enrichment for specific names. |
 | `--dump-host-sample` | Write the first host object next to the state file and exit. |
 
@@ -209,7 +209,7 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 | `SNAPSHOT_DIR` | no | Default `config/snapshots`, i.e. `/app/config/snapshots` in the container. |
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | no | Snapshot retention: 30 days / 5000 files. |
 | `DEBUG` | no | Extractor + auth diagnostics. |
-| `ENRICHER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` | no | Wikidata worker tuning. |
+| `ENRICHER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` | no | Wikipedia worker tuning. |
 | `EXTENSION_WORKER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` / `_PARALLELISM` | no | Extension intel worker tuning. |
 | `OODA_ENABLED` / `_INTERVAL_SEC` / `_FULL_SCAN_EVERY` / `_TEAMS` | no | Autonomous supervisor (below). |
 | `SHADOW_IT_OUTLIER_PCT` | no | Outlier threshold as a fraction of a platform's hosts. Default `0.03`. |
@@ -237,7 +237,7 @@ All routes are under `/api/`. Send the token as `Authorization: Bearer <token>` 
 | `GET /api/snapshots?limit=N` | Snapshot list, newest first (default 100, max 500). |
 | `GET /api/diff?from=<ts>&to=<ts>` | Per-property, node, and edge diff between two snapshots. |
 | `GET /api/ooda/status`, `/findings`, `/cycles`, `POST /trigger` | OODA supervisor introspection. |
-| `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikidata enricher introspection. |
+| `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikipedia enricher introspection. |
 
 ---
 
@@ -251,7 +251,7 @@ Premise: **ubiquitous software is sanctioned; rare software is suspect.** Three 
 
 **Detectors:**
 1. **Outlier (rarity)** — flag software installed on ≤ `max(2, platform_hosts × SHADOW_IT_OUTLIER_PCT)` hosts of its platform, so 1-of-10 Linux ≠ 1-of-100 Windows. `host_count == 1` → high risk, else medium.
-2. **High-risk category** — curated brand list (remote access, personal file sync, personal messaging, crypto miners, Tor/VPN). Word-boundary match on enriched Wikidata category first, then name. Always high risk.
+2. **High-risk category** — curated brand list (remote access, personal file sync, personal messaging, crypto miners, Tor/VPN). Word-boundary match on enriched Wikipedia category first, then name. Always high risk.
 3. **Version sprawl** — more than two distinct versions of one title across the fleet.
 
 `config/whitelist.json` of approved names suppresses matches on the next read.
@@ -275,14 +275,14 @@ OODA_FULL_SCAN_EVERY=24       # refresh per-team watermarks every ~12h
 ```text
 fleet-hound/
 ├── main.py                  # CLI ETL entrypoint (thin shim over src/etl.py)
-├── categorize_software.py   # Wikidata enrichment
+├── categorize_software.py   # Wikipedia enrichment
 ├── clear_db.py              # wipe Memgraph + runtime state
 ├── start.sh / stop.sh       # docker compose wrappers
 ├── Dockerfile               # production image (non-root, read-only rootfs)
 ├── docker-compose.yml       # memgraph + webviz services
 ├── src/                     # ETL: etl, extractor, ingestion, snapshot, auth
-├── webviz/                  # Flask app, workers, static single-file UI
-│   └── static/              # index.html + vendored D3 + local fonts
+├── webviz/                  # Flask app, workers, static UI
+│   └── static/              # index.html, app.js, app.css, boot.js, vendored D3, fonts
 ├── config/                  # bind mount: state, snapshots, whitelist, logs
 └── assets/                  # README screenshots
 
@@ -290,7 +290,7 @@ Local-only (git-ignored): `tests/` unit suite and `webviz/static/ping.html`
 debug page — they never ship to GitHub.
 ```
 
-The UI is one self-contained `webviz/static/index.html` with vendored D3 7.9.0 and local fonts: no CDN, no external requests at runtime, works behind an air-gapped proxy.
+The UI is plain static files (`index.html` markup, `app.js`, `app.css`, `boot.js`) with vendored D3 7.9.0 and local fonts: no CDN, no build step, no external requests at runtime, works behind an air-gapped proxy. No inline script or `on*=` handlers, so the server sends a strict `Content-Security-Policy` (`script-src 'self'`); keep it that way when editing the UI.
 
 ---
 
