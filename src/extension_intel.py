@@ -332,7 +332,8 @@ _KNOWN_PUBLISHERS_CANDIDATES = (
                  "config", "known_publishers.json"),
 )
 _CWS_PUBLISHER_ID_RE = re.compile(r"u[0-9a-f]{32}")
-_known_publishers_cache: dict = {"key": None, "names": frozenset(), "chrome_ids": frozenset()}
+_known_publishers_cache: dict = {"key": None, "names": frozenset(), "chrome_ids": frozenset(),
+                                 "amo_ids": frozenset()}
 _known_publishers_lock = threading.Lock()
 
 
@@ -343,8 +344,8 @@ def _known_publishers_path() -> str | None:
     return next((p for p in _KNOWN_PUBLISHERS_CANDIDATES if os.path.exists(p)), None)
 
 
-def _parse_known_publishers(doc) -> tuple[frozenset, frozenset]:
-    names, chrome_ids = set(), set()
+def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset]:
+    names, chrome_ids, amo_ids = set(), set(), set()
     entries = doc.get("publishers") if isinstance(doc, dict) else None
     if not isinstance(entries, list):
         raise ValueError("expected an object with a 'publishers' list")
@@ -357,6 +358,10 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset]:
             bad = [i for i in ids if not (isinstance(i, str) and _CWS_PUBLISHER_ID_RE.fullmatch(i))]
             if bad:
                 raise ValueError(f"invalid chrome_publisher_ids {bad}")
+            authors = entry.get("amo_author_ids") or []
+            bad = [i for i in authors if not (isinstance(i, int) and not isinstance(i, bool) and i > 0)]
+            if bad:
+                raise ValueError(f"invalid amo_author_ids {bad}")
         except (ValueError, TypeError) as exc:
             logger.warning("known_publishers: skipping entry %d (%s): %s",
                            idx, (entry or {}).get("name") if isinstance(entry, dict) else entry, exc)
@@ -367,11 +372,12 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset]:
             if _normalise_publisher(n):
                 names.add(_normalise_publisher(n))
         chrome_ids.update(ids)
-    return frozenset(names), frozenset(chrome_ids)
+        amo_ids.update(authors)
+    return frozenset(names), frozenset(chrome_ids), frozenset(amo_ids)
 
 
-def known_publishers() -> tuple[frozenset, frozenset]:
-    """(normalized names, Chrome Web Store publisher IDs), reloaded when the file changes.
+def known_publishers() -> tuple[frozenset, frozenset, frozenset]:
+    """(normalized names, Chrome publisher IDs, AMO author IDs), reloaded when the file changes.
 
     A missing or unreadable file trusts nobody (logged), never a built-in default.
     """
@@ -381,41 +387,49 @@ def known_publishers() -> tuple[frozenset, frozenset]:
     except OSError:
         key = None
     with _known_publishers_lock:
-        if key is not None and key == _known_publishers_cache["key"]:
-            return _known_publishers_cache["names"], _known_publishers_cache["chrome_ids"]
-        names, chrome_ids = frozenset(), frozenset()
+        c = _known_publishers_cache
+        if key is not None and key == c["key"]:
+            return c["names"], c["chrome_ids"], c["amo_ids"]
+        names, chrome_ids, amo_ids = frozenset(), frozenset(), frozenset()
         if key is None:
             logger.warning("known_publishers: file not found (%s); no publisher is trusted",
                            path or "config/known_publishers.json")
         else:
             try:
                 with open(path, encoding="utf-8") as fh:
-                    names, chrome_ids = _parse_known_publishers(json.load(fh))
-                logger.info("known_publishers: loaded %d names, %d Chrome publisher IDs from %s",
-                            len(names), len(chrome_ids), path)
+                    names, chrome_ids, amo_ids = _parse_known_publishers(json.load(fh))
+                logger.info("known_publishers: loaded %d names, %d Chrome publisher IDs, "
+                            "%d AMO author IDs from %s",
+                            len(names), len(chrome_ids), len(amo_ids), path)
             except (OSError, ValueError) as exc:
                 logger.warning("known_publishers: cannot load %s (%s); no publisher is trusted",
                                path, exc)
-        _known_publishers_cache.update(key=key, names=names, chrome_ids=chrome_ids)
-        return names, chrome_ids
+        c.update(key=key, names=names, chrome_ids=chrome_ids, amo_ids=amo_ids)
+        return names, chrome_ids, amo_ids
 
 
 def publisher_is_reputable(*values) -> bool:
     """True when a store-sourced developer/publisher NAME is a known publisher.
 
-    For non-Chrome stores only; Chrome-family trust is by publisher ID
-    (chrome_publisher_is_reputable). Callers pass store fields only: Fleet's
+    Edge/Safari only; Chrome-family and Firefox trust is by store ID
+    (chrome_publisher_is_reputable / amo_author_is_reputable). Callers pass store fields only: Fleet's
     host-reported `vendor` is attacker-influenced. Normalized equality, not a
     word search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
     """
-    names, _ = known_publishers()
+    names, _, _ = known_publishers()
     return any(_normalise_publisher(v) in names for v in values if v)
 
 
 def chrome_publisher_is_reputable(publisher_id) -> bool:
     """Chrome Web Store trust is by immutable publisher ID, never display name."""
-    _, chrome_ids = known_publishers()
+    _, chrome_ids, _ = known_publishers()
     return bool(publisher_id) and publisher_id in chrome_ids
+
+
+def amo_author_is_reputable(author_ids) -> bool:
+    """Firefox trust is by immutable AMO author user ID, never display name."""
+    _, _, amo_ids = known_publishers()
+    return any(isinstance(i, int) and i in amo_ids for i in author_ids or [])
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +783,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     )
     if meta.get("store") == "chrome":
         reputable = chrome_publisher_is_reputable(meta.get("publisher_id"))
+    elif meta.get("store") == "firefox":
+        reputable = amo_author_is_reputable(meta.get("author_ids"))
     else:
         reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
@@ -1252,6 +1268,9 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
     current = data.get("current_version") if isinstance(data.get("current_version"), dict) else {}
     file_info = current.get("file") if isinstance(current.get("file"), dict) else {}
     authors = data.get("authors") if isinstance(data.get("authors"), list) else []
+    # Numeric AMO user IDs are immutable; author display names are not.
+    meta["author_ids"] = [a["id"] for a in authors
+                          if isinstance(a, dict) and isinstance(a.get("id"), int) and a["id"] > 0]
     developer = ""
     if authors and isinstance(authors[0], dict):
         developer = _first(authors[0], "name", "username") or ""
@@ -1478,7 +1497,9 @@ def _self_check() -> None:
         {"name": "Google", "match_names": ["Google", "Google Ireland"], "added_at": "2026-10-26T00:00:00Z",
          "chrome_publisher_ids": ["udcdd80226b381e8c9845d3e7861f0e71"]},
         {"name": "Meta", "match_names": ["Meta"], "added_at": "2026-10-26T00:00:00Z"},
-        {"name": "Mozilla", "match_names": ["Mozilla"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "Mozilla", "match_names": ["Mozilla"], "added_at": "2026-10-26T00:00:00Z",
+         "amo_author_ids": [101]},
+        {"name": "Bad Amo", "added_at": "2026-10-26T00:00:00Z", "amo_author_ids": ["101"]},  # skipped
         {"name": "AdGuard", "match_names": ["AdGuard"], "added_at": "2026-10-26T00:00:00Z"},
         {"name": "1Password", "match_names": ["1Password", "AgileBits"], "added_at": "2026-10-26T00:00:00Z",
          "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"]},
@@ -1523,11 +1544,19 @@ def _self_check() -> None:
     tiny_known = analyze_extension({
         "store": "firefox", "extension_id": "{ce9f4b1f-24b8-4e9a-9051-b9e472b1b2f2}",
         "name": "clear browsing data", "host_count": 1,
-        "store_meta": {"status": "public", "users": 41_759,
-                       "developer": "Mozilla"},
+        "store_meta": {"store": "firefox", "status": "public", "users": 41_759,
+                       "developer": "Mozilla", "author_ids": [101]},
     })
     assert tiny_known["risk_band"] in ("low", "medium"), tiny_known
     assert any(s["code"] == "reputable-publisher" for s in tiny_known["risk_signals"])
+    # Firefox trust is by AMO author ID: the right name with another ID is not trusted.
+    amo_spoof = analyze_extension({
+        "store": "firefox", "extension_id": "spoof@example.com", "name": "x", "host_count": 1,
+        "store_meta": {"store": "firefox", "status": "public", "developer": "Mozilla",
+                       "author_ids": [999]},
+    })
+    assert amo_spoof["publisher_reputable"] is False, "AMO name match without ID must not be trusted"
+    assert not publisher_is_reputable("Bad Amo"), "string author IDs are rejected"
 
     typo = analyze_extension({
         "store": "chrome", "extension_id": "a" * 32,

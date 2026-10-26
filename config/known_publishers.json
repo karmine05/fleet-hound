@@ -1,12 +1,14 @@
 {
   "_about": [
     "Known-good extension publishers. A match adds trust to an extension's risk score.",
-    "Chrome/Brave/Vivaldi/Opera/Chromium: trusted ONLY by chrome_publisher_ids (the immutable",
-    "Chrome Web Store publisher ID, 'u' + 32 hex, from the publisher link on the listing page).",
-    "Display names are never trusted for Chrome-family stores: anyone can register a lookalike name.",
-    "Firefox/Edge/Safari: only names listed in match_names are trusted (normalized: case, punctuation,",
-    "legal suffixes like Inc/LLC/Ltd/GmbH ignored). `name` alone is a label, never trusted. Leave",
-    "match_names empty for publishers verified only by Chrome ID; avoid short/generic aliases.",
+    "Chrome/Brave/Vivaldi/Opera/Chromium: trusted ONLY by chrome_publisher_ids (immutable Chrome Web",
+    "Store publisher ID, 'u' + 32 hex, from the publisher link on the listing page).",
+    "Firefox: trusted ONLY by amo_author_ids (immutable addons.mozilla.org user IDs, integers, from",
+    "https://addons.mozilla.org/api/v5/addons/addon/<guid>/ -> authors[].id).",
+    "Display names are never trusted on those stores: anyone can register a lookalike.",
+    "Edge/Safari: only names listed in match_names are trusted (normalized: case, punctuation, legal",
+    "suffixes like Inc/LLC/Ltd/GmbH ignored). `name` alone is a label, never trusted. Leave",
+    "match_names empty for publishers verified only by store ID; avoid short/generic aliases.",
     "Every entry needs name and added_at (ISO 8601 UTC). Invalid entries are skipped with a warning.",
     "Edits apply on the next extension scoring cycle; no rebuild or restart needed."
   ],
@@ -178,9 +180,12 @@
         "AgileBits"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; AMO author ID verified on dogfood 2026-10-26",
       "chrome_publisher_ids": [
         "udb847e9815e2e1626d9ddb346d722811"
+      ],
+      "amo_author_ids": [
+        19257918
       ]
     },
     {
@@ -189,9 +194,12 @@
         "Bitwarden"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; AMO author ID verified on dogfood 2026-10-26",
       "chrome_publisher_ids": [
         "u941d7546c76ba2f4a7f919aefabeede7"
+      ],
+      "amo_author_ids": [
+        12533945
       ]
     },
     {
@@ -200,7 +208,10 @@
         "LastPass"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py"
+      "note": "migrated from the hard-coded list in src/extension_intel.py; AMO author ID verified on dogfood 2026-10-26",
+      "amo_author_ids": [
+        2338345
+      ]
     },
     {
       "name": "Dashlane",
@@ -224,9 +235,12 @@
         "Grammarly"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; AMO author ID verified on dogfood 2026-10-26",
       "chrome_publisher_ids": [
         "u7431803589585a11dd7aea578e1005d0"
+      ],
+      "amo_author_ids": [
+        6640141
       ]
     },
     {
@@ -421,7 +435,10 @@
         "ub94b4d262bab132b7b011f95e88c8240"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Okta Browser Plugin; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Okta Browser Plugin; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable); AMO author ID verified on dogfood 2026-10-26",
+      "amo_author_ids": [
+        11835954
+      ]
     },
     {
       "name": "OpenAI",
