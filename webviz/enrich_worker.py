@@ -32,7 +32,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +42,7 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 # Use absolute import — Dockerfile copies prod/categorize_software.py to /app/.
 sys.path.insert(0, "/app")
 from categorize_software import (  # noqa: E402
+    ENRICH_FAILURE_COOLDOWN_DAYS,
     EnrichResult,
     SHADOW_IT_SOURCES,
     get_software_info,
@@ -126,6 +127,9 @@ def _pick_uncategorized(driver, batch_size: int):
                 MATCH (s:Software)
                 WHERE s.category IS NULL
                   AND any(x IN s.sources WHERE x IN $eligible)
+                  AND coalesce(s.kind, '') <> 'browser_extension'
+                  AND (s.last_categorization_attempt_iso IS NULL
+                       OR s.last_categorization_attempt_iso < $cutoff_iso)
                 OPTIONAL MATCH (s)-[:INSTALLED_ON]->(h:Host)
                 WITH s.name AS name, COUNT(DISTINCT h) AS host_count
                 RETURN name
@@ -134,6 +138,10 @@ def _pick_uncategorized(driver, batch_size: int):
                 """,
                 limit=int(batch_size),
                 eligible=list(SHADOW_IT_SOURCES),
+                # Misses are stamped with an attempt time; without this cooldown
+                # the same rarest-N misses are re-picked forever.
+                cutoff_iso=(datetime.now(timezone.utc)
+                            - timedelta(days=ENRICH_FAILURE_COOLDOWN_DAYS)).isoformat(),
             )
             return [r["name"] for r in result if r.get("name")]
     except (TransientError, ServiceUnavailable, SessionExpired) as exc:
@@ -142,6 +150,21 @@ def _pick_uncategorized(driver, batch_size: int):
     except Exception as exc:
         logger.error("enricher: pick_uncategorized failed: %s", exc)
         return []
+
+
+def _mark_miss(driver, name: str) -> None:
+    try:
+        with driver.session() as session:
+            session.run(
+                """
+                MATCH (s:Software {name: $name})
+                SET s.last_categorization_attempt_iso = $now_iso,
+                    s.categorization_attempts = coalesce(s.categorization_attempts, 0) + 1
+                """,
+                name=name, now_iso=datetime.now(timezone.utc).isoformat(),
+            ).consume()
+    except Exception as exc:
+        logger.warning("enricher: mark_miss failed for %s: %s", name, exc)
 
 
 def _write_categories(driver, name: str, categories, description) -> bool:
@@ -259,7 +282,9 @@ def _fetch_batch(names, *, parallelism: int, stop_event: threading.Event):
             categories, desc = payload
             if categories or desc:
                 return (name, categories, desc)
-        return None
+        if status_code in (EnrichResult.MISS, EnrichResult.HIT):  # HIT with no data counts as a miss
+            return (name, None, None)
+        return None  # transient: retry next tick without a cooldown
 
     hits = []
     with ThreadPoolExecutor(max_workers=max(1, int(parallelism)),
@@ -301,6 +326,9 @@ def _loop(driver_provider, status: _SharedStatus, *,
                             items, parallelism=parallelism, stop_event=stop_event):
                         if stop_event.is_set():
                             break
+                        if categories is None and desc is None:
+                            _mark_miss(driver, name)
+                            continue
                         if _write_categories(driver, name, categories, desc):
                             enriched += 1
                     if enriched:

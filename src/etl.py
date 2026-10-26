@@ -393,6 +393,13 @@ def run_etl(cfg: ETLConfig) -> ETLResult:
         result.duration_sec = datetime.now(timezone.utc).timestamp() - t0
         return result
 
+    if not cfg.team_ids:
+        # Never default to "every team": the operator must pick the scope.
+        result.error = "No Fleet teams selected; pass --teams or set OODA_TEAMS"
+        result.finished_iso = _now_iso()
+        result.duration_sec = datetime.now(timezone.utc).timestamp() - t0
+        return result
+
     token = _resolve_token(cfg)
     if not token:
         result.error = "Fleet authentication failed"
@@ -423,7 +430,9 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
     """Body of run_etl, executed under the file lock."""
 
     state = load_state(cfg.state_path)
-    since_map = state.get("team_syncs", {}) if isinstance(state, dict) else {}
+    # A full scan must ignore per-team watermarks too: the host reap below
+    # treats every host it didn't see as gone.
+    since_map = {} if cfg.full_scan else (state.get("team_syncs", {}) if isinstance(state, dict) else {})
     global_since = None if cfg.full_scan else state.get("last_run_timestamp")
     current_ts = _now_compact()
 
@@ -433,7 +442,7 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         )
 
         logger.info("etl: extracting hosts (full_scan=%s, since=%s, teams=%s)",
-                    cfg.full_scan, global_since, cfg.team_ids or "ALL")
+                    cfg.full_scan, global_since, cfg.team_ids)
         # Streaming path: extract_host_pages yields one page (~500 hosts) at
         # a time so peak Python heap stays bounded by page size, not fleet
         # size. We wrap the generator in a side-effecting iterator that
@@ -490,6 +499,10 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     if lid is None:
                         continue
                     members = extractor.extract_label_host_membership(lid)
+                    if members is None:
+                        # Fetch failed: leave the label out of member_map so
+                        # sync keeps its existing edges instead of wiping them.
+                        continue
                     member_map[lid] = [
                         m.get("id") for m in members if m.get("id") is not None
                     ]
@@ -616,6 +629,7 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     stats = ingestion.reap_stale_hosts(
                         now_iso=_now_iso(),
                         reap_age_seconds=cfg.host_reap_age_seconds,
+                        team_ids=cfg.team_ids,
                     )
                     result.host_reap_stats = stats
                     logger.info(
@@ -691,25 +705,10 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                 result.failed_host_count,
             )
         else:
-            if cfg.team_ids:
-                state.setdefault("team_syncs", {})
-                for tid in cfg.team_ids:
-                    state["team_syncs"][str(tid)] = current_ts
-                result.teams_synced = list(cfg.team_ids)
-            else:
-                state["last_run_timestamp"] = current_ts
-                try:
-                    all_teams = extractor.extract_teams()
-                    state.setdefault("team_syncs", {})
-                    synced = []
-                    for t in all_teams:
-                        tid = t.get("id")
-                        if tid is not None:
-                            state["team_syncs"][str(tid)] = current_ts
-                            synced.append(int(tid))
-                    result.teams_synced = synced
-                except Exception as exc:
-                    logger.warning("etl: failed to refresh per-team watermarks: %s", exc)
+            state.setdefault("team_syncs", {})
+            for tid in cfg.team_ids:
+                state["team_syncs"][str(tid)] = current_ts
+            result.teams_synced = list(cfg.team_ids)
             save_state(cfg.state_path, state)
 
     except Exception as exc:

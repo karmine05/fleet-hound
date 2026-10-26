@@ -291,7 +291,10 @@ def get_extensions():
             band_rows = [dict(record) for record in session.run(band_query, **params)]
             host_row = session.run(host_query, **params).single()
     except (ServiceUnavailable, TransientError) as exc:
-        _reset_driver()
+        # Only a dead connection warrants a new driver; resetting on a
+        # TransientError would yank the pool from the background workers.
+        if isinstance(exc, ServiceUnavailable):
+            _reset_driver()
         logger.error("extensions list unavailable: %s", exc)
         return jsonify({"error": "Database temporarily unavailable"}), 503
     except Exception as exc:

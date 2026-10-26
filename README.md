@@ -187,7 +187,7 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 | `--memgraph-uri URI` | Bolt URI. Default in-container `bolt://memgraph:7687`. |
 | `--insecure` | Skip TLS verification (self-signed Fleet certs only). |
 | `--debug-auth` | Print auth status code + a 300-char body snippet. |
-| `--teams 1,2,3` | Restrict extraction to Fleet team IDs. |
+| `--teams 1,2,3` | Fleet team IDs to scan. **Required**: falls back to `OODA_TEAMS`, prompts on a TTY, otherwise exits listing the teams. ETL never scans all teams by default. |
 | `--full-scan` | Ignore the watermark and re-fetch every host. |
 | `--complete-enrichment` | Enrich every uncategorized `Software` node via Wikidata (slow). |
 | `--enrich-software "Slack,Zoom"` | Force enrichment for specific names. |

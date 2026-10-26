@@ -110,6 +110,46 @@ for i in $(seq 1 30); do
     sleep 2
 done
 
+# --- Fleet team scope ------------------------------------------------------
+# ETL never scans every team by default. If OODA_TEAMS is unset, list the
+# teams from Fleet, ask once, and persist the choice to .env.
+OODA_TEAMS_VAL="$(read_env OODA_TEAMS || true)"
+if [[ -z "${OODA_TEAMS_VAL}" ]]; then
+    if [[ -t 0 ]]; then
+        info "No Fleet teams selected (OODA_TEAMS). Fetching team list..."
+        "${DOCKER_COMPOSE[@]}" exec -T webviz python -c '
+import os, main
+teams = main._list_teams(os.environ["FLEET_URL"], os.environ.get("FLEET_API_TOKEN", ""),
+                         os.environ.get("INSECURE", "").lower() in ("1", "true", "yes", "on"), False)
+main._print_teams(teams)
+' || warn "Could not list teams (check FLEET_URL / FLEET_API_TOKEN)."
+        while [[ -z "${OODA_TEAMS_VAL}" ]]; do
+            read -r -p "Team IDs to scan (comma-separated): " picked
+            picked="${picked// /}"
+            if [[ "$picked" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+                OODA_TEAMS_VAL="$picked"
+            else
+                warn "Enter one or more integer team IDs, e.g. 1,2"
+            fi
+        done
+        if grep -qE '^[[:space:]]*OODA_TEAMS=' .env; then
+            sed -i.bak -E "s/^[[:space:]]*OODA_TEAMS=.*/OODA_TEAMS=${OODA_TEAMS_VAL}/" .env && rm -f .env.bak
+        else
+            printf '\nOODA_TEAMS=%s\n' "${OODA_TEAMS_VAL}" >> .env
+        fi
+        ok "Saved OODA_TEAMS=${OODA_TEAMS_VAL} to .env; restarting webviz to pick it up"
+        "${DOCKER_COMPOSE[@]}" up -d webviz
+        for i in $(seq 1 30); do
+            [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/health" 2>/dev/null || echo 000)" == 200 ]] && break
+            sleep 2
+        done
+    else
+        warn "OODA_TEAMS is empty. ETL and OODA will refuse to run until you set Fleet team IDs in .env."
+    fi
+else
+    ok "Fleet team scope: OODA_TEAMS=${OODA_TEAMS_VAL}"
+fi
+
 # --- OODA supervisor status -----------------------------------------------
 # /api/ooda/status is auth-gated when WEBVIZ_API_TOKEN is set. Skip the check
 # if the operator hasn't configured a token (status is reachable from inside

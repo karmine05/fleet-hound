@@ -119,7 +119,8 @@ Read from the container environment (supplied by `.env` through Compose):
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | `30` / `5000` | Pruned after each ETL run. |
 | `ENRICHER_ENABLED`, `ENRICHER_INTERVAL_SEC`, `ENRICHER_BATCH_SIZE` | `true` / worker defaults | Wikidata categorization. |
 | `EXTENSION_WORKER_ENABLED`, `_INTERVAL_SEC`, `_BATCH_SIZE`, `_PARALLELISM` | `true` / worker defaults | Extension intel. |
-| `OODA_ENABLED`, `OODA_INTERVAL_SEC`, `OODA_FULL_SCAN_EVERY`, `OODA_TEAMS` | `false` | Autonomous ETL. |
+| `OODA_ENABLED`, `OODA_INTERVAL_SEC`, `OODA_FULL_SCAN_EVERY` | `false` | Autonomous ETL. |
+| `OODA_TEAMS` | *(required)* | Fleet team IDs to scan, comma-separated. ETL and OODA refuse to run without it; `./start.sh` prompts once and saves it. |
 | `SHADOW_IT_OUTLIER_PCT` | `0.03` | Rarity threshold per platform. |
 | `SHADOW_IT_INCLUDE_LINUX_PACKAGES` | `false` | Opt in to `deb`/`rpm` detections. |
 

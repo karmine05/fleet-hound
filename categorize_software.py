@@ -375,6 +375,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                         MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {platform: $platform})
                         WHERE s.category IS NULL
                           AND any(src IN coalesce(s.sources, []) WHERE src IN $shadow_it_sources)
+                          AND coalesce(s.kind, '') <> 'browser_extension'
                           AND (s.last_categorization_attempt_iso IS NULL
                                OR s.last_categorization_attempt_iso < $cutoff_iso)
                         WITH s.name AS name,
