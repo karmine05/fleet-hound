@@ -166,6 +166,15 @@
     --type-software: #9aa3b8;
     --signal: #5eead4;
 
+    /* Cluster hulls, one per Fleet team. Hues avoid the node type
+       colours (host blue, user teal, software grey). */
+    --team-1: #c4a1ff;
+    --team-2: #f59ac8;
+    --team-3: #f5b36b;
+    --team-4: #a9d977;
+    --team-5: #6fc6f2;
+    --team-6: #e8d36d;
+
     /* Hero type size */
     --text-hero: clamp(2rem, 3.4vw, 3.25rem);
 }
@@ -193,6 +202,12 @@
     --type-user: #0f7f74;
     --type-software: #5b6478;
     --signal: #0f8a7d;
+    --team-1: #7a45d6;
+    --team-2: #be3d7c;
+    --team-3: #9c5210;
+    --team-4: #3f7215;
+    --team-5: #1a76ad;
+    --team-6: #75620c;
 
     /* Risk colours are used as text as well as fills (delta cells,
        metric deltas, legacy .text-* helpers). The dark values sit
