@@ -21,7 +21,9 @@ import io
 import json
 import logging
 import math
+import os
 import re
+import threading
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -207,17 +209,6 @@ _BRANDS = (
     "pocket", "darkreader", "ghostery", "privacybadger", "tampermonkey",
 )
 
-_KNOWN_PUBLISHERS = (
-    "google", "microsoft", "mozilla", "apple", "adobe", "amazon", "meta",
-    "cloudflare", "cisco", "norton", "mcafee", "avast", "avg", "eset",
-    "bitdefender", "kaspersky", "malwarebytes", "sophos", "trend micro",
-    "1password", "bitwarden", "lastpass", "dashlane", "keeper", "grammarly",
-    "paypal", "stripe", "shopify", "atlassian", "slack", "zoom", "dropbox",
-    "box", "evernote", "notion", "spotify", "netflix", "adguard", "brave",
-    "opera", "vivaldi", "duckduckgo", "proton", "tampermonkey", "ghostery",
-    # Legal names the stores show for brands above (Chrome Web Store, 2026-10).
-    "agilebits", "duck duck go", "google ireland",
-)
 
 # Cyrillic/Greek characters that render like Latin letters. Used only to raise
 # a signal, never to block.
@@ -333,17 +324,96 @@ def _normalise_publisher(value) -> str:
     return " ".join(words)
 
 
-_NORMALISED_PUBLISHERS = frozenset(_normalise_publisher(p) for p in _KNOWN_PUBLISHERS)
+# Known-good publishers live in a data file (config/known_publishers.json) so
+# operators can add or change entries without a code change or rebuild.
+_KNOWN_PUBLISHERS_CANDIDATES = (
+    "/app/config/known_publishers.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "config", "known_publishers.json"),
+)
+_CWS_PUBLISHER_ID_RE = re.compile(r"u[0-9a-f]{32}")
+_known_publishers_cache: dict = {"key": None, "names": frozenset(), "chrome_ids": frozenset()}
+_known_publishers_lock = threading.Lock()
+
+
+def _known_publishers_path() -> str | None:
+    env = os.environ.get("KNOWN_PUBLISHERS_FILE", "").strip()
+    if env:
+        return env
+    return next((p for p in _KNOWN_PUBLISHERS_CANDIDATES if os.path.exists(p)), None)
+
+
+def _parse_known_publishers(doc) -> tuple[frozenset, frozenset]:
+    names, chrome_ids = set(), set()
+    entries = doc.get("publishers") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("expected an object with a 'publishers' list")
+    for idx, entry in enumerate(entries):
+        try:
+            if not isinstance(entry, dict) or not _clean_str(entry.get("name")):
+                raise ValueError("missing name")
+            datetime.fromisoformat(_clean_str(entry.get("added_at")).replace("Z", "+00:00"))
+            ids = entry.get("chrome_publisher_ids") or []
+            bad = [i for i in ids if not (isinstance(i, str) and _CWS_PUBLISHER_ID_RE.fullmatch(i))]
+            if bad:
+                raise ValueError(f"invalid chrome_publisher_ids {bad}")
+        except (ValueError, TypeError) as exc:
+            logger.warning("known_publishers: skipping entry %d (%s): %s",
+                           idx, (entry or {}).get("name") if isinstance(entry, dict) else entry, exc)
+            continue
+        for n in [entry["name"], *(entry.get("match_names") or [])]:
+            if _normalise_publisher(n):
+                names.add(_normalise_publisher(n))
+        chrome_ids.update(ids)
+    return frozenset(names), frozenset(chrome_ids)
+
+
+def known_publishers() -> tuple[frozenset, frozenset]:
+    """(normalized names, Chrome Web Store publisher IDs), reloaded when the file changes.
+
+    A missing or unreadable file trusts nobody (logged), never a built-in default.
+    """
+    path = _known_publishers_path()
+    try:
+        key = (path, os.path.getmtime(path)) if path else None
+    except OSError:
+        key = None
+    with _known_publishers_lock:
+        if key is not None and key == _known_publishers_cache["key"]:
+            return _known_publishers_cache["names"], _known_publishers_cache["chrome_ids"]
+        names, chrome_ids = frozenset(), frozenset()
+        if key is None:
+            logger.warning("known_publishers: file not found (%s); no publisher is trusted",
+                           path or "config/known_publishers.json")
+        else:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    names, chrome_ids = _parse_known_publishers(json.load(fh))
+                logger.info("known_publishers: loaded %d names, %d Chrome publisher IDs from %s",
+                            len(names), len(chrome_ids), path)
+            except (OSError, ValueError) as exc:
+                logger.warning("known_publishers: cannot load %s (%s); no publisher is trusted",
+                               path, exc)
+        _known_publishers_cache.update(key=key, names=names, chrome_ids=chrome_ids)
+        return names, chrome_ids
 
 
 def publisher_is_reputable(*values) -> bool:
-    """True when a store-sourced developer/publisher field IS a known publisher.
+    """True when a store-sourced developer/publisher NAME is a known publisher.
 
-    Callers pass store fields only: Fleet's host-reported `vendor` and the
-    display name are attacker-influenced. Normalized equality, not a word
-    search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
+    For non-Chrome stores only; Chrome-family trust is by publisher ID
+    (chrome_publisher_is_reputable). Callers pass store fields only: Fleet's
+    host-reported `vendor` is attacker-influenced. Normalized equality, not a
+    word search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
     """
-    return any(_normalise_publisher(v) in _NORMALISED_PUBLISHERS for v in values if v)
+    names, _ = known_publishers()
+    return any(_normalise_publisher(v) in names for v in values if v)
+
+
+def chrome_publisher_is_reputable(publisher_id) -> bool:
+    """Chrome Web Store trust is by immutable publisher ID, never display name."""
+    _, chrome_ids = known_publishers()
+    return bool(publisher_id) and publisher_id in chrome_ids
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +765,10 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     publisher = _clean_str(
         meta.get("developer") or meta.get("publisher") or record.get("vendor")
     )
-    reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
+    if meta.get("store") == "chrome":
+        reputable = chrome_publisher_is_reputable(meta.get("publisher_id"))
+    else:
+        reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
     threat, threat_signals = _threat_score(meta, record, blocklist_entry)
     signals.extend(threat_signals)
@@ -999,22 +1072,32 @@ def _parse_crx(data: bytes) -> dict:
 #   <a ... data-publisher-id="u<32 hex>" ...>AgileBits Inc</a>
 # Bounded quantifiers keep this linear on the ~1 MB untrusted page.
 _CWS_PUBLISHER_RE = re.compile(
-    rb'data-publisher-id="u[0-9a-f]{32}"[^>]{0,400}>([^<]{1,150})</a>'
+    rb'data-publisher-id="(u[0-9a-f]{32})"[^>]{0,400}>([^<]{1,150})</a>'
 )
+_CHROME_EXTENSION_ID_RE = re.compile(r"[a-p]{32}")
 
 
-def _chrome_publisher(page: bytes) -> str | None:
-    match = _CWS_PUBLISHER_RE.search(page)
-    if not match:
+def _chrome_publisher(page: bytes) -> tuple[str, str] | None:
+    """(publisher_id, display name), or None unless exactly one publisher ID appears.
+
+    A listing has one publisher link; more than one distinct ID means the
+    markup changed or the page embeds another publisher, so trust nothing.
+    """
+    matches = _CWS_PUBLISHER_RE.findall(page)
+    if len({pid for pid, _ in matches}) != 1:
         return None
-    name = html.unescape(match.group(1).decode("utf-8", "replace")).strip()
-    return name or None
+    pid, raw = matches[0]
+    name = html.unescape(raw.decode("utf-8", "replace")).strip()
+    return pid.decode("ascii"), name or pid.decode("ascii")
 
 
 def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None) -> dict:
     client = client or HttpClient()
+    # Host-reported ID: only a real Chrome ID may reach a store URL path.
+    if not _CHROME_EXTENSION_ID_RE.fullmatch(extension_id or ""):
+        return {"store": "chrome", "status": "unknown", "error": "invalid chrome extension id"}
     meta = {"store": "chrome", "status": "unknown", "url": (
-        f"https://chromewebstore.google.com/detail/{extension_id}"
+        "https://chromewebstore.google.com/detail/" + urllib.parse.quote(extension_id, safe="")
     )}
     query = urllib.parse.quote(f"id={extension_id}&uc", safe="")
     url = (
@@ -1063,7 +1146,7 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
         if dstatus == 200 and dbody:
             publisher = _chrome_publisher(dbody)
             if publisher:
-                meta["publisher"] = publisher
+                meta["publisher_id"], meta["publisher"] = publisher
         codebase = updatecheck.get("codebase") or ""
         expected_hash = (updatecheck.get("hash_sha256") or "").lower()
         if not codebase:
@@ -1387,6 +1470,26 @@ def signals_json(signals) -> str:
 # ---------------------------------------------------------------------------
 
 def _self_check() -> None:
+    import tempfile
+    # Self-check uses its own publisher fixture, independent of the operator list.
+    fixture = {"publishers": [
+        {"name": "Google", "match_names": ["Google Ireland"], "added_at": "2026-10-26T00:00:00Z",
+         "chrome_publisher_ids": ["udcdd80226b381e8c9845d3e7861f0e71"]},
+        {"name": "Meta", "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "Mozilla", "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "AdGuard", "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "1Password", "match_names": ["AgileBits"], "added_at": "2026-10-26T00:00:00Z",
+         "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"]},
+        {"name": "DuckDuckGo", "match_names": ["Duck Duck Go"], "added_at": "2026-10-26T00:00:00Z"},
+        {"name": "No Timestamp"},                                                   # skipped
+        {"name": "Bad Id", "added_at": "2026-10-26T00:00:00Z", "chrome_publisher_ids": ["x"]},  # skipped
+    ]}
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(fixture, tmp)
+    tmp.close()
+    os.environ["KNOWN_PUBLISHERS_FILE"] = tmp.name
+    assert not publisher_is_reputable("No Timestamp") and not publisher_is_reputable("Bad Id")
+
     builtin = analyze_extension({
         "store": "chrome", "extension_id": "ghbmnnjooekpmoecnnnilnnbdlolhkhi",
         "name": "google docs offline", "host_count": 32,
@@ -1510,9 +1613,31 @@ def _self_check() -> None:
     assert publisher_is_reputable("Google Ireland, Ltd.") and not publisher_is_reputable("eyeo GmbH")
     page = (b'<a class="x" href="./publisher/agilebits-inc/u1" data-publisher-id='
             b'"udb847e9815e2e1626d9ddb346d722811" jslog="1">AgileBits &amp; Co</a>')
-    assert _chrome_publisher(page) == "AgileBits & Co"
+    assert _chrome_publisher(page) == ("udb847e9815e2e1626d9ddb346d722811", "AgileBits & Co")
+    two = page + page.replace(b"udb847e9815e2e1626d9ddb346d722811", b"u" + b"0" * 32)
+    assert _chrome_publisher(two) is None, "two distinct publisher IDs -> trust nothing"
+    # Chrome trust is by ID: a lookalike name with another ID is not reputable.
+    assert chrome_publisher_is_reputable("udb847e9815e2e1626d9ddb346d722811")
+    assert not chrome_publisher_is_reputable("u" + "0" * 32) and not chrome_publisher_is_reputable(None)
+    chrome_meta = {"store": "chrome", "status": "public", "publisher": "AgileBits Inc",
+                   "publisher_id": "u" + "1" * 32}
+    spoof = analyze_extension({"store": "chrome", "extension_id": "a" * 32, "name": "x",
+                               "host_count": 1, "store_meta": chrome_meta})
+    assert spoof["publisher_reputable"] is False, "Chrome name match without ID must not be trusted"
+    # Host-reported IDs never reach a store URL unless they are real Chrome IDs.
+    class _NoNet:
+        def get(self, *a, **k):
+            raise AssertionError("network call for invalid id")
+    assert fetch_chrome_metadata("../publisher/x", client=_NoNet())["error"] == "invalid chrome extension id"
+    # Edits to the file are picked up without a restart (mtime change).
+    fixture["publishers"].append({"name": "Late Addition", "added_at": "2026-10-27T00:00:00Z"})
+    with open(tmp.name, "w") as fh:
+        json.dump(fixture, fh)
+    os.utime(tmp.name, (os.path.getmtime(tmp.name) + 5,) * 2)
+    assert publisher_is_reputable("Late Addition Inc")
     assert _chrome_publisher(b"<html>no publisher link</html>") is None
     assert not publisher_is_reputable("Totally Not 1Password Devs")
+    os.unlink(tmp.name)
     print("extension_intel self-check: OK")
 
 

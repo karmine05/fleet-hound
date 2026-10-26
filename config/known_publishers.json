@@ -1,0 +1,475 @@
+{
+  "_about": [
+    "Known-good extension publishers. A match adds trust to an extension's risk score.",
+    "Chrome/Brave/Vivaldi/Opera/Chromium: trusted ONLY by chrome_publisher_ids (the immutable",
+    "Chrome Web Store publisher ID, 'u' + 32 hex, from the publisher link on the listing page).",
+    "Display names are never trusted for Chrome-family stores: anyone can register a lookalike name.",
+    "Firefox/Edge/Safari: match_names are compared after normalization (case, punctuation, and",
+    "legal suffixes like Inc/LLC/Ltd/GmbH are ignored).",
+    "Every entry needs name and added_at (ISO 8601 UTC). Invalid entries are skipped with a warning.",
+    "Edits apply on the next extension scoring cycle; no rebuild or restart needed."
+  ],
+  "schema_version": 1,
+  "publishers": [
+    {
+      "name": "Google",
+      "match_names": [
+        "Google",
+        "Google Ireland"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "udcdd80226b381e8c9845d3e7861f0e71"
+      ]
+    },
+    {
+      "name": "Microsoft",
+      "match_names": [
+        "Microsoft"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Mozilla",
+      "match_names": [
+        "Mozilla"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Apple",
+      "match_names": [
+        "Apple"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Adobe",
+      "match_names": [
+        "Adobe"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u4aa1399b20671957d839ff11569693bf"
+      ]
+    },
+    {
+      "name": "Amazon",
+      "match_names": [
+        "Amazon"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Meta",
+      "match_names": [
+        "Meta"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Cloudflare",
+      "match_names": [
+        "Cloudflare"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Cisco",
+      "match_names": [
+        "Cisco"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Norton",
+      "match_names": [
+        "Norton"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "McAfee",
+      "match_names": [
+        "McAfee"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Avast",
+      "match_names": [
+        "Avast"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "AVG",
+      "match_names": [
+        "AVG"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "ESET",
+      "match_names": [
+        "ESET"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Bitdefender",
+      "match_names": [
+        "Bitdefender"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Kaspersky",
+      "match_names": [
+        "Kaspersky"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Malwarebytes",
+      "match_names": [
+        "Malwarebytes"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Sophos",
+      "match_names": [
+        "Sophos"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Trend Micro",
+      "match_names": [
+        "Trend Micro"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "1Password",
+      "match_names": [
+        "1Password",
+        "AgileBits"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "udb847e9815e2e1626d9ddb346d722811"
+      ]
+    },
+    {
+      "name": "Bitwarden",
+      "match_names": [
+        "Bitwarden"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u941d7546c76ba2f4a7f919aefabeede7"
+      ]
+    },
+    {
+      "name": "LastPass",
+      "match_names": [
+        "LastPass"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Dashlane",
+      "match_names": [
+        "Dashlane"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Keeper",
+      "match_names": [
+        "Keeper"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Grammarly",
+      "match_names": [
+        "Grammarly"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u7431803589585a11dd7aea578e1005d0"
+      ]
+    },
+    {
+      "name": "PayPal",
+      "match_names": [
+        "PayPal"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Stripe",
+      "match_names": [
+        "Stripe"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Shopify",
+      "match_names": [
+        "Shopify"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Atlassian",
+      "match_names": [
+        "Atlassian"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Slack",
+      "match_names": [
+        "Slack"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Zoom",
+      "match_names": [
+        "Zoom"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Dropbox",
+      "match_names": [
+        "Dropbox"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Box",
+      "match_names": [
+        "Box"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Evernote",
+      "match_names": [
+        "Evernote"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u79afc20d105ffcb7b693035cf1143799"
+      ]
+    },
+    {
+      "name": "Notion",
+      "match_names": [
+        "Notion"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u2fd0ab1b7a73832e5e23f8a81f789e83"
+      ]
+    },
+    {
+      "name": "Spotify",
+      "match_names": [
+        "Spotify"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Netflix",
+      "match_names": [
+        "Netflix"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "AdGuard",
+      "match_names": [
+        "AdGuard"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "u63f06aecfdc45d32c13ccc24f56c3d2d"
+      ]
+    },
+    {
+      "name": "Brave",
+      "match_names": [
+        "Brave"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Opera",
+      "match_names": [
+        "Opera"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Vivaldi",
+      "match_names": [
+        "Vivaldi"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "DuckDuckGo",
+      "match_names": [
+        "DuckDuckGo",
+        "Duck Duck Go"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "ud64d7483bf96eb500551d565ee99b0f4"
+      ]
+    },
+    {
+      "name": "Proton",
+      "match_names": [
+        "Proton"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "chrome_publisher_ids": [
+        "uad75ed7845e15764d0596794a10ae86b"
+      ]
+    },
+    {
+      "name": "Tampermonkey",
+      "match_names": [
+        "Tampermonkey"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "Ghostery",
+      "match_names": [
+        "Ghostery"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "migrated from the hard-coded list in src/extension_intel.py"
+    },
+    {
+      "name": "eyeo",
+      "match_names": [
+        "eyeo"
+      ],
+      "chrome_publisher_ids": [
+        "uea3afeea2b49701b04ae2130ec920743"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Adblock Plus"
+    },
+    {
+      "name": "Okta",
+      "match_names": [
+        "Okta"
+      ],
+      "chrome_publisher_ids": [
+        "ub94b4d262bab132b7b011f95e88c8240"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Okta Browser Plugin"
+    },
+    {
+      "name": "OpenAI",
+      "match_names": [
+        "OpenAI"
+      ],
+      "chrome_publisher_ids": [
+        "u33f3849923dbb9495ad540f8634ab579"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via ChatGPT search"
+    },
+    {
+      "name": "Postman",
+      "match_names": [
+        "Postman"
+      ],
+      "chrome_publisher_ids": [
+        "uf3026ce02867f99debf9df0a4a91eb76"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Postman Interceptor"
+    },
+    {
+      "name": "Electronic Frontier Foundation",
+      "match_names": [
+        "Electronic Frontier Foundation",
+        "EFF"
+      ],
+      "chrome_publisher_ids": [
+        "uee155fce3653042847650b96a629f468"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Privacy Badger"
+    },
+    {
+      "name": "Kagi",
+      "match_names": [
+        "Kagi"
+      ],
+      "chrome_publisher_ids": [
+        "ua725dd00b4f4687b9914bb71bb96a4d0"
+      ],
+      "added_at": "2026-10-26T16:00:00Z",
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Kagi Search"
+    }
+  ]
+}

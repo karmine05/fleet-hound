@@ -70,6 +70,8 @@ graphify-out/*
 config.local.py
 secrets.py
 config/*
+# Known-good publisher list ships with the repo; operators edit it in place.
+!config/known_publishers.json
 
 # Test suite + debug pages stay local; they never ship to GitHub.
 tests/

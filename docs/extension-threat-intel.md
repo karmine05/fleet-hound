@@ -381,7 +381,7 @@ TTLs:
 | Unlisted | +5 |
 | Removed / not found | 0 |
 | Sideloaded | 0 |
-| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH. Chrome-family publisher comes from the Chrome Web Store detail page (`data-publisher-id` link); only trader-declared developers have one, so non-trader extensions stay unverified. Legal-name aliases (AgileBits, Duck Duck Go, Google Ireland) map to listed brands | +15 |
+| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH. The list is data, not code: `config/known_publishers.json` (one entry per publisher with `added_at`; reloaded on change, no rebuild). Chrome-family trust is by Chrome Web Store publisher ID only (`chrome_publisher_ids`, from the listing's `data-publisher-id` link; a page with more than one distinct ID trusts nothing); names are display-only there because anyone can register a lookalike. Only trader-declared developers have a publisher link, so non-trader extensions stay unverified | +15 |
 | MV3 | +10 |
 | Updated < 12 months | +15 |
 | Updated 12-24 months | +5 |
