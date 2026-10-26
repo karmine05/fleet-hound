@@ -236,11 +236,16 @@ def get_full_graph_data():
 
             # User-Host relationships — target keyed on fleet_host_id to match
             # the node ids emitted above.
+            # Both link queries are bounded to the loaded hosts: links are only
+            # kept when both ends are loaded, and an unbounded scan returned
+            # every edge in the graph to be filtered here.
+            host_fids = [n['fleet_host_id'] for n in nodes if n['type'] == 'host' and n.get('fleet_host_id') is not None]
             rel_result = session.run("""
                 MATCH (u:User)-[r:USES]->(h:Host)
+                WHERE h.fleet_host_id IN $host_fids
                 RETURN 'uses' AS type, u.username AS from_name,
                        h.fleet_host_id AS to_host_id
-            """)
+            """, host_fids=host_fids)
             for record in rel_result:
                 source_id = f"user_{record['from_name']}"
                 target_id = f"host_{record['to_host_id']}"
@@ -262,10 +267,10 @@ def get_full_graph_data():
                 # This is much more memory efficient than loading all relationships
                 software_rel_result = session.run("""
                     MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
-                    WHERE s.name IN $software_names
+                    WHERE s.name IN $software_names AND h.fleet_host_id IN $host_fids
                     RETURN 'installed' AS type, s.name AS from_name,
                            h.fleet_host_id AS to_host_id
-                """, software_names=software_names)
+                """, software_names=software_names, host_fids=host_fids)
 
                 added_software_links = 0
                 for record in software_rel_result:
@@ -491,14 +496,25 @@ def get_host_software(hostname):
         # Case-insensitive host lookup. LIMIT 1 because, in the rare event
         # two enrolled Fleet hosts share a lowercased hostname, we pick the
         # one with the most recent activity to populate the side panel.
-        host_result = session.run(
-            "MATCH (h:Host) "
-            "WHERE toLower(h.hostname) = toLower($hostname) "
-            "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
-            "       h.os_version AS os_version, h.platform AS platform "
-            "ORDER BY h.last_seen DESC LIMIT 1",
-            hostname=hostname
-        )
+        # Prefer the exact fleet_host_id when the caller has it: hostnames
+        # collide, and the indexed id lookup avoids a toLower() full scan.
+        fid_raw = request.args.get("fleet_host_id", "").strip()
+        if fid_raw.isdigit():
+            host_result = session.run(
+                "MATCH (h:Host {fleet_host_id: $fid}) "
+                "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
+                "       h.os_version AS os_version, h.platform AS platform",
+                fid=int(fid_raw),
+            )
+        else:
+            host_result = session.run(
+                "MATCH (h:Host) "
+                "WHERE toLower(h.hostname) = toLower($hostname) "
+                "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
+                "       h.os_version AS os_version, h.platform AS platform "
+                "ORDER BY h.last_seen DESC LIMIT 1",
+                hostname=hostname
+            )
         host_data = host_result.single()
         if not host_data:
             return jsonify({"error": "Host not found"}), 404

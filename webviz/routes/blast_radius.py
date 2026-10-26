@@ -127,6 +127,7 @@ def get_blast_radius():
             hosts = (_h_rec['hosts'] if _h_rec else []) or []
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
+            original_host_fids = [h['fleet_host_id'] for h in hosts]
             details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
             metrics['platform_diversity'] = len(details['platforms'])
             
@@ -141,18 +142,19 @@ def get_blast_radius():
 
             # Potential impacted users (people who use the same machines)
             if hosts:
-                host_names = [h['hostname'] for h in hosts]
+                # Join on fleet_host_id: hostnames collide (e.g. several Macs named mac.lan).
+                host_fids = [h['fleet_host_id'] for h in hosts]
                 # Note: We don't filter impacted users by team, we see ALL users on the affected hosts
                 # because if a host is compromised, all users on it are at risk regardless of their team.
                 # However, the HOSTS themselves were filtered by the team earlier.
                 
                 user_query = f"""
                     MATCH (u:User)-[:USES]->(h:Host)
-                    WHERE h.hostname IN $hostnames {user_exclusion_clause}
+                    WHERE h.fleet_host_id IN $host_fids {user_exclusion_clause}
                     RETURN collect(DISTINCT u.username) as users
                 """
                 # Update params with hostnames for this query
-                query_params = {**params, "hostnames": host_names}
+                query_params = {**params, "host_fids": host_fids}
                 
                 user_res = session.run(user_query, **query_params)
                 user_rec = user_res.single()
@@ -194,6 +196,7 @@ def get_blast_radius():
             
             metrics['host_reach'] = len(hosts)
             details['hosts'] = [h['hostname'] for h in hosts]
+            original_host_fids = [h['fleet_host_id'] for h in hosts]
             details['platforms'] = list(set([h['platform'] for h in hosts if h.get('platform')]))
             metrics['platform_diversity'] = len(details['platforms'])
             
@@ -206,14 +209,15 @@ def get_blast_radius():
             
             # Impacted users
             if hosts:
-                host_names = [h['hostname'] for h in hosts]
+                # Join on fleet_host_id: hostnames collide (e.g. several Macs named mac.lan).
+                host_fids = [h['fleet_host_id'] for h in hosts]
                 
                 user_query = f"""
                     MATCH (u:User)-[:USES]->(h:Host)
-                    WHERE h.hostname IN $hostnames {user_exclusion_clause}
+                    WHERE h.fleet_host_id IN $host_fids {user_exclusion_clause}
                     RETURN collect(DISTINCT u.username) as users
                 """
-                query_params = {**params, "hostnames": host_names}
+                query_params = {**params, "host_fids": host_fids}
                 
                 user_res = session.run(user_query, **query_params)
                 user_rec = user_res.single()
@@ -231,14 +235,12 @@ def get_blast_radius():
         if details['users'] and len(details['users']) > 0:
             # We have impacted users. Find where they can go.
             # Avoid re-scanning original hosts.
-            original_host_names = details['hosts']
-            
             lateral_res = session.run("""
                 MATCH (u:User)-[:USES]->(h:Host)
-                WHERE u.username IN $users 
-                  AND NOT h.hostname IN $original_hosts
-                RETURN collect(DISTINCT h.hostname) as lateral_hosts
-            """, users=details['users'], original_hosts=original_host_names)
+                WHERE u.username IN $users
+                  AND NOT h.fleet_host_id IN $original_fids
+                RETURN collect(DISTINCT h.fleet_host_id) as lateral_hosts
+            """, users=details['users'], original_fids=original_host_fids)
             
             _lat_rec = lateral_res.single()
             lateral_hosts = (_lat_rec['lateral_hosts'] if _lat_rec else []) or []

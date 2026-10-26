@@ -197,6 +197,10 @@ def main() -> int:
         snapshot_dir=SNAPSHOT_DIR,
         enrich_limit=None if args.complete_enrichment else 250,
         enrich_target_names=target_names,
+        # The in-container enricher worker already categorizes in the background
+        # (OODA skips inline enrichment for the same reason); inline it only on request.
+        skip_enrichment=(str_to_bool(env_vars.get('ENRICHER_ENABLED', 'false'))
+                         and not (args.complete_enrichment or target_names)),
     )
 
     logger.info("extracting from Fleet url=%s", fleet_url)

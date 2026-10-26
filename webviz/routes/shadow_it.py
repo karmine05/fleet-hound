@@ -7,10 +7,14 @@ names are imported at module top; safe because app.py registers every
 blueprint at the very bottom, after all of them are bound.
 """
 
-from flask import Blueprint, jsonify, request
+import os
+import threading
+import time
+
+from flask import Blueprint, current_app, jsonify, make_response, request
 from webviz.host_filters import FilterValidationError, apply_label_filter
 from src.shadow_it_filter import MIN_OUTLIER_HOSTS as _MIN_OUTLIER_HOSTS, classify_extension_type as _classify_extension_type, compute_per_platform_thresholds as _compute_per_platform_thresholds, get_outlier_pct as _get_outlier_pct, is_system_package as _is_system_package
-from webviz.app import _normalize_whitelist, _whitelist_clause, _word_match, driver, load_whitelist, logger
+from webviz.app import WHITELIST_FILE, _normalize_whitelist, _whitelist_clause, _word_match, driver, load_whitelist, logger
 
 bp = Blueprint("shadow_it", __name__)
 
@@ -36,8 +40,37 @@ def _shadow_it_users_by_software(session, software_names):
     )
     return {r["name"]: sorted(r["users"] or []) for r in rows}
 
+# Short per-worker response cache. Keyed on the query args plus the whitelist
+# mtime, so approving software is visible on the next read in every worker;
+# graph changes from an ETL cycle show up within the TTL.
+SHADOW_CACHE_TTL_SEC = 30
+_SHADOW_CACHE_MAX = 64
+_shadow_cache: dict = {}
+_shadow_cache_lock = threading.Lock()
+
+
 @bp.route("/api/shadow-it")
 def get_shadow_it():
+    try:
+        wl_mtime = os.path.getmtime(WHITELIST_FILE)
+    except OSError:
+        wl_mtime = 0.0
+    key = (tuple(sorted(request.args.items(multi=True))), wl_mtime)
+    now = time.monotonic()
+    with _shadow_cache_lock:
+        hit = _shadow_cache.get(key)
+    if hit and now - hit[0] < SHADOW_CACHE_TTL_SEC:
+        return current_app.response_class(hit[1], mimetype="application/json")
+    resp = make_response(_get_shadow_it_uncached())
+    if resp.status_code == 200:
+        with _shadow_cache_lock:
+            if len(_shadow_cache) >= _SHADOW_CACHE_MAX:
+                _shadow_cache.clear()
+            _shadow_cache[key] = (now, resp.get_data())
+    return resp
+
+
+def _get_shadow_it_uncached():
     """Detect Shadow IT - unauthorized or risky software installations.
     
     Query parameters:
@@ -335,18 +368,15 @@ def get_shadow_it():
                      s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
-                     COUNT(DISTINCT h) AS host_count,
-                     COLLECT(DISTINCT h.hostname) AS hosts,
-                     COLLECT(DISTINCT h.platform) AS platforms
-                RETURN software_name, display_name, version, host_count, hosts, platforms,
+                     COUNT(DISTINCT h) AS host_count
+                RETURN software_name, display_name, version, host_count,
                        db_category, db_desc, db_sources
             """
-            
+            # Two passes: classify every software from this light aggregate, then
+            # collect hosts/platforms/users only for the matches. Collecting
+            # hostnames for the whole catalog was a near-full graph scan.
             high_risk_rows = list(session.run(all_software_query, **filter_params))
-            # Batched user lookup (replaces the per-candidate N+1 query).
-            high_risk_users_by_name = _shadow_it_users_by_software(
-                session, [r['software_name'] for r in high_risk_rows]
-            )
+            high_risk_matches = []
             for record in high_risk_rows:
                 software_lower = record['software_name'].lower()
                 display_lower = (record.get('display_name') or record['software_name']).lower()
@@ -387,61 +417,83 @@ def get_shadow_it():
                             break
 
                 if matched_category:
-                    users = high_risk_users_by_name.get(record['software_name'], [])
-                    
-                    # All high-risk category detections are high risk
-                    risk_level = "high"
-                    
-                    # Apply host count filter
-                    if host_count_filter != 'all':
-                        if host_count_filter == '1' and record['host_count'] != 1 or host_count_filter == '2' and record['host_count'] != 2 or host_count_filter == '3+' and record['host_count'] < 3:
-                            continue
-                    
-                    # Apply user count filter
-                    user_count = len(users)
-                    if user_count_filter != 'all':
-                        if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
-                            continue
-                    
-                    # Detect software type (source-authoritative).
-                    software_type = detect_software_type(
-                        record['software_name'], db_sources
-                    )
+                    high_risk_matches.append((dict(record), matched_category))
 
-                    # Apply software type filter
-                    if software_type_filter != 'all' and software_type != software_type_filter:
+            matched_names = [r['software_name'] for r, _ in high_risk_matches]
+            host_detail = {}
+            if matched_names:
+                detail_query = f"""
+                    MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
+                    WHERE s.name IN $matched_names {team_clause} {platform_clause} {whitelist_clause} {label_clause}
+                    RETURN s.name AS software_name,
+                           COLLECT(DISTINCT h.hostname) AS hosts,
+                           COLLECT(DISTINCT h.platform) AS platforms
+                """
+                host_detail = {
+                    r['software_name']: r
+                    for r in session.run(detail_query, matched_names=matched_names, **filter_params)
+                }
+            high_risk_users_by_name = _shadow_it_users_by_software(session, matched_names)
+            for record, matched_category in high_risk_matches:
+                detail = host_detail.get(record['software_name'])
+                record['hosts'] = detail['hosts'] if detail else []
+                record['platforms'] = detail['platforms'] if detail else []
+                db_sources = record.get('db_sources') or []
+                users = high_risk_users_by_name.get(record['software_name'], [])
+                
+                # All high-risk category detections are high risk
+                risk_level = "high"
+                
+                # Apply host count filter
+                if host_count_filter != 'all':
+                    if host_count_filter == '1' and record['host_count'] != 1 or host_count_filter == '2' and record['host_count'] != 2 or host_count_filter == '3+' and record['host_count'] < 3:
                         continue
+                
+                # Apply user count filter
+                user_count = len(users)
+                if user_count_filter != 'all':
+                    if user_count_filter == '1' and user_count != 1 or user_count_filter == '2' and user_count != 2 or user_count_filter == '3+' and user_count < 3:
+                        continue
+                
+                # Detect software type (source-authoritative).
+                software_type = detect_software_type(
+                    record['software_name'], db_sources
+                )
 
-                    if risk_filter == 'all' or risk_filter == risk_level:
-                        # Category-specific recommendations. Keys must match
-                        # HIGH_RISK_PATTERNS exactly.
-                        recommendations = {
-                            'Remote Access Tools': "Verify authorization. Remote access tools can be used for data exfiltration. Replace with approved enterprise solution.",
-                            'File Sharing': "Verify authorization. File sharing apps may lead to data leakage. Use approved enterprise file sharing.",
-                            'Communication Apps': "Verify authorization. Unofficial communication apps may bypass DLP policies. Use approved enterprise messaging.",
-                            'Cryptocurrency Mining': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
-                            'Tor/Privacy Tools': "CRITICAL: Investigate immediately. Privacy/anonymity tools may indicate malicious activity or policy violation.",
-                        }
-                        
-                        detections.append({
-                            "id": f"highrisk_{detection_id_counter}",
-                            "software_name": record['software_name'],
-                            "display_name": record.get('display_name') or record['software_name'],
-                            "software_type": software_type,
-                            "risk_level": risk_level,
-                            "category": matched_category,
-                            "detection_type": "high_risk",
-                            "host_count": record['host_count'],
-                            "affected_hosts": record['hosts'],
-                            "affected_users": users,
-                            "platforms": record['platforms'],
-                            "version": record['version'] or "Unknown",
-                            "recommendation": recommendations.get(matched_category, "Review and verify authorization"),
-                            "details": f"High-risk category: {matched_category}",
-                            "risk_reason": f"Risk is HIGH because '{record['software_name']}' matches the '{matched_category}' category, which is flagged for security review."
-                        })
-                        detection_id_counter += 1
-        
+                # Apply software type filter
+                if software_type_filter != 'all' and software_type != software_type_filter:
+                    continue
+
+                if risk_filter == 'all' or risk_filter == risk_level:
+                    # Category-specific recommendations. Keys must match
+                    # HIGH_RISK_PATTERNS exactly.
+                    recommendations = {
+                        'Remote Access Tools': "Verify authorization. Remote access tools can be used for data exfiltration. Replace with approved enterprise solution.",
+                        'File Sharing': "Verify authorization. File sharing apps may lead to data leakage. Use approved enterprise file sharing.",
+                        'Communication Apps': "Verify authorization. Unofficial communication apps may bypass DLP policies. Use approved enterprise messaging.",
+                        'Cryptocurrency Mining': "CRITICAL: Remove immediately. Cryptocurrency miners consume resources and may indicate compromise.",
+                        'Tor/Privacy Tools': "CRITICAL: Investigate immediately. Privacy/anonymity tools may indicate malicious activity or policy violation.",
+                    }
+                    
+                    detections.append({
+                        "id": f"highrisk_{detection_id_counter}",
+                        "software_name": record['software_name'],
+                        "display_name": record.get('display_name') or record['software_name'],
+                        "software_type": software_type,
+                        "risk_level": risk_level,
+                        "category": matched_category,
+                        "detection_type": "high_risk",
+                        "host_count": record['host_count'],
+                        "affected_hosts": record['hosts'],
+                        "affected_users": users,
+                        "platforms": record['platforms'],
+                        "version": record['version'] or "Unknown",
+                        "recommendation": recommendations.get(matched_category, "Review and verify authorization"),
+                        "details": f"High-risk category: {matched_category}",
+                        "risk_reason": f"Risk is HIGH because '{record['software_name']}' matches the '{matched_category}' category, which is flagged for security review."
+                    })
+                    detection_id_counter += 1
+    
         # ===== DETECTION 3: Version Sprawl (multiple versions of same software) =====
         #
         # Count distinct versions across the INSTALLED_ON EDGES (r.version = the

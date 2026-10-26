@@ -1,4 +1,5 @@
 import atexit
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -287,10 +288,13 @@ def _word_match(pattern: str, text_lower: str) -> bool:
     like 'tor browser' are supported."""
     if not pattern or not text_lower:
         return False
-    return re.search(
-        r"(?<![a-z0-9])" + re.escape(pattern) + r"(?![a-z0-9])",
-        text_lower,
-    ) is not None
+    return _word_re(pattern).search(text_lower) is not None
+
+
+@functools.lru_cache(maxsize=2048)
+def _word_re(pattern: str) -> "re.Pattern":
+    # Shadow IT calls _word_match ~10^5 times per request; compile once.
+    return re.compile(r"(?<![a-z0-9])" + re.escape(pattern) + r"(?![a-z0-9])")
 
 
 def load_whitelist():

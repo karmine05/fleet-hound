@@ -7,10 +7,13 @@ names are imported at module top; safe because app.py registers every
 blueprint at the very bottom, after all of them are bound.
 """
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, redirect, request, url_for
 from webviz.host_filters import FilterValidationError, apply_label_filter
 from webviz.hostname_utils import hostname_counts as _hostname_counts, disambiguated_display_name
 from webviz.app import _validate_user_regex, driver, logger
+
+# Cap on hosts pulled in around matched users/software (graph render budget).
+CONNECTED_HOST_CAP = 500
 
 bp = Blueprint("search", __name__)
 
@@ -141,8 +144,7 @@ def search_all():
                 host_query += label_flt_fragment
                 host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
                 # Apply limit to search results too if requested
-                if limit_param > 0:
-                    host_query += f" LIMIT {cypher_limit}"
+                host_query += f" LIMIT {cypher_limit}"
 
                 params = {'search_term': search_term}
                 if search_mode == 'regex' and not case_sensitive:
@@ -209,8 +211,7 @@ def search_all():
                 params.update(label_flt_params)
 
                 user_query += " RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname"
-                if limit_param > 0:
-                    user_query += f" LIMIT {cypher_limit}"
+                user_query += f" LIMIT {cypher_limit}"
 
                 user_result = session.run(user_query, **params)
             else:
@@ -272,9 +273,9 @@ def search_all():
                 software_query += """
                     WITH s, COUNT(DISTINCT h) as host_count
                     RETURN s.name AS name, coalesce(s.display_name, s.name) AS display_name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, host_count
+                    ORDER BY host_count DESC, name
                 """
-                if limit_param > 0:
-                    software_query += f" LIMIT {cypher_limit}"
+                software_query += f" LIMIT {cypher_limit}"
 
                 software_result = session.run(software_query, **params)
             else:
@@ -350,6 +351,7 @@ def search_all():
             params.update(label_flt_params)
 
             host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += f" LIMIT {CONNECTED_HOST_CAP}"
 
             host_result = session.run(host_query, **params)
             for record in host_result:
@@ -382,6 +384,7 @@ def search_all():
             params.update(label_flt_params)
 
             host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += f" LIMIT {CONNECTED_HOST_CAP}"
 
             host_result = session.run(host_query, **params)
             for record in host_result:
@@ -440,7 +443,9 @@ def search_all():
                 except ValueError:
                     continue
 
-            if user_ids_list or host_fids_list:
+            # Edges are only kept when both ends are loaded nodes, so AND the two
+            # id lists; OR fetched every edge of every loaded host and dropped most.
+            if user_ids_list and host_fids_list:
                 user_host_query = """
                     MATCH (u:User)-[:USES]->(h:Host)
                 """
@@ -454,8 +459,7 @@ def search_all():
                     conditions.append("h.fleet_host_id IN $host_fid_list")
                     params['host_fid_list'] = host_fids_list
 
-                if conditions:
-                    user_host_query += " WHERE " + " OR ".join(conditions)
+                user_host_query += " WHERE " + " AND ".join(conditions)
 
                 # Apply team filter to relationships to prevent cross-team contamination
                 if team_filter != 'all':
@@ -505,7 +509,9 @@ def search_all():
                 except ValueError:
                     continue
 
-            if software_ids_list or host_fids_list:
+            # Edges are only kept when both ends are loaded nodes, so AND the two
+            # id lists; OR fetched every edge of every loaded host and dropped most.
+            if software_ids_list and host_fids_list:
                 software_host_query = """
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 """
@@ -519,8 +525,7 @@ def search_all():
                     conditions.append("h.fleet_host_id IN $host_fid_list")
                     params['host_fid_list'] = host_fids_list
 
-                if conditions:
-                    software_host_query += " WHERE " + " OR ".join(conditions)
+                software_host_query += " WHERE " + " AND ".join(conditions)
 
                 # Apply team filter to relationships to prevent cross-team contamination
                 if team_filter != 'all':
@@ -573,213 +578,7 @@ def search_all():
 
 @bp.route("/api/search/software")
 def search_software():
-    """Legacy endpoint - redirects to new universal search endpoint.
-
-    Kept for backward compatibility with existing frontend code.
-    """
-    if not driver:
-        return jsonify({"error": "Database connection failed"}), 500
-
-    search_term = request.args.get('q', '').strip()
-    platform_filter = request.args.get('platform', 'all').strip().lower()
-
-    with driver.session() as session:
-        nodes = []
-        node_ids = set()
-
-        # Search for ALL software matching the search term (case-insensitive, partial match)
-        # If search_term is empty, return ALL software
-        if search_term:
-            software_query = """
-                MATCH (s:Software)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                   OR toLower(coalesce(s.display_name, '')) CONTAINS toLower($search_term)
-                RETURN DISTINCT s.name AS name,
-                       coalesce(s.display_name, s.name) AS display_name,
-                       s.last_version AS last_version
-                ORDER BY coalesce(s.display_name, s.name)
-            """
-            software_result = session.run(software_query, search_term=search_term)
-        else:
-            # No search term: return top 100 software by host count
-            # Apply platform filter if specified to reduce data
-            if platform_filter != 'all':
-                software_query = """
-                    MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                    WHERE toLower(h.platform) CONTAINS toLower($platform)
-                    WITH s.name AS name,
-                         coalesce(s.display_name, s.name) AS display_name,
-                         s.last_version AS last_version,
-                         COUNT(DISTINCT h) AS host_count
-                    ORDER BY host_count DESC
-                    LIMIT 100
-                    RETURN name, display_name, last_version, host_count
-                """
-                software_result = session.run(software_query, platform=platform_filter)
-            else:
-                software_query = """
-                    MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                    WITH s.name AS name,
-                         coalesce(s.display_name, s.name) AS display_name,
-                         s.last_version AS last_version,
-                         COUNT(DISTINCT h) AS host_count
-                    ORDER BY host_count DESC
-                    LIMIT 100
-                    RETURN name, display_name, last_version, host_count
-                """
-                software_result = session.run(software_query)
-
-        software_list = [record for record in software_result]
-
-        if not software_list:
-            msg = f"No software found matching '{search_term}'" if search_term else "No software found"
-            return jsonify({"nodes": [], "links": [], "message": msg}), 200
-
-        # Add matching software nodes - limit to 10 unique items ONLY when showing "ALL" (no search term)
-        # When user searches for specific software, show ALL matching results
-        software_count = 0
-        for record in software_list:
-            # Only apply limit when there's no search term (the "ALL" case)
-            if not search_term and software_count >= 10:
-                break
-            software_id = f"software_{record['name']}"
-            nodes.append({
-                "id": software_id,
-                "name": record['name'],
-                "display_name": record.get('display_name') or record['name'],
-                "type": "software",
-                "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
-            })
-            node_ids.add(software_id)
-            software_count += 1
-
-        # Get ALL hosts that have any of the matching software, with optional
-        # platform filter. Keyed on fleet_host_id (stable, unique) — hostname
-        # is NOT unique (Fleet's default "mac.lan" collision) and would both
-        # over-match and never line up with the host_<fid> ids the rest of the
-        # app emits.
-        if platform_filter == 'all':
-            host_result = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
-                               h.hostname AS hostname,
-                               h.os_version AS os_version,
-                               h.platform AS platform
-            """, search_term=search_term)
-        else:
-            host_result = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                  AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
-                               h.hostname AS hostname,
-                               h.os_version AS os_version,
-                               h.platform AS platform
-            """, search_term=search_term, platform=platform_filter)
-
-        host_records = [record for record in host_result if record['fleet_host_id'] is not None]
-        hostname_counts = _hostname_counts(host_records)
-        for record in host_records:
-            fid = record['fleet_host_id']
-            host_id = f"host_{fid}"
-            if host_id not in node_ids:
-                hn = record['hostname']
-                nodes.append({
-                    "id": host_id,
-                    "name": hn,
-                    "display_name": disambiguated_display_name(hn, fid, hostname_counts),
-                    "fleet_host_id": fid,
-                    "type": "host",
-                    "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
-                })
-                node_ids.add(host_id)
-
-        # Get users connected to these hosts (with platform filter if applicable)
-        if platform_filter == 'all':
-            user_result = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname
-            """, search_term=search_term)
-        else:
-            user_result = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                  AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN DISTINCT u.username AS username, u.email AS email, u.fullname AS fullname
-            """, search_term=search_term, platform=platform_filter)
-
-        for record in user_result:
-            user_id = f"user_{record['username']}"
-            if user_id not in node_ids:
-                nodes.append({
-                    "id": user_id,
-                    "name": record['username'],
-                    "type": "user",
-                    "details": record['email'] or record['fullname'] or ''
-                })
-                node_ids.add(user_id)
-
-        # Get all relationships
-        links = []
-
-        # Software-Host relationships (with platform filter if applicable)
-        if platform_filter == 'all':
-            software_host_links = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN s.name AS software_name, h.fleet_host_id AS fleet_host_id
-            """, search_term=search_term)
-        else:
-            software_host_links = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                  AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN s.name AS software_name, h.fleet_host_id AS fleet_host_id
-            """, search_term=search_term, platform=platform_filter)
-
-        for record in software_host_links:
-            source_id = f"software_{record['software_name']}"
-            target_id = f"host_{record['fleet_host_id']}"
-            if source_id in node_ids and target_id in node_ids:
-                links.append({
-                    "source": source_id,
-                    "target": target_id,
-                    "type": "installed"
-                })
-
-        # User-Host relationships (for hosts that have the matching software, with platform filter)
-        if platform_filter == 'all':
-            user_host_links = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id
-            """, search_term=search_term)
-        else:
-            user_host_links = session.run("""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                WHERE toLower(s.name) CONTAINS toLower($search_term)
-                  AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id
-            """, search_term=search_term, platform=platform_filter)
-
-        for record in user_host_links:
-            source_id = f"user_{record['username']}"
-            target_id = f"host_{record['fleet_host_id']}"
-            if source_id in node_ids and target_id in node_ids:
-                links.append({
-                    "source": source_id,
-                    "target": target_id,
-                    "type": "uses"
-                })
-
-        search_desc = f"'{search_term}'" if search_term else "ALL"
-        logger.info(f"Software search {search_desc} (platform: {platform_filter}): Found {len(software_list)} software, returning {len(nodes)} nodes and {len(links)} links")
-        return jsonify({
-            "nodes": nodes,
-            "links": links,
-            "search_term": search_term,
-            "platform_filter": platform_filter,
-            "software_count": len(software_list)
-        })
+    """Legacy endpoint: redirects to /api/search scoped to software."""
+    args = request.args.to_dict()
+    args["type"] = "software"
+    return redirect(url_for("search.search_all", **args), code=308)

@@ -275,21 +275,9 @@ class MemgraphIngestion:
             except Exception as exc:
                 logger.warning("software case-variant dedupe skipped: %s", exc)
 
-            # Recurring sweep: collapse duplicate INSTALLED_ON edges between
-            # the same (Software, Host) pair. Memgraph MERGE on a relationship
-            # pattern is NOT serializable across concurrent transactions —
-            # two parallel chunks both seeing "no edge exists" can each
-            # create one, producing 2 rels for the same pair.
-            # `_batch_create_software_grouped` deliberately runs chunks in
-            # parallel via ThreadPoolExecutor for ingest throughput, so the
-            # race window is real on every cycle. This sweep keeps one rel
-            # per (s,h) and deletes the rest; cheap (single Cypher) and
-            # self-quiescing — after a clean cycle the WHERE clause matches
-            # zero rows and the sweep no-ops in <50ms.
-            try:
-                self._dedupe_installed_on_edges(session)
-            except Exception as exc:
-                logger.warning("installed_on edge dedupe skipped: %s", exc)
+            # Duplicate INSTALLED_ON edges are swept post-ingest, scoped to the
+            # hosts written that cycle (see create_graph_relationships). A
+            # whole-graph sweep here grouped every edge on every cycle.
 
             # One-shot: rename existing extension nodes so s.name == s.extension_key.
             # After this, MERGE (s:Software {name: extension_key}) hits the
@@ -360,6 +348,7 @@ class MemgraphIngestion:
             # Grouped software structure: List of {fleet_host_id: int, software_list: []}.
             # Keyed by Fleet's stable id; hostname carried only for diagnostic logs.
             software_grouped_batch = []
+            sw_written_fids: set = set()  # scopes the post-ingest dedupe sweep
 
             if total_hosts is None:
                 progress_interval = 500  # unknown size — log every 500 hosts processed
@@ -566,6 +555,7 @@ class MemgraphIngestion:
                                 entry['vendor'] = s.get('vendor') or None
                             cleaned_software.append(entry)
                         if cleaned_software:
+                            sw_written_fids.add(fleet_host_id)
                             software_grouped_batch.append({
                                 'fleet_host_id': fleet_host_id,
                                 'software_list': cleaned_software,
@@ -609,7 +599,7 @@ class MemgraphIngestion:
             # behind even on its first cycle, before the next-cycle startup
             # sweep would catch them. No-op when clean.
             try:
-                self._dedupe_installed_on_edges(session)
+                self._dedupe_installed_on_edges(session, sorted(sw_written_fids))
             except Exception as exc:
                 logger.warning("post-ingest installed_on dedupe skipped: %s", exc)
 
@@ -809,6 +799,8 @@ class MemgraphIngestion:
     # via env if Memgraph is sized differently — set to 1 to force serial
     # execution.
     _SOFTWARE_REL_PARALLELISM = max(1, int(os.environ.get("INGEST_SW_PARALLELISM", "4")))
+    # Rows per Software node MERGE; mirrors SOFTWARE_REL_CHUNK_ROWS for the rel writes.
+    _SOFTWARE_NODE_CHUNK = 5000
 
     def _resolve_canonical_extension_names(
         self, session, ext_keys, software_grouped_batch
@@ -1122,10 +1114,15 @@ class MemgraphIngestion:
                 s.max_cvss = CASE WHEN sw.max_cvss IS NOT NULL THEN sw.max_cvss ELSE s.max_cvss END,
                 s.is_builtin = CASE WHEN sw.kind IS NOT NULL THEN sw.is_builtin ELSE s.is_builtin END
         """
-        nodes_ok = self._execute_with_retry(
-            session, query_nodes,
-            {'software': unique_software_list, 'seen_at': seen_at},
-            "create software nodes",
+        # Chunked like the rel writes: one oversized UNWIND can exceed the
+        # query timeout and then fail the same flush on every cycle.
+        nodes_ok = all(
+            self._execute_with_retry(
+                session, query_nodes,
+                {'software': unique_software_list[i:i + self._SOFTWARE_NODE_CHUNK], 'seen_at': seen_at},
+                "create software nodes",
+            )
+            for i in range(0, len(unique_software_list), self._SOFTWARE_NODE_CHUNK)
         )
         if not nodes_ok:
             # The node MERGE is global to this batch: if it fails, the rel
@@ -1496,7 +1493,15 @@ class MemgraphIngestion:
                 fid=fleet_id,
             ).single()
             live_edges = count_rec["c"] if count_rec else 0
-            if live_edges == expected_count:
+            # Orphan members (no :Host node, e.g. hosts in unscanned teams)
+            # can never have an edge; compare against members that exist,
+            # or every label with an orphan is rewritten every cycle.
+            present_rec = session.run(
+                "MATCH (h:Host) WHERE h.fleet_host_id IN $ids RETURN count(h) AS c",
+                ids=ids_list,
+            ).single()
+            present_count = present_rec["c"] if present_rec else expected_count
+            if live_edges == present_count:
                 # Hash match AND graph state consistent → safe to skip.
                 # last_synced_iso already updated in _batch_merge_labels.
                 # Still refresh orphan accounting cheaply so operators see
@@ -1901,7 +1906,7 @@ class MemgraphIngestion:
             )
         return {'clusters': clusters, 'duplicates_removed': duplicates_removed, 'renamed': renamed}
 
-    def _dedupe_installed_on_edges(self, session) -> dict:
+    def _dedupe_installed_on_edges(self, session, fleet_host_ids=None) -> dict:
         """Collapse duplicate INSTALLED_ON edges between same (Software, Host).
 
         Memgraph MERGE on a relationship pattern is not serializable across
@@ -1924,15 +1929,22 @@ class MemgraphIngestion:
         race persists for every ingestion cycle that runs parallel chunks,
         so the sweep must run every cycle to keep the graph clean.
         """
+        # fleet_host_ids scopes the sweep to hosts written this cycle (the only
+        # place the race can create dupes); None sweeps the whole graph, which
+        # groups every INSTALLED_ON edge and is too slow to run every cycle.
+        if fleet_host_ids is not None and not fleet_host_ids:
+            return {'pairs': 0, 'extras_removed': 0}
         rec = session.run(
             """
             MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
+            WHERE $fids IS NULL OR h.fleet_host_id IN $fids
             WITH s, h, collect(r) AS rs
             WHERE size(rs) > 1
             WITH s, h, rs, size(rs) - 1 AS extras
             FOREACH (rel IN tail(rs) | DELETE rel)
             RETURN count(*) AS pairs, sum(extras) AS extras_removed
-            """
+            """,
+            fids=fleet_host_ids,
         ).single()
         pairs = int(rec['pairs']) if rec and rec['pairs'] is not None else 0
         extras_removed = int(rec['extras_removed']) if rec and rec['extras_removed'] is not None else 0

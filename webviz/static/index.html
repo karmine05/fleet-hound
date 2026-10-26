@@ -5748,8 +5748,9 @@
 
             if (clickedNode.type === 'host') {
                 showStatus(`Loading software for ${clickedNode.name}...`);
-                fetch(`/api/host/${clickedNode.name}/software`)
-                    .then(response => response.json())
+                const fidQS = clickedNode.fleet_host_id != null ? `?fleet_host_id=${encodeURIComponent(clickedNode.fleet_host_id)}` : '';
+                fetch(`/api/host/${encodeURIComponent(clickedNode.name)}/software${fidQS}`)
+                    .then(response => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
                     .then(hostData => {
                         currentData = hostData;
                         renderGraph(hostData);
