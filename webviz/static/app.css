@@ -794,7 +794,8 @@ textarea {
 #graph .node-label {
     font-family: var(--font-mono);
     font-weight: 600;
-    font-size: 11px;
+    /* No font-size: sizeGraphLabels() sets 11/k as an attribute to keep
+       labels 11 screen px at any zoom, and any CSS size overrides it. */
     fill: var(--text-primary);
 }
 /* Labels sit in their own layer above the nodes, so hover/focus dimming
@@ -902,9 +903,15 @@ textarea {
     pointer-events: none;
 }
 .cluster-label {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
-    fill: var(--text-tertiary);
+    letter-spacing: 0.02em;
+    fill: var(--text-secondary);
+    /* Halo so headings stay legible over edges crossing the gap. */
+    paint-order: stroke;
+    stroke: var(--bg-primary);
+    stroke-width: 3px;
+    stroke-linejoin: round;
     pointer-events: none;
     text-anchor: middle;
 }
