@@ -232,6 +232,11 @@ body {
     background: var(--bg-primary);
     color: var(--text-primary);
     overflow: hidden;
+    /* Column layout: the active view takes whatever height the topbar,
+       scope banner and toolbar leave, instead of guessing it. */
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
@@ -588,16 +593,16 @@ textarea {
 /* ========================================
    VIEW CONTAINERS
    ======================================== */
+/* Fixed calc() heights assumed 84px of chrome above the graph; the
+   scope banner and a taller toolbar made it 135px, so the SVG ran 52px
+   past the window and fitGraph() framed nodes off-screen. */
 .view-container {
     display: none;
     width: 100vw;
-    height: calc(100vh - 44px);
+    flex: 1 1 auto;
+    min-height: 0;
     overflow: hidden;
     position: relative;
-}
-
-.view-container.with-toolbar {
-    height: calc(100vh - 44px - 40px);
 }
 
 .view-container.active {

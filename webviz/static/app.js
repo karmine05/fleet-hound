@@ -3910,7 +3910,6 @@ function _applyClusterForces(data) {
     root.selectAll('.cluster-label-layer').remove();
     const hullLayer = root.insert('g', ':first-child').attr('class', 'cluster-hull-layer');
     const labelLayer = root.append('g').attr('class', 'cluster-label-layer');
-    const hullPad = 18;
 
     const _renderHulls = () => {
         const polygons = [];
@@ -3919,12 +3918,14 @@ function _applyClusterForces(data) {
             if (!placed.length) return;
             // Ring each node with 8 points so the hull wraps the circles
             // instead of running through their centres, and so 1-2 node
-            // groups still get an outline.
+            // groups still get an outline. collideR is radius + 8, so big
+            // hub circles stay inside too.
             const pts = [];
             placed.forEach(n => {
+                const pad = collideR(n) + 4;
                 for (let i = 0; i < 8; i++) {
                     const a = (i / 8) * 2 * Math.PI;
-                    pts.push([n.x + hullPad * Math.cos(a), n.y + hullPad * Math.sin(a)]);
+                    pts.push([n.x + pad * Math.cos(a), n.y + pad * Math.sin(a)]);
                 }
             });
             const hull = d3.polygonHull(pts);
@@ -3941,7 +3942,6 @@ function _applyClusterForces(data) {
         lblSel.enter().append('text').attr('class', 'cluster-label')
             .merge(lblSel)
             .attr('x', p => d3.mean(p.pts, c => c[0]))
-            .attr('y', p => d3.min(p.pts, c => c[1]) - 8 / _clusterZoomK())
             .text(p => _clusterLabel(p.key));
         _sizeClusterLabels();
     };
@@ -3952,6 +3952,9 @@ function _applyClusterForces(data) {
     const _sizeClusterLabels = () => {
         const k = _clusterZoomK();
         labelLayer.selectAll('text.cluster-label')
+            // 16 screen px clears the top node's own label (r + 6/k up);
+            // set here because fitGraph() zooms after the last tick.
+            .attr('y', p => d3.min(p.pts, c => c[1]) - 16 / k)
             .style('font-size', `${12 / k}px`)
             .style('stroke-width', `${3 / k}px`);
     };
