@@ -417,26 +417,69 @@ def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset]:
         return names, chrome_ids, amo_ids, edge_ext_ids
 
 
-def store_install_verified(store, extension_id, paths) -> bool:
-    """True when the host-reported install paths show a store install.
+# Browser-managed store directories, anchored at the user's home. Paths are
+# matched whole (fullmatch) after normalizing "\\" to "/", so an unpacked
+# extension placed in some other ".../Extensions/<id>/<ver>" does not pass.
+_HOME = r"(?:/Users/[^/]+|/home/[^/]+|/root|[a-z]:/Users/[^/]+)"
+_CHROMIUM_ROOTS = (
+    # macOS
+    r"Library/Application Support/(?:Google/Chrome(?: Beta| Canary| Dev)?|Chromium"
+    r"|Microsoft Edge(?: Beta| Dev| Canary)?|BraveSoftware/Brave-Browser(?:-Beta|-Nightly)?"
+    r"|Vivaldi|com\.operasoftware\.Opera|Arc/User Data|Comet|Dia/User Data)"
+    # Linux
+    r"|\.config/(?:google-chrome(?:-beta|-unstable)?|chromium|microsoft-edge(?:-beta|-dev)?"
+    r"|BraveSoftware/Brave-Browser(?:-Beta|-Nightly)?|vivaldi|opera)"
+    r"|snap/chromium/common/chromium"
+    # Windows
+    r"|AppData/Local/(?:Google/Chrome(?: Beta| Dev| SxS)?|Chromium"
+    r"|Microsoft/Edge(?: Beta| Dev| SxS)?|BraveSoftware/Brave-Browser(?:-Beta|-Nightly)?"
+    r"|Vivaldi)/User Data"
+    r"|AppData/Roaming/Opera Software/Opera Stable"
+)
+_FIREFOX_ROOTS = (
+    r"Library/Application Support/Firefox/Profiles|\.mozilla/firefox"
+    r"|snap/firefox/common/\.mozilla/firefox|\.var/app/org\.mozilla\.firefox/\.mozilla/firefox"
+    r"|AppData/Roaming/Mozilla/Firefox/Profiles"
+)
+
+
+def _store_path_re(store: str, extension_id: str):
+    eid = re.escape(extension_id)
+    if store == "firefox":
+        tail = rf"(?:{_FIREFOX_ROOTS})/[^/]+/extensions/{eid}\.xpi"
+    else:  # Chromium family + Edge; Opera has no profile segment
+        tail = rf"(?:{_CHROMIUM_ROOTS})(?:/[^/]+)?/Extensions/{eid}/[^/]+/?"
+    return re.compile(rf"{_HOME}/{tail}", re.IGNORECASE)
+
+
+def store_install_verified(store, extension_id, installs) -> bool:
+    """True when every host install of the extension is a store install.
 
     Store-ID trust is about the listing, not the installed copy: an unpacked
     extension can claim a listed ID by copying its manifest `key`. Store
-    installs live in the browser's managed directory
-    (Chromium: <profile>/Extensions/<id>/<version>; Firefox:
-    <profile>/extensions/<id>.xpi); unpacked ones load from anywhere else.
-    Needs at least one store path and no other path; unreported (empty)
-    paths are ignored, and no paths at all is not evidence.
+    installs live in the browser's managed directory under the user's
+    profile; unpacked ones load from anywhere else. `installs` is a list of
+    {"path", "platform"} (one per host install; bare path strings accepted).
+    Fails closed: a missing path counts against trust, except on ChromeOS
+    hosts (platform "chrome"), whose agent never reports extension paths.
+
+    Residual: a local user who copies an unpacked extension INTO the real
+    profile directory still passes; osquery's from_webstore would close
+    that, but Fleet's software inventory does not expose it.
     """
-    if not extension_id:
+    if not extension_id or not installs:
         return False
-    if store == "firefox":
-        store_path = re.compile(r"[\\/]extensions[\\/]" + re.escape(extension_id) + r"\.xpi$")
-    else:
-        store_path = re.compile(r"[\\/]Extensions[\\/]" + re.escape(extension_id)
-                                + r"[\\/][^\\/]+[\\/]?$")
-    reported = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
-    return bool(reported) and all(store_path.search(p) for p in reported)
+    pattern = _store_path_re(store, extension_id)
+    for item in installs:
+        path, platform = (item.get("path"), item.get("platform")) if isinstance(item, dict) else (item, None)
+        path = (path or "").strip().replace("\\", "/")
+        if not path:
+            if platform == "chrome":
+                continue
+            return False
+        if not pattern.fullmatch(path):
+            return False
+    return True
 
 
 def publisher_is_reputable(*values) -> bool:
@@ -833,11 +876,12 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     sideload_signal = None
     if reputable and meta.get("store") in ("chrome", "firefox", "edge"):
         if not store_install_verified(meta.get("store"), record.get("extension_id"),
-                                      record.get("install_paths")):
+                                      record.get("installs")):
             reputable = False
             sideload_signal = {"code": "not-store-install", "weight": 0,
-                               "detail": "publisher is known, but no host shows a store install "
-                                         "(unpacked or unreported path); publisher trust not applied"}
+                               "detail": "publisher is known, but not every host install is in the "
+                                         "browser's store directory (unpacked or unreported path); "
+                                         "publisher trust not applied"}
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
     if sideload_signal:
         trust_signals.append(sideload_signal)
@@ -1599,7 +1643,7 @@ def _self_check() -> None:
     tiny_known = analyze_extension({
         "store": "firefox", "extension_id": "{ce9f4b1f-24b8-4e9a-9051-b9e472b1b2f2}",
         "name": "clear browsing data", "host_count": 1,
-        "install_paths": ["/home/a/.mozilla/firefox/p.default/extensions/"
+        "installs": ["/home/a/.mozilla/firefox/p.default/extensions/"
                           "{ce9f4b1f-24b8-4e9a-9051-b9e472b1b2f2}.xpi"],
         "store_meta": {"store": "firefox", "status": "public", "users": 41_759,
                        "developer": "Mozilla", "author_ids": [101]},
@@ -1620,20 +1664,29 @@ def _self_check() -> None:
                  "jmjflgjpcpepeafmmgdpfkogkghcpiha/1.0_0"]
     listed = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
                                 "name": "x", "host_count": 1, "store_meta": edge_meta,
-                                "install_paths": edge_path})
+                                "installs": edge_path})
     other = analyze_extension({"store": "edge", "extension_id": "b" * 32, "name": "x",
                                "host_count": 1, "store_meta": edge_meta})
     gone = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
-                              "name": "x", "host_count": 1, "install_paths": edge_path,
+                              "name": "x", "host_count": 1, "installs": edge_path,
                               "store_meta": {**edge_meta, "status": "not_found"}})
     assert listed["publisher_reputable"] and not other["publisher_reputable"]
     assert not gone["publisher_reputable"], "listed ID no longer on the store is not trusted"
     # An unpacked copy claiming the listed ID (manifest `key`) loses store trust.
     sideloaded = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
                                     "name": "x", "host_count": 2, "store_meta": edge_meta,
-                                    "install_paths": edge_path + ["/Users/b/dev/copy/dist"]})
+                                    "installs": edge_path + ["/Users/b/dev/copy/dist"]})
     assert not sideloaded["publisher_reputable"]
     assert any(s["code"] == "not-store-install" for s in sideloaded["risk_signals"])
+    eid = "jmjflgjpcpepeafmmgdpfkogkghcpiha"
+    assert store_install_verified("chrome", eid, [
+        f"C:\\Users\\a\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Extensions\\{eid}\\1_0",
+        {"path": None, "platform": "chrome"}])                       # ChromeOS: no path reported
+    for bad in ([f"/tmp/x/Extensions/{eid}/1.0"],                    # store-shaped, wrong root
+                [f"/Users/a/evil/Google/Chrome/Default/Extensions/{eid}/1.0"],
+                [f"/Users/a/Library/Application Support/Google/Chrome/Default/Extensions/{eid}/1/../../x"],
+                [{"path": None, "platform": "darwin"}], []):         # missing path fails closed
+        assert not store_install_verified("chrome", eid, bad), bad
 
     typo = analyze_extension({
         "store": "chrome", "extension_id": "a" * 32,
