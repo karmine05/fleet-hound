@@ -7,9 +7,7 @@ names are imported at module top; safe because app.py registers every
 blueprint at the very bottom, after all of them are bound.
 """
 
-from flask import Blueprint
-
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
 from neo4j.exceptions import ServiceUnavailable, TransientError
 from webviz.host_filters import FilterValidationError, apply_composite_filter, apply_host_filters
 import json

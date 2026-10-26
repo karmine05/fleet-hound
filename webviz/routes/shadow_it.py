@@ -7,9 +7,7 @@ names are imported at module top; safe because app.py registers every
 blueprint at the very bottom, after all of them are bound.
 """
 
-from flask import Blueprint
-
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
 from webviz.host_filters import FilterValidationError, apply_label_filter
 from src.shadow_it_filter import MIN_OUTLIER_HOSTS as _MIN_OUTLIER_HOSTS, classify_extension_type as _classify_extension_type, compute_per_platform_thresholds as _compute_per_platform_thresholds, get_outlier_pct as _get_outlier_pct, is_system_package as _is_system_package
 from webviz.app import _normalize_whitelist, _whitelist_clause, _word_match, driver, load_whitelist, logger
