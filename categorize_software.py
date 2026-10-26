@@ -296,17 +296,22 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
     return EnrichResult.HIT, (categories, short_extract or description)
 
 def purge_non_software_descriptions(driver, dry_run: bool = False) -> list:
-    """Clear Wikipedia enrichments that fail the _SOFTWARE_HINT_RE gate.
+    """Clear Wikipedia enrichments written before the _SOFTWARE_HINT_RE gate
+    that fail it.
 
     Enrichments written before the gate existed include unrelated articles
     ("chromium" -> the element, "ruby" -> the gemstone). Clears category and
     description and stamps a categorization attempt, so the cooldown keeps
     the enricher from re-fetching the same wrong page right away. Catalog
-    entries are curated and kept. Idempotent; returns the cleared names.
+    entries are curated and kept. Entries written since the gate carry
+    enrich_gate_passed: the gate judged the full summary, but only a short
+    first sentence is stored ("RingCentral, Inc"), so re-judging the stored
+    text would wrongly clear them. Idempotent; returns the cleared names.
     """
     with driver.session() as session:
         rows = session.run(
             "MATCH (s:Software) WHERE s.wikidata_description IS NOT NULL "
+            "  AND s.enrich_gate_passed IS NULL "
             "RETURN s.name AS name, s.wikidata_description AS description"
         ).data()
         names = [
@@ -517,6 +522,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                             SET s.category = $category,
                                 s.wikidata_description = $desc,
                                 s.last_categorized = datetime(),
+                                s.enrich_gate_passed = true,
                                 s.last_categorization_attempt_iso = $now_iso,
                                 s.categorization_attempts = coalesce(s.categorization_attempts, 0) + 1,
                                 s.categorization_source = 'catalog'
@@ -551,6 +557,7 @@ def run_categorization(memgraph_uri: str = MEMGRAPH_URI, limit: Optional[int] = 
                             SET s.category = $category,
                                 s.wikidata_description = $desc,
                                 s.last_categorized = datetime(),
+                                s.enrich_gate_passed = true,
                                 s.last_categorization_attempt_iso = $now_iso,
                                 s.categorization_attempts = coalesce(s.categorization_attempts, 0) + 1,
                                 s.categorization_source = 'wikipedia'

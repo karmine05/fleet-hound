@@ -460,8 +460,11 @@ def store_install_verified(store, extension_id, installs) -> bool:
     installs live in the browser's managed directory under the user's
     profile; unpacked ones load from anywhere else. `installs` is a list of
     {"path", "platform"} (one per host install; bare path strings accepted).
-    Fails closed: a missing path counts against trust, except on ChromeOS
-    hosts (platform "chrome"), whose agent never reports extension paths.
+    Fails closed: needs at least one install whose path positively matches a
+    store directory. A missing path counts against trust, except on ChromeOS
+    hosts (platform "chrome"), whose agent never reports extension paths;
+    those are tolerated but never count as evidence, so a ChromeOS-only
+    extension is unverifiable and gets no publisher trust.
 
     Residual: a local user who copies an unpacked extension INTO the real
     profile directory still passes; osquery's from_webstore would close
@@ -470,6 +473,7 @@ def store_install_verified(store, extension_id, installs) -> bool:
     if not extension_id or not installs:
         return False
     pattern = _store_path_re(store, extension_id)
+    verified = 0
     for item in installs:
         path, platform = (item.get("path"), item.get("platform")) if isinstance(item, dict) else (item, None)
         path = (path or "").strip().replace("\\", "/")
@@ -479,7 +483,8 @@ def store_install_verified(store, extension_id, installs) -> bool:
             return False
         if not pattern.fullmatch(path):
             return False
-    return True
+        verified += 1
+    return verified > 0
 
 
 def publisher_is_reputable(*values) -> bool:
@@ -1685,7 +1690,8 @@ def _self_check() -> None:
     for bad in ([f"/tmp/x/Extensions/{eid}/1.0"],                    # store-shaped, wrong root
                 [f"/Users/a/evil/Google/Chrome/Default/Extensions/{eid}/1.0"],
                 [f"/Users/a/Library/Application Support/Google/Chrome/Default/Extensions/{eid}/1/../../x"],
-                [{"path": None, "platform": "darwin"}], []):         # missing path fails closed
+                [{"path": None, "platform": "darwin"}], [],          # missing path fails closed
+                [{"path": None, "platform": "chrome"}]):              # ChromeOS-only: no evidence
         assert not store_install_verified("chrome", eid, bad), bad
 
     typo = analyze_extension({

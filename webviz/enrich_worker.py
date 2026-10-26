@@ -176,7 +176,8 @@ def _write_categories(driver, name: str, categories, description) -> bool:
                 MATCH (s:Software {name: $name})
                 SET s.category = $category,
                     s.wikidata_description = $desc,
-                    s.last_categorized = datetime()
+                    s.last_categorized = datetime(),
+                    s.enrich_gate_passed = true
                 """,
                 name=name,
                 category=list(categories) if categories else [],
