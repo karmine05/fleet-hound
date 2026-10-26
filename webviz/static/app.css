@@ -794,7 +794,8 @@ textarea {
 #graph .node-label {
     font-family: var(--font-mono);
     font-weight: 600;
-    font-size: 11px;
+    /* No font-size: sizeGraphLabels() sets 11/k as an attribute to keep
+       labels 11 screen px at any zoom, and any CSS size overrides it. */
     fill: var(--text-primary);
 }
 /* Labels sit in their own layer above the nodes, so hover/focus dimming
