@@ -333,7 +333,7 @@ _KNOWN_PUBLISHERS_CANDIDATES = (
 )
 _CWS_PUBLISHER_ID_RE = re.compile(r"u[0-9a-f]{32}")
 _known_publishers_cache: dict = {"key": None, "names": frozenset(), "chrome_ids": frozenset(),
-                                 "amo_ids": frozenset()}
+                                 "amo_ids": frozenset(), "edge_ext_ids": frozenset()}
 _known_publishers_lock = threading.Lock()
 
 
@@ -344,8 +344,8 @@ def _known_publishers_path() -> str | None:
     return next((p for p in _KNOWN_PUBLISHERS_CANDIDATES if os.path.exists(p)), None)
 
 
-def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset]:
-    names, chrome_ids, amo_ids = set(), set(), set()
+def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset, frozenset]:
+    names, chrome_ids, amo_ids, edge_ext_ids = set(), set(), set(), set()
     entries = doc.get("publishers") if isinstance(doc, dict) else None
     if not isinstance(entries, list):
         raise ValueError("expected an object with a 'publishers' list")
@@ -362,6 +362,11 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset]:
             bad = [i for i in authors if not (isinstance(i, int) and not isinstance(i, bool) and i > 0)]
             if bad:
                 raise ValueError(f"invalid amo_author_ids {bad}")
+            edge_exts = entry.get("edge_extension_ids") or []
+            bad = [i for i in edge_exts
+                   if not (isinstance(i, str) and _CHROME_EXTENSION_ID_RE.fullmatch(i))]
+            if bad:
+                raise ValueError(f"invalid edge_extension_ids {bad}")
         except (ValueError, TypeError) as exc:
             logger.warning("known_publishers: skipping entry %d (%s): %s",
                            idx, (entry or {}).get("name") if isinstance(entry, dict) else entry, exc)
@@ -373,11 +378,14 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset]:
                 names.add(_normalise_publisher(n))
         chrome_ids.update(ids)
         amo_ids.update(authors)
-    return frozenset(names), frozenset(chrome_ids), frozenset(amo_ids)
+        edge_ext_ids.update(edge_exts)
+    return frozenset(names), frozenset(chrome_ids), frozenset(amo_ids), frozenset(edge_ext_ids)
 
 
-def known_publishers() -> tuple[frozenset, frozenset, frozenset]:
-    """(normalized names, Chrome publisher IDs, AMO author IDs), reloaded when the file changes.
+def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset]:
+    """(normalized names, Chrome publisher IDs, AMO author IDs, Edge extension IDs).
+
+    Reloaded when the file changes.
 
     A missing or unreadable file trusts nobody (logged), never a built-in default.
     """
@@ -389,47 +397,57 @@ def known_publishers() -> tuple[frozenset, frozenset, frozenset]:
     with _known_publishers_lock:
         c = _known_publishers_cache
         if key is not None and key == c["key"]:
-            return c["names"], c["chrome_ids"], c["amo_ids"]
-        names, chrome_ids, amo_ids = frozenset(), frozenset(), frozenset()
+            return c["names"], c["chrome_ids"], c["amo_ids"], c["edge_ext_ids"]
+        names, chrome_ids, amo_ids, edge_ext_ids = (frozenset(),) * 4
         if key is None:
             logger.warning("known_publishers: file not found (%s); no publisher is trusted",
                            path or "config/known_publishers.json")
         else:
             try:
                 with open(path, encoding="utf-8") as fh:
-                    names, chrome_ids, amo_ids = _parse_known_publishers(json.load(fh))
+                    names, chrome_ids, amo_ids, edge_ext_ids = _parse_known_publishers(json.load(fh))
                 logger.info("known_publishers: loaded %d names, %d Chrome publisher IDs, "
-                            "%d AMO author IDs from %s",
-                            len(names), len(chrome_ids), len(amo_ids), path)
+                            "%d AMO author IDs, %d Edge extension IDs from %s",
+                            len(names), len(chrome_ids), len(amo_ids), len(edge_ext_ids), path)
             except (OSError, ValueError) as exc:
                 logger.warning("known_publishers: cannot load %s (%s); no publisher is trusted",
                                path, exc)
-        c.update(key=key, names=names, chrome_ids=chrome_ids, amo_ids=amo_ids)
-        return names, chrome_ids, amo_ids
+        c.update(key=key, names=names, chrome_ids=chrome_ids, amo_ids=amo_ids,
+                 edge_ext_ids=edge_ext_ids)
+        return names, chrome_ids, amo_ids, edge_ext_ids
 
 
 def publisher_is_reputable(*values) -> bool:
     """True when a store-sourced developer/publisher NAME is a known publisher.
 
-    Edge/Safari only; Chrome-family and Firefox trust is by store ID
-    (chrome_publisher_is_reputable / amo_author_is_reputable). Callers pass store fields only: Fleet's
+    Safari only; Chrome-family, Firefox and Edge trust is by store ID
+    (chrome_publisher_is_reputable / amo_author_is_reputable /
+    edge_extension_is_reputable). Callers pass store fields only: Fleet's
     host-reported `vendor` is attacker-influenced. Normalized equality, not a
     word search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
     """
-    names, _, _ = known_publishers()
+    names, _, _, _ = known_publishers()
     return any(_normalise_publisher(v) in names for v in values if v)
 
 
 def chrome_publisher_is_reputable(publisher_id) -> bool:
     """Chrome Web Store trust is by immutable publisher ID, never display name."""
-    _, chrome_ids, _ = known_publishers()
+    _, chrome_ids, _, _ = known_publishers()
     return bool(publisher_id) and publisher_id in chrome_ids
 
 
 def amo_author_is_reputable(author_ids) -> bool:
     """Firefox trust is by immutable AMO author user ID, never display name."""
-    _, _, amo_ids = known_publishers()
+    _, _, amo_ids, _ = known_publishers()
     return any(isinstance(i, int) and i in amo_ids for i in author_ids or [])
+
+
+def edge_extension_is_reputable(extension_id, store_status) -> bool:
+    """Edge exposes no publisher ID, so trust is per listed extension ID, and
+    only while the Edge store reports that ID as a public listing (a
+    sideloaded copy reusing the ID gets nothing)."""
+    _, _, _, edge_ext_ids = known_publishers()
+    return store_status == "public" and bool(extension_id) and extension_id in edge_ext_ids
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +803,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         reputable = chrome_publisher_is_reputable(meta.get("publisher_id"))
     elif meta.get("store") == "firefox":
         reputable = amo_author_is_reputable(meta.get("author_ids"))
+    elif meta.get("store") == "edge":
+        reputable = edge_extension_is_reputable(record.get("extension_id"), meta.get("status"))
     else:
         reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
@@ -1500,6 +1520,8 @@ def _self_check() -> None:
         {"name": "Mozilla", "match_names": ["Mozilla"], "added_at": "2026-10-26T00:00:00Z",
          "amo_author_ids": [101]},
         {"name": "Bad Amo", "added_at": "2026-10-26T00:00:00Z", "amo_author_ids": ["101"]},  # skipped
+        {"name": "Microsoft", "match_names": ["Microsoft"], "added_at": "2026-10-26T00:00:00Z",
+         "edge_extension_ids": ["jmjflgjpcpepeafmmgdpfkogkghcpiha"]},
         {"name": "AdGuard", "match_names": ["AdGuard"], "added_at": "2026-10-26T00:00:00Z"},
         {"name": "1Password", "match_names": ["1Password", "AgileBits"], "added_at": "2026-10-26T00:00:00Z",
          "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"]},
@@ -1557,6 +1579,17 @@ def _self_check() -> None:
     })
     assert amo_spoof["publisher_reputable"] is False, "AMO name match without ID must not be trusted"
     assert not publisher_is_reputable("Bad Amo"), "string author IDs are rejected"
+    # Edge: listed extension ID + public listing; the developer name alone earns nothing.
+    edge_meta = {"store": "edge", "status": "public", "developer": "Microsoft Corporation"}
+    listed = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
+                                "name": "x", "host_count": 1, "store_meta": edge_meta})
+    other = analyze_extension({"store": "edge", "extension_id": "b" * 32, "name": "x",
+                               "host_count": 1, "store_meta": edge_meta})
+    gone = analyze_extension({"store": "edge", "extension_id": "jmjflgjpcpepeafmmgdpfkogkghcpiha",
+                              "name": "x", "host_count": 1,
+                              "store_meta": {**edge_meta, "status": "not_found"}})
+    assert listed["publisher_reputable"] and not other["publisher_reputable"]
+    assert not gone["publisher_reputable"], "sideloaded copy of a listed ID is not trusted"
 
     typo = analyze_extension({
         "store": "chrome", "extension_id": "a" * 32,

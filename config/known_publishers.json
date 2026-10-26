@@ -5,8 +5,10 @@
     "Store publisher ID, 'u' + 32 hex, from the publisher link on the listing page).",
     "Firefox: trusted ONLY by amo_author_ids (immutable addons.mozilla.org user IDs, integers, from",
     "https://addons.mozilla.org/api/v5/addons/addon/<guid>/ -> authors[].id).",
+    "Edge: the store exposes no publisher ID, so trust is per extension: edge_extension_ids (the",
+    "32-letter extension ID), and only while the Edge store lists that ID as public.",
     "Display names are never trusted on those stores: anyone can register a lookalike.",
-    "Edge/Safari: only names listed in match_names are trusted (normalized: case, punctuation, legal",
+    "Safari: only names listed in match_names are trusted (normalized: case, punctuation, legal",
     "suffixes like Inc/LLC/Ltd/GmbH ignored). `name` alone is a label, never trusted. Leave",
     "match_names empty for publishers verified only by store ID; avoid short/generic aliases.",
     "Every entry needs name and added_at (ISO 8601 UTC). Invalid entries are skipped with a warning.",
@@ -32,7 +34,10 @@
         "Microsoft"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py"
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Edge: per-extension trust ('Edge relevant text changes', verified on Edge Add-ons 2026-10-26)",
+      "edge_extension_ids": [
+        "jmjflgjpcpepeafmmgdpfkogkghcpiha"
+      ]
     },
     {
       "name": "Mozilla",
