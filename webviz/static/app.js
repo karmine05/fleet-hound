@@ -3862,6 +3862,14 @@ function _applyClusterForces(data) {
         groups.get(k).push(n);
     });
     const groupKeys = Array.from(groups.keys());
+    // One colour per team, assigned by sorted name so a team keeps its
+    // colour across re-renders. Category, user and no-team hulls stay
+    // on the neutral accent from app.css.
+    const teamKeys = groupKeys.filter(k => k.startsWith('team:') && k !== 'team:no-team').sort();
+    const teamColor = k => {
+        const i = teamKeys.indexOf(k);
+        return i < 0 ? null : `var(--team-${(i % 6) + 1})`;
+    };
     const cols = Math.ceil(Math.sqrt(groupKeys.length || 1));
     const rows = Math.ceil((groupKeys.length || 1) / cols);
     const container = document.getElementById('graph');
@@ -3935,6 +3943,9 @@ function _applyClusterForces(data) {
         sel.exit().remove();
         sel.enter().append('path').attr('class', 'cluster-hull')
             .merge(sel)
+            .style('fill', p => teamColor(p.key))
+            .style('fill-opacity', p => (teamColor(p.key) ? 0.12 : null))
+            .style('stroke', p => teamColor(p.key))
             .attr('d', p => 'M' + p.hull.map(c => c.join(',')).join('L') + 'Z');
 
         const lblSel = labelLayer.selectAll('text.cluster-label').data(polygons, p => p.key);
@@ -3942,6 +3953,7 @@ function _applyClusterForces(data) {
         lblSel.enter().append('text').attr('class', 'cluster-label')
             .merge(lblSel)
             .attr('x', p => d3.mean(p.pts, c => c[0]))
+            .style('fill', p => teamColor(p.key))
             .text(p => _clusterLabel(p.key));
         _sizeClusterLabels();
     };
