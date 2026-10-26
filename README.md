@@ -210,7 +210,7 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | no | Snapshot retention: 30 days / 5000 files. |
 | `DEBUG` | no | Extractor + auth diagnostics. |
 | `ENRICHER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` | no | Wikipedia worker tuning. |
-| `KNOWN_PUBLISHERS_FILE` | no | Override path of the known-good extension publisher list (default `config/known_publishers.json`). Edit that file to trust a publisher: add an entry with `name`, `added_at` (ISO 8601 UTC) and, for Chrome/Brave/Vivaldi/Opera, `chrome_publisher_ids` (the `u…` ID from the listing's publisher link). Applied on the next scoring cycle; no rebuild. |
+| `KNOWN_PUBLISHERS_FILE` | no | Override path of the known-good extension publisher list (default `config/known_publishers.json`). Edit that file to trust a publisher: add an entry with `name`, `added_at` (ISO 8601 UTC) and, for Chrome/Brave/Vivaldi/Opera, `chrome_publisher_ids` (the `u…` ID from the listing's publisher link). Names are trusted on Firefox/Edge/Safari only if listed in `match_names`; leave it empty for Chrome-ID-only entries. Applied on the next scoring cycle; no rebuild. |
 | `EXTENSION_WORKER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` / `_PARALLELISM` | no | Extension intel worker tuning. |
 | `OODA_ENABLED` / `_INTERVAL_SEC` / `_FULL_SCAN_EVERY` / `_TEAMS` | no | Autonomous supervisor (below). |
 | `SHADOW_IT_OUTLIER_PCT` | no | Outlier threshold as a fraction of a platform's hosts. Default `0.03`. |

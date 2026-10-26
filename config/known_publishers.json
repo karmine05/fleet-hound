@@ -4,8 +4,9 @@
     "Chrome/Brave/Vivaldi/Opera/Chromium: trusted ONLY by chrome_publisher_ids (the immutable",
     "Chrome Web Store publisher ID, 'u' + 32 hex, from the publisher link on the listing page).",
     "Display names are never trusted for Chrome-family stores: anyone can register a lookalike name.",
-    "Firefox/Edge/Safari: match_names are compared after normalization (case, punctuation, and",
-    "legal suffixes like Inc/LLC/Ltd/GmbH are ignored).",
+    "Firefox/Edge/Safari: only names listed in match_names are trusted (normalized: case, punctuation,",
+    "legal suffixes like Inc/LLC/Ltd/GmbH ignored). `name` alone is a label, never trusted. Leave",
+    "match_names empty for publishers verified only by Chrome ID; avoid short/generic aliases.",
     "Every entry needs name and added_at (ISO 8601 UTC). Invalid entries are skipped with a warning.",
     "Edits apply on the next extension scoring cycle; no rebuild or restart needed."
   ],
@@ -406,70 +407,57 @@
     },
     {
       "name": "eyeo",
-      "match_names": [
-        "eyeo"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "uea3afeea2b49701b04ae2130ec920743"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Adblock Plus"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Adblock Plus; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     },
     {
       "name": "Okta",
-      "match_names": [
-        "Okta"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "ub94b4d262bab132b7b011f95e88c8240"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Okta Browser Plugin"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Okta Browser Plugin; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     },
     {
       "name": "OpenAI",
-      "match_names": [
-        "OpenAI"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "u33f3849923dbb9495ad540f8634ab579"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via ChatGPT search"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via ChatGPT search; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     },
     {
       "name": "Postman",
-      "match_names": [
-        "Postman"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "uf3026ce02867f99debf9df0a4a91eb76"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Postman Interceptor"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Postman Interceptor; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     },
     {
       "name": "Electronic Frontier Foundation",
-      "match_names": [
-        "Electronic Frontier Foundation",
-        "EFF"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "uee155fce3653042847650b96a629f468"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Privacy Badger"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Privacy Badger; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     },
     {
       "name": "Kagi",
-      "match_names": [
-        "Kagi"
-      ],
+      "match_names": [],
       "chrome_publisher_ids": [
         "ua725dd00b4f4687b9914bb71bb96a4d0"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "added on operator request; Chrome Web Store publisher ID verified via Kagi Search"
+      "note": "added on operator request; Chrome Web Store publisher ID verified via Kagi Search; Chrome-ID-only: name not trusted on Firefox/Edge/Safari (store names are spoofable)"
     }
   ]
 }
