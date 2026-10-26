@@ -310,7 +310,7 @@ class _SharedStatus:
         self.last_error: Optional[str] = prior.get("last_error")
         self.cycles_total: int = int(prior.get("cycles_total", 0))
         self.cycles_failed: int = int(prior.get("cycles_failed", 0))
-        # Deliberately NOT flushing on __init__: with 4 gunicorn workers the
+        # Deliberately NOT flushing on __init__: with multiple gunicorn workers the
         # non-leaders would trample the leader's `running=True` write.
         # Only the leader calls flush_initial() after acquiring the lock.
 

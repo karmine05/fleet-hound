@@ -4,19 +4,17 @@
 # Brings up Memgraph + webviz, waits for both to report healthy, and surfaces
 # the OODA supervisor's view so the operator can confirm autonomy is wired up.
 #
+# Docker is the only supported deployment. Every Python command runs inside
+# the webviz container, never against a host virtualenv.
+#
 # Usage:
-#   ./start.sh              # boot stack, do not run host-side ETL
-#   ./start.sh --full-scan  # boot stack, then run a one-shot host ETL with the args passed through
+#   ./start.sh              # boot stack, leave ETL to the OODA supervisor
+#   ./start.sh --full-scan  # boot stack, then run one ETL pass inside webviz
 #   FOLLOW_LOGS=1 ./start.sh   # keep tailing logs after boot
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
-
-# Auto-activate virtual environment if it exists
-if [[ -d venv ]]; then
-    source venv/bin/activate
-fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()  { echo -e "${BLUE}ℹ️  $*${NC}"; }
@@ -52,14 +50,15 @@ fi
 
 # Read a small set of values from .env without exporting the whole file. Lets
 # us tell the operator what's about to happen and gate the OODA status check.
+# No `exit` on first match: Compose lets a later duplicate key win, so the
+# helper has to agree with it.
 read_env() {
-    awk -F= -v k="$1" '$0 !~ /^[[:space:]]*#/ && $1==k {sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' .env
+    awk -F= -v k="$1" '$0 !~ /^[[:space:]]*#/ && $1==k {sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); v=$0} END {print v}' .env
 }
 WEBVIZ_API_TOKEN_VAL="$(read_env WEBVIZ_API_TOKEN || true)"
 OODA_ENABLED_VAL="$(read_env OODA_ENABLED || true)"
-PORT_VAL="$(read_env PORT || echo 8080)"
-PORT_VAL="${PORT_VAL:-8080}"
-BASE_URL="http://127.0.0.1:${PORT_VAL}"
+# docker-compose.yml pins the published port to 8080 on loopback.
+BASE_URL="http://127.0.0.1:8080"
 MEMGRAPH_USER_VAL="$(read_env MEMGRAPH_USER || true)"
 MEMGRAPH_PASSWORD_VAL="$(read_env MEMGRAPH_PASSWORD || true)"
 
@@ -142,12 +141,12 @@ print(
     ok "Stack reachable"
 fi
 
-# --- Optional: pass-through to host CLI -----------------------------------
+# --- Optional: one ETL pass inside the container ---------------------------
 if [[ $# -gt 0 ]]; then
     echo
-    info "Running host-side ETL: python3 main.py $*"
-    if ! python3 main.py "$@"; then
-        warn "Host ETL exited non-zero. The container OODA loop will keep running."
+    info "Running ETL in the webviz container: python main.py $*"
+    if ! "${DOCKER_COMPOSE[@]}" exec -T webviz python main.py "$@"; then
+        warn "ETL exited non-zero. The container OODA loop will keep running."
     fi
 fi
 
@@ -165,14 +164,17 @@ echo "  Memgraph Bolt:    bolt://localhost:7687"
 echo
 echo "  Logs:             ${DOCKER_COMPOSE[*]} logs -f"
 echo "  Stop:             ./stop.sh"
-echo "  Wipe DB:          python3 clear_db.py --yes"
+echo "  Wipe DB:          ${DOCKER_COMPOSE[*]} exec webviz python clear_db.py --yes"
+echo
+echo "  ETL (one pass):   ${DOCKER_COMPOSE[*]} exec -T webviz python main.py"
+echo "  ETL (full):       ${DOCKER_COMPOSE[*]} exec -T webviz python main.py --full-scan"
 echo
 
 if [[ "${OODA_ENABLED_VAL:-false}" =~ ^([Tt]rue|1|[Yy]es|on)$ ]]; then
     info "OODA_ENABLED=true — webviz will drive ETL cycles autonomously."
     info "If this is the very first run, the first cycle will behave like --full-scan."
 else
-    warn "OODA_ENABLED is not true. Run host ETL manually with: python3 main.py"
+    warn "OODA_ENABLED is not true. Run one pass with: ${DOCKER_COMPOSE[*]} exec -T webviz python main.py"
 fi
 
 if [[ "${FOLLOW_LOGS:-0}" == "1" ]]; then

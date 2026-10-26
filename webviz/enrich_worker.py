@@ -197,7 +197,7 @@ class _SharedStatus:
         self.last_tick_iso: Optional[str] = prior.get("last_tick_iso")
         self.items_categorized_total: int = int(prior.get("items_categorized_total", 0))
         self.last_error: Optional[str] = prior.get("last_error")
-        # Deliberately NOT flushing on __init__: with 4 gunicorn workers the
+        # Deliberately NOT flushing on __init__: with multiple gunicorn workers the
         # non-leaders would trample the leader's `running=True` write.
         # Only the leader calls flush_initial() after acquiring the lock.
 
@@ -399,7 +399,7 @@ def fire_trigger(trigger_path: str = TRIGGER_PATH_DEFAULT,
                  *, cooldown_sec: float = 30.0) -> tuple[bool, float]:
     """Touch the trigger file iff outside the cooldown window.
 
-    Cooldown is enforced by the file's existing mtime, so all 4 gunicorn workers
+    Cooldown is enforced by the file's existing mtime, so all gunicorn workers
     share it. Returns (fired, retry_after_sec). retry_after_sec is 0 when fired,
     otherwise the seconds until cooldown expires.
     """

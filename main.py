@@ -9,6 +9,7 @@ The substantive work lives in `src/etl.py`. This file owns:
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,10 @@ from src.etl import ETLConfig, run_etl
 from src.extractor import FleetGraphExtractor
 
 
-STATE_FILE = '.state.json'
-SNAPSHOT_DIR = 'config/snapshots'
+# Docker runs webviz with a read-only rootfs, so the compose file points this
+# at the writable config mount. Host runs keep the historical repo-root file.
+STATE_FILE = os.environ.get('STATE_FILE', '.state.json')
+SNAPSHOT_DIR = os.environ.get('SNAPSHOT_DIR', 'config/snapshots')
 
 logger = logging.getLogger("fleethound.main")
 
@@ -78,7 +81,10 @@ def main() -> int:
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
 
-    env_vars = load_env_file('.env')
+    # Process environment wins over the file: inside Docker the values come
+    # from Compose (env_file + environment), and `.env` is not baked into the
+    # image. Host runs still work from the checkout's `.env`.
+    env_vars = {**load_env_file('.env'), **os.environ}
     if not env_vars and not Path('.env').exists() and Path('.env.example').exists():
         logger.warning(".env file not found; copy .env.example to .env first (`cp .env.example .env`)")
 
@@ -129,9 +135,12 @@ def main() -> int:
         ext = FleetGraphExtractor(fleet_url, token, verify=not insecure, debug=debug)
         hosts = ext.extract_host_data(team_ids=[], since=None, since_map={})
         if hosts:
-            with open('hosts_sample.json', 'w') as fh:
+            # Same directory as the watermark so it stays inside the writable
+            # config mount when a container runs this diagnostic.
+            sample_path = Path(STATE_FILE).parent / 'hosts_sample.json'
+            with open(sample_path, 'w') as fh:
                 json.dump(hosts[0], fh, indent=2)
-            logger.info("wrote hosts_sample.json (first host object)")
+            logger.info("wrote %s (first host object)", sample_path)
         else:
             logger.info("no hosts extracted")
         return 0

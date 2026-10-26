@@ -71,11 +71,14 @@ config.local.py
 secrets.py
 config/*
 
-# Test files
+# Test suite + debug pages stay local; they never ship to GitHub.
+tests/
+webviz/static/ping.html
+
+# Test artifacts
 .pytest_cache/
 .coverage
 htmlcov/
-tests/
 
 # Documentation builds
 docs/_build/

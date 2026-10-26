@@ -13,7 +13,8 @@
 | 3. Risk-scoring engine | `src/extension_intel.py::analyze_extension` (capability / trust / threat / exposure + name-anomaly + rarity + download rules; built-ins score 0; blocklist + ≥100k installs ⇒ ≥95) |
 | 4. Worker + API + UI | `webviz/extension_worker.py` (leader-elected, cached, status/trigger files), `/api/extensions[...]` in `webviz/app.py`, "Extensions" tab in `webviz/static/index.html` |
 
-Runnable self-check: `python3 src/extension_intel.py`. Phase-1+ items below (policy
+Runnable self-check (inside the container, so it uses the shipped code and env):
+`docker compose exec -T webviz python src/extension_intel.py`. Phase-1+ items below (policy
 export, threat feeds with keys, static analysis) are intentionally NOT built yet.
 
 ---

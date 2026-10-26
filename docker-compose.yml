@@ -79,6 +79,9 @@ services:
     environment:
       - MEMGRAPH_URI=bolt://memgraph:7687
       - PORT=8080
+      # The rootfs is read-only; ETL/ OODA watermarks live on the config mount.
+      # `docker compose exec webviz python main.py` inherits this.
+      - STATE_FILE=/app/config/.state.json
       # Optional Bolt auth — passes through from host env / .env file.
       - MEMGRAPH_USER
       - MEMGRAPH_PASSWORD

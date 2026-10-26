@@ -147,7 +147,7 @@ PUBLIC_PATHS = {"/api/health", "/"}
 # Configuration for persistence
 WHITELIST_FILE = '/app/config/whitelist.json'
 AUDIT_FILE = '/app/config/audit.log'
-SNAPSHOT_DIR = '/app/config/snapshots'
+SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", "/app/config/snapshots")
 
 # Enricher worker tunables (read once at import time).
 ENRICHER_ENABLED = _bool_env("ENRICHER_ENABLED", True)
@@ -165,7 +165,7 @@ except ValueError:
     ENRICHER_PARALLELISM = 4
 ENRICHER_LOCK_PATH = os.environ.get("ENRICHER_LOCK_PATH", "/tmp/fleet-hound-enricher.lock")
 ENRICHER_TRIGGER_PATH = os.environ.get("ENRICHER_TRIGGER_PATH", "/tmp/fleet-hound-enricher.trigger")
-# Status file lives under /app/config (the bind-mounted volume) so all 4
+# Status file lives under /app/config (the bind-mounted volume) so all
 # gunicorn workers see the same view AND items_categorized_total survives
 # container restarts.
 ENRICHER_STATUS_PATH = os.environ.get("ENRICHER_STATUS_PATH", "/app/config/enricher_status.json")
@@ -551,6 +551,32 @@ def _bounded_limit(default: int = 5000, hard_cap: int = 20000) -> int:
     except (TypeError, ValueError):
         limit = default
     return max(1, min(limit, hard_cap))
+
+
+def _normalize_whitelist(entries) -> list:
+    """Lowercased unique whitelist entries, preserving first-seen order."""
+    seen = set()
+    out = []
+    for raw in entries or []:
+        item = str(raw or "").strip().lower()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _whitelist_clause(alias: str = "s") -> str:
+    """Exclude software whose name or display_name is on the whitelist.
+
+    Operators authorize by the title they see (LastPass, Grammarly). After
+    extension_key identity, that title lives in display_name while `name`
+    is `ext:<store>:<id>`. Matching either keeps authorize working.
+    """
+    return (
+        f"AND NOT (toLower({alias}.name) IN $whitelist "
+        f"OR toLower(coalesce({alias}.display_name, '')) IN $whitelist)"
+    )
 
 
 @app.route("/api/hosts")
@@ -1071,8 +1097,11 @@ def search_all():
         # Search/load software
         if node_type in ['all', 'software']:
             if search_term:
-                # Search software by name
-                software_cond = get_search_condition('s.name', 'search_term')
+                # Search software by stable id (`name`) or human title.
+                software_cond = (
+                    f"({get_search_condition('s.name', 'search_term')} OR "
+                    f"{get_search_condition('coalesce(s.display_name, s.name)', 'search_term')})"
+                )
                 
                 software_query = f"""
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
@@ -1093,7 +1122,7 @@ def search_all():
 
                 software_query += """
                     WITH s, COUNT(DISTINCT h) as host_count
-                    RETURN s.name AS name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, host_count
+                    RETURN s.name AS name, coalesce(s.display_name, s.name) AS display_name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, host_count
                 """
                 if limit_param > 0:
                     software_query += f" LIMIT {cypher_limit}"
@@ -1117,10 +1146,10 @@ def search_all():
                 params.update(label_flt_params)
 
                 software_query += f"""
-                    WITH s.name AS name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, COUNT(DISTINCT h) AS host_count
+                    WITH s.name AS name, coalesce(s.display_name, s.name) AS display_name, s.last_version AS last_version, s.category AS category, s.wikidata_description AS description, COUNT(DISTINCT h) AS host_count
                     ORDER BY host_count DESC
                     LIMIT {cypher_limit}
-                    RETURN name, last_version, category, description, host_count
+                    RETURN name, display_name, last_version, category, description, host_count
                 """
                 software_result = session.run(software_query, **params)
 
@@ -1136,6 +1165,7 @@ def search_all():
                     nodes.append({
                         "id": software_id,
                         "name": record['name'],
+                        "display_name": record.get('display_name') or record['name'],
                         "type": "software",
                         "category": record.get('category'),
                         "description": record.get('description'),
@@ -1423,8 +1453,11 @@ def search_software():
             software_query = """
                 MATCH (s:Software)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT s.name AS name, s.last_version AS last_version
-                ORDER BY s.name
+                   OR toLower(coalesce(s.display_name, '')) CONTAINS toLower($search_term)
+                RETURN DISTINCT s.name AS name,
+                       coalesce(s.display_name, s.name) AS display_name,
+                       s.last_version AS last_version
+                ORDER BY coalesce(s.display_name, s.name)
             """
             software_result = session.run(software_query, search_term=search_term)
         else:
@@ -1434,19 +1467,25 @@ def search_software():
                 software_query = """
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                     WHERE toLower(h.platform) CONTAINS toLower($platform)
-                    WITH s.name AS name, s.last_version AS last_version, COUNT(DISTINCT h) AS host_count
+                    WITH s.name AS name,
+                         coalesce(s.display_name, s.name) AS display_name,
+                         s.last_version AS last_version,
+                         COUNT(DISTINCT h) AS host_count
                     ORDER BY host_count DESC
                     LIMIT 100
-                    RETURN name, last_version, host_count
+                    RETURN name, display_name, last_version, host_count
                 """
                 software_result = session.run(software_query, platform=platform_filter)
             else:
                 software_query = """
                     MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                    WITH s.name AS name, s.last_version AS last_version, COUNT(DISTINCT h) AS host_count
+                    WITH s.name AS name,
+                         coalesce(s.display_name, s.name) AS display_name,
+                         s.last_version AS last_version,
+                         COUNT(DISTINCT h) AS host_count
                     ORDER BY host_count DESC
                     LIMIT 100
-                    RETURN name, last_version, host_count
+                    RETURN name, display_name, last_version, host_count
                 """
                 software_result = session.run(software_query)
 
@@ -1467,6 +1506,7 @@ def search_software():
             nodes.append({
                 "id": software_id,
                 "name": record['name'],
+                "display_name": record.get('display_name') or record['name'],
                 "type": "software",
                 "details": f"Latest: {record['last_version'] or 'unknown'} (on {record.get('host_count', 0)} hosts)"
             })
@@ -1601,7 +1641,7 @@ def get_blast_radius():
 
     node_type = request.args.get('type')
     node_id = request.args.get('id')
-    team_filter = request.args.get('team', 'all')
+    team_filter = (request.args.get('team') or 'all').strip() or 'all'
     ignore_defaults = request.args.get('ignore_defaults', 'false').lower() == 'true'
 
     if not node_type or not node_id:
@@ -1827,14 +1867,15 @@ def get_blast_radius():
         # If we select a team, the impact is 1 team. 1/TotalTeams is small, but accurate.
         # This prevents "100% Team Impact" when filtering by a single team.
 
-        # Fetch Global Totals (ignoring filters)
+        # Fetch Global Totals (ignoring filters). Team membership lives on
+        # Host.team_id; there are no (:Team) nodes in this schema, so a
+        # MATCH (t:Team) here returned no row and every denominator silently
+        # fell back to 1.
         global_totals = session.run("""
             MATCH (h:Host)
-            WITH count(h) as total_hosts
+            WITH count(h) AS total_hosts, count(DISTINCT h.team_id) AS total_teams
             MATCH (u:User)
-            WITH total_hosts, count(u) as total_users
-            MATCH (t:Team)
-            RETURN total_hosts, total_users, count(t) as total_teams
+            RETURN total_hosts, total_teams, count(u) AS total_users
         """).single()
         
         # When normalizing:
@@ -2117,7 +2158,7 @@ def get_full_graph_data():
                 " WITH s, COUNT(DISTINCT h) AS host_count "
                 "ORDER BY host_count DESC "
                 "LIMIT 50 "
-                "RETURN s.name AS name, s.last_version AS last_version, "
+                "RETURN s.name AS name, coalesce(s.display_name, s.name) AS display_name, s.last_version AS last_version, "
                 "        s.category AS category, "
                 "        s.wikidata_description AS description, "
                 "        host_count"
@@ -2128,6 +2169,7 @@ def get_full_graph_data():
                 node_obj = {
                     "id": node_id,
                     "name": record['name'],
+                    "display_name": record.get('display_name') or record['name'],
                     "type": "software",
                     "details": f"Latest: {record['last_version'] or 'unknown'} (on {record['host_count']} hosts)",
                 }
@@ -2191,7 +2233,23 @@ def get_full_graph_data():
                 logger.info(f"Software links: {added_software_links} added")
 
             logger.info(f"Full graph API: Returning {len(nodes)} nodes and {len(links)} links")
-            return jsonify({"nodes": nodes, "links": links})
+            meta = {}
+            sample_raw = (request.args.get("sample") or "").strip()
+            if sample_raw:
+                try:
+                    sample_n = int(sample_raw)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "sample must be an integer"}), 400
+                if sample_n < 20 or sample_n > 300:
+                    return jsonify({"error": "sample must be between 20 and 300"}), 400
+                from webviz.graph_sample import sample_graph
+                nodes, links, meta = sample_graph(nodes, links, sample_n)
+                logger.info(
+                    "Full graph sample: kept %d/%d nodes, %d/%d links",
+                    len(nodes), meta.get("total_nodes"),
+                    len(links), meta.get("total_links"),
+                )
+            return jsonify({"nodes": nodes, "links": links, **meta})
 
     except TransientError as e:
         error_msg = str(e)
@@ -2239,7 +2297,10 @@ def get_software_hosts(software_name):
     with driver.session() as session:
         # Check if software exists
         software_check = session.run(
-            "MATCH (s:Software {name: $name}) RETURN s.name AS name, s.last_version AS last_version",
+            "MATCH (s:Software {name: $name}) "
+            "RETURN s.name AS name, "
+            "       coalesce(s.display_name, s.name) AS display_name, "
+            "       s.last_version AS last_version",
             name=software_name
         )
         software_data = software_check.single()
@@ -2254,6 +2315,7 @@ def get_software_hosts(software_name):
         nodes.append({
             "id": software_id,
             "name": software_name,
+            "display_name": software_data.get("display_name") or software_name,
             "type": "software",
             "details": f"Latest: {software_data['last_version'] or 'unknown'}"
         })
@@ -2439,8 +2501,10 @@ def get_host_software(hostname):
         # Get ALL software installed on this host
         software_result = session.run("""
             MATCH (s:Software)-[:INSTALLED_ON]->(h:Host {fleet_host_id: $fleet_host_id})
-            RETURN s.name AS name, s.last_version AS last_version
-            ORDER BY s.name
+            RETURN s.name AS name,
+                   coalesce(s.display_name, s.name) AS display_name,
+                   s.last_version AS last_version
+            ORDER BY coalesce(s.display_name, s.name)
         """, fleet_host_id=fleet_host_id)
 
         for record in software_result:
@@ -2448,6 +2512,7 @@ def get_host_software(hostname):
             nodes.append({
                 "id": software_id,
                 "name": record['name'],
+                "display_name": record.get('display_name') or record['name'],
                 "type": "software",
                 "details": f"Latest: {record['last_version'] or 'unknown'}"
             })
@@ -2577,7 +2642,7 @@ def authorize_software():
                 "message": "software_name must be <= 500 characters",
             }), 400
             
-        whitelist = load_whitelist()
+        whitelist = _normalize_whitelist(load_whitelist())
         if software_name not in whitelist:
             whitelist.append(software_name)
             save_whitelist(whitelist)
@@ -2763,7 +2828,7 @@ def get_shadow_it():
         detection_id_counter = 1
         
         # Load whitelist
-        whitelist = load_whitelist()
+        whitelist = _normalize_whitelist(load_whitelist())
         
         # Build team and platform filters
         team_clause = ""
@@ -2784,10 +2849,8 @@ def get_shadow_it():
             filter_params['platform'] = platform_filter
 
         if whitelist:
-            whitelist_clause = "AND NOT s.name IN $whitelist"
-            # Graph names are lowercased at ingestion; normalize legacy
-            # mixed-case entries so the exclusion actually matches.
-            filter_params['whitelist'] = [w.lower() for w in whitelist]
+            whitelist_clause = _whitelist_clause("s")
+            filter_params['whitelist'] = whitelist
 
         filter_params.update(label_flt_params)
         
@@ -2796,16 +2859,18 @@ def get_shadow_it():
             outlier_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause} {label_clause}
-                WITH s.name AS software_name, s.last_version AS version,
+                WITH s.name AS software_name,
+                     coalesce(s.display_name, s.name) AS display_name,
+                     s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts,
                      COLLECT(DISTINCT h.platform) AS platforms
                 WHERE host_count <= $outlier_threshold
-                RETURN software_name, version, host_count, hosts, platforms,
+                RETURN software_name, display_name, version, host_count, hosts, platforms,
                        db_category, db_desc, db_sources
-                ORDER BY host_count ASC, software_name ASC
+                ORDER BY host_count ASC, display_name ASC
             """
             
             # Add outlier_threshold to filter_params
@@ -2864,6 +2929,7 @@ def get_shadow_it():
                     detections.append({
                         "id": f"outlier_{detection_id_counter}",
                         "software_name": record['software_name'],
+                        "display_name": record.get('display_name') or record['software_name'],
                         "software_type": software_type,
                         "risk_level": risk_level,
                         "category": "Outlier Software",
@@ -2887,13 +2953,15 @@ def get_shadow_it():
             all_software_query = f"""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE 1=1 {team_clause} {platform_clause} {whitelist_clause} {label_clause}
-                WITH s.name AS software_name, s.last_version AS version,
+                WITH s.name AS software_name,
+                     coalesce(s.display_name, s.name) AS display_name,
+                     s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts,
                      COLLECT(DISTINCT h.platform) AS platforms
-                RETURN software_name, version, host_count, hosts, platforms,
+                RETURN software_name, display_name, version, host_count, hosts, platforms,
                        db_category, db_desc, db_sources
             """
             
@@ -2901,6 +2969,7 @@ def get_shadow_it():
 
             for record in result:
                 software_lower = record['software_name'].lower()
+                display_lower = (record.get('display_name') or record['software_name']).lower()
                 db_categories = record.get('db_category') or []
                 db_sources = record.get('db_sources') or []
 
@@ -2926,12 +2995,12 @@ def get_shadow_it():
                     if matched_category:
                         break
 
-                # 2. Fallback: word-boundary match on software name. Plain
-                # substring match is unsafe (libreadline8 -> 'line').
+                # 2. Fallback: word-boundary match on software name or title.
+                # Plain substring match is unsafe (libreadline8 -> 'line').
                 if not matched_category:
                     for category, patterns in HIGH_RISK_PATTERNS.items():
                         for pattern in patterns:
-                            if _word_match(pattern, software_lower):
+                            if _word_match(pattern, software_lower) or _word_match(pattern, display_lower):
                                 matched_category = category
                                 break
                         if matched_category:
@@ -2984,6 +3053,7 @@ def get_shadow_it():
                         detections.append({
                             "id": f"highrisk_{detection_id_counter}",
                             "software_name": record['software_name'],
+                            "display_name": record.get('display_name') or record['software_name'],
                             "software_type": software_type,
                             "risk_level": risk_level,
                             "category": matched_category,
@@ -3007,6 +3077,7 @@ def get_shadow_it():
                   AND s.last_version <> ''
                   {team_clause} {platform_clause} {whitelist_clause} {label_clause}
                 WITH s.name AS software_name,
+                     coalesce(s.display_name, s.name) AS display_name,
                      s.category AS db_category,
                      s.sources AS db_sources,
                      COUNT(DISTINCT s.last_version) AS version_count,
@@ -3014,7 +3085,7 @@ def get_shadow_it():
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts
                 WHERE version_count > 2
-                RETURN software_name, db_category, db_sources, version_count, versions, host_count, hosts
+                RETURN software_name, display_name, db_category, db_sources, version_count, versions, host_count, hosts
                 ORDER BY version_count DESC
                 LIMIT 20
             """
@@ -3073,6 +3144,7 @@ def get_shadow_it():
                     detections.append({
                         "id": f"sprawl_{detection_id_counter}",
                         "software_name": record['software_name'],
+                        "display_name": record.get('display_name') or record['software_name'],
                         "software_type": software_type,
                         "risk_level": risk_level,
                         "category": "Version Management",
@@ -3444,13 +3516,26 @@ def get_correlate():
 
 @app.route("/api/snapshots")
 def list_snapshots_route():
-    """List available graph snapshots (newest first)."""
+    """List available graph snapshots (newest first).
+
+    `?limit=<n>` is optional (default 100, cap 500). The Overview asks for 8,
+    Changes asks for 60; callers that omit it keep the old behaviour.
+    """
     try:
         from src.snapshot import list_snapshots as _ls
     except Exception as exc:
         logger.error("snapshot module unavailable: %s", exc)
         return jsonify([])
     items = _ls(Path(SNAPSHOT_DIR))
+    limit_raw = (request.args.get("limit") or "").strip()
+    if limit_raw:
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer"}), 400
+        if limit < 1:
+            return jsonify({"error": "limit must be positive"}), 400
+        items = items[: min(limit, 500)]
     # Caller doesn't need the absolute path; expose ts + counts.
     return jsonify([
         {
@@ -3521,7 +3606,7 @@ def get_diff():
 # Each gunicorn worker tries to claim the lock at boot. Only the holder runs
 # the enrichment loop. Other workers fall through. Status is mirrored to a
 # JSON file under /app/config and triggers travel via a tmpfs file mtime, so
-# the four worker views are coherent regardless of which one handles a given
+# the worker views are coherent regardless of which one handles a given
 # /api request.
 _ENRICHER_STOP = None
 _ENRICHER_INIT_DONE = False

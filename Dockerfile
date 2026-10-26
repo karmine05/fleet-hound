@@ -12,6 +12,7 @@ COPY webviz/ ./webviz/
 # snapshot.diff API + enrich_worker import these from /app at runtime.
 COPY src/ ./src/
 COPY categorize_software.py ./categorize_software.py
+COPY clear_db.py ./clear_db.py
 COPY main.py ./main.py
 
 # Config dir is mounted as a volume in docker-compose; pre-create + own it so

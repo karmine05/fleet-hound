@@ -62,7 +62,8 @@ if [[ "$PURGE" -eq 1 ]]; then
     #
     # Preserves ./config/memgraph.conf — that's config, not state.
     purge_paths=(
-        # Host-side runtime state (when ETL is invoked from the host with `python3 main.py`).
+        # Legacy host-side state (pre-Docker runs). Kept so an old checkout
+        # purges completely; current ETL runs inside the container.
         "./.state.json"
         "./.etl.lock"
         # Container-side runtime state (bind-mounted from ./config).
@@ -98,9 +99,9 @@ fi
 ok "Stack stopped"
 echo
 if [[ "$PURGE" -eq 1 ]]; then
-    info "Volumes + host-side state were dropped. Run a host-side --full-scan after restart, or rely on the OODA loop's first-cycle full-scan behavior."
+    info "Volumes + host-side state were dropped. ./start.sh --full-scan re-baselines, or the OODA loop's first cycle does it automatically."
 else
     info "Volumes preserved."
     info "  Restart:        ./start.sh"
-    info "  Wipe data:      ./stop.sh --purge   (or: python3 clear_db.py --yes while running)"
+    info "  Wipe data:      ./stop.sh --purge   (or: docker compose exec -T webviz python clear_db.py --yes while running)"
 fi
