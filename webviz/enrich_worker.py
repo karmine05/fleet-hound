@@ -326,7 +326,6 @@ def _loop(driver_provider, status: _SharedStatus, *,
                     break
                 time.sleep(_TRIGGER_POLL_SEC)
     finally:
-        http.close()
         status.update(running=False)
         logger.info("enricher: loop exited")
 

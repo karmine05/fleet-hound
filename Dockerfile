@@ -45,6 +45,7 @@ CMD ["gunicorn", \
      "--worker-class", "sync", \
      "--timeout", "120", \
      "--graceful-timeout", "30", \
+     "--no-control-socket", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "webviz.app:app"]
