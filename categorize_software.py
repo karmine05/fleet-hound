@@ -292,8 +292,32 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
         return EnrichResult.MISS, None
 
     categories = infer_categories_from_description(description, extract)
-    short_extract = extract.split('. ')[0] if extract else description
+    short_extract = _first_sentence(extract) if extract else description
     return EnrichResult.HIT, (categories, short_extract or description)
+
+# Abbreviations whose period is usually followed by a capitalized word mid-
+# sentence ("Dr. Smith", "e.g. Linux"). Company suffixes are deliberately
+# absent: "Inc. is" never splits (lowercase follows) and "Inc. It" really
+# does end the sentence.
+_ABBREVIATIONS = frozenset({
+    "jr", "sr", "st", "dr", "mr", "mrs", "ms", "vs", "etc", "no", "approx",
+    "e.g", "i.e", "u.s", "u.k",
+})
+
+
+def _first_sentence(text: str, limit: int = 300) -> str:
+    """First sentence of a Wikipedia extract, without splitting on "Inc." or
+    initials ("J. R."). A period ends a sentence only when followed by
+    whitespace and an uppercase letter, digit or opening quote/paren."""
+    text = " ".join((text or "").split())
+    for m in re.finditer(r"\.(?=\s+[A-Z0-9\"'(])", text):
+        word = re.search(r"([\w.]+)$", text[:m.start()])
+        token = word.group(1).lower() if word else ""
+        if token in _ABBREVIATIONS or len(token) == 1:
+            continue
+        return text[:m.end()]
+    return text[:limit]
+
 
 def purge_non_software_descriptions(driver, dry_run: bool = False) -> list:
     """Clear Wikipedia enrichments written before the _SOFTWARE_HINT_RE gate
