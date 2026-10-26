@@ -90,13 +90,18 @@ WIKIPEDIA_REST_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
 
 # A Wikipedia summary counts as a hit only if it mentions one of these.
 _SOFTWARE_HINT_RE = re.compile(
-    r"\b(software|application|app|apps|program|programs|utility|utilities|tool|tools|"
-    r"toolkit|library|framework|browser|editor|client|server|daemon|shell|terminal|"
-    r"command[- ]line|package|plug-?in|extension|operating system|database|compiler|"
-    r"interpreter|programming language|ide|sdk|api|emulator|video game|messaging|"
-    r"messenger|driver|firmware|codec|open[- ]source|freeware|proprietary|"
-    r"vpn|antivirus|password manager|cloud-based|web-based|communication platform|"
-    r"collaboration)\b",
+    r"\b(software|application|apps?|programs?|utilit(y|ies)|tools?|toolkit|librar(y|ies)|"
+    r"framework|browser|editors?|clients?|servers?|daemon|shell|terminal|"
+    r"command[- ]line|(linux|unix|shell) command|packages?|plug-?ins?|extensions?|"
+    r"operating system|database|compiler|interpreter|"
+    r"(programming|scripting|markup|query) language|ide|sdk|api|emulator|scanner|"
+    r"messaging|messenger|driver|firmware|codec|compression|file formats?|typesetting|"
+    r"graphics|open[- ]source|freeware|proprietary|vpn|antivirus|password manager|"
+    r"cloud-based|web-based|web conferencing|communication (platform|service)|"
+    r"online service|digital distribution|chatbot|generative artificial intelligence|"
+    r"collaboration|"
+    r"(video|computer|online|puzzle|indie|programming|simulation|survival|strategy|"
+    r"roguelike|deck-building) game)\b",
     re.IGNORECASE,
 )
 
@@ -289,6 +294,35 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
     categories = infer_categories_from_description(description, extract)
     short_extract = extract.split('. ')[0] if extract else description
     return EnrichResult.HIT, (categories, short_extract or description)
+
+def purge_non_software_descriptions(driver, dry_run: bool = False) -> list:
+    """Clear Wikipedia enrichments that fail the _SOFTWARE_HINT_RE gate.
+
+    Enrichments written before the gate existed include unrelated articles
+    ("chromium" -> the element, "ruby" -> the gemstone). Clears category and
+    description and stamps a categorization attempt, so the cooldown keeps
+    the enricher from re-fetching the same wrong page right away. Catalog
+    entries are curated and kept. Idempotent; returns the cleared names.
+    """
+    with driver.session() as session:
+        rows = session.run(
+            "MATCH (s:Software) WHERE s.wikidata_description IS NOT NULL "
+            "RETURN s.name AS name, s.wikidata_description AS description"
+        ).data()
+        names = [
+            r["name"] for r in rows
+            if catalog_lookup(r["name"]) is None
+            and not _SOFTWARE_HINT_RE.search(r["description"] or "")
+        ]
+        if names and not dry_run:
+            session.run(
+                "UNWIND $names AS n MATCH (s:Software {name: n}) "
+                "SET s.category = NULL, s.wikidata_description = NULL, "
+                "    s.last_categorized = NULL, s.last_categorization_attempt_iso = $now",
+                names=names, now=datetime.now(timezone.utc).isoformat(),
+            ).consume()
+    return names
+
 
 def run_query_with_retry(session, query, params, max_retries=3):
     for attempt in range(max_retries):
