@@ -371,12 +371,15 @@ def _resolve_etl_config(memgraph_uri: str, *,
         logger.error("ooda: no Fleet credentials (FLEET_API_TOKEN or FLEET_EMAIL+FLEET_PASSWORD)")
         return None
 
-    team_ids: list[int] = []
-    if teams_raw:
-        try:
-            team_ids = [int(x.strip()) for x in teams_raw.split(",") if x.strip()]
-        except ValueError:
-            logger.warning("ooda: OODA_TEAMS is not a comma-separated integer list; ignoring")
+    try:
+        team_ids = sorted({int(x.strip()) for x in teams_raw.split(",") if x.strip()})
+    except ValueError:
+        logger.error("ooda: OODA_TEAMS is not a comma-separated integer list — cannot run cycle")
+        return None
+    if not team_ids:
+        # Never default to every team; the operator must choose the scope.
+        logger.error("ooda: OODA_TEAMS is empty — set the Fleet team IDs to scan")
+        return None
 
     return ETLConfig(
         fleet_url=fleet_url,

@@ -370,8 +370,8 @@ class FleetGraphExtractor:
         (NOT hostname) so osquery host renames don't churn the membership
         hash.
 
-        Returns an empty list on any HTTP failure; the caller should treat
-        that as "skip this label this cycle" and not propagate the failure.
+        Returns None on any HTTP failure; the caller should treat that as
+        "skip this label this cycle" (an empty list would wipe its edges).
         """
         members = []
         page = 0
@@ -387,13 +387,13 @@ class FleetGraphExtractor:
                         "/labels/%s/hosts failed status=%s",
                         label_id, resp.status_code if resp else "no-resp",
                     )
-                return []
+                return None
             try:
                 data = resp.json()
             except ValueError:
                 if self.debug:
                     logger.warning("failed to parse /labels/%s/hosts JSON", label_id)
-                return []
+                return None
             page_hosts = data.get('hosts', [])
             members.extend(page_hosts)
             if len(page_hosts) < per_page:

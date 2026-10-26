@@ -49,29 +49,41 @@ def str_to_bool(value: str) -> bool:
     return value.lower() in ('true', '1', 'yes', 'on')
 
 
-def _interactive_team_select(fleet_url: str, token: str, insecure: bool, debug: bool) -> list[int]:
+def _parse_team_ids(raw: str) -> list[int]:
+    """Parse '1,2' into [1, 2]. Raises ValueError on non-integers."""
+    return sorted({int(x.strip()) for x in raw.split(',') if x.strip()})
+
+
+def _list_teams(fleet_url: str, token: str, insecure: bool, debug: bool) -> list[dict]:
     extractor = FleetGraphExtractor(fleet_url, token, verify=not insecure, debug=debug)
-    logger.info("fetching teams")
-    teams = extractor.extract_teams()
-    if not teams:
-        logger.info("no teams found or insufficient permissions; fetching ALL data")
-        return []
+    return extractor.extract_teams() or []
+
+
+def _print_teams(teams: list[dict]) -> None:
     print("\nAvailable teams:")
-    print(f"   {'[0]':<6} No Team (Unassigned)")
+    print(f"   {'[0]':<8} No team (unassigned hosts)")
     for t in teams:
-        tid = t.get('id', '?')
-        tname = t.get('name', 'Unknown')
-        print(f"   [{tid}]:   {tname}")
-    print("\nSelect teams by ID (comma-separated, e.g. '1,2') or press ENTER for ALL:")
-    selection = input("   > ").strip()
-    if not selection:
-        logger.info("no specific teams selected; fetching ALL data")
-        return []
-    try:
-        return list({int(x.strip()) for x in selection.split(',') if x.strip()})
-    except ValueError:
-        logger.warning("invalid team input; fetching ALL teams")
-        return []
+        print(f"   [{t.get('id', '?')}]".ljust(11) + f" {t.get('name', 'Unknown')}")
+
+
+def _interactive_team_select(teams: list[dict]) -> list[int]:
+    """Prompt until the operator names at least one valid team. No 'all' default."""
+    valid = {0} | {int(t['id']) for t in teams if t.get('id') is not None}
+    _print_teams(teams)
+    while True:
+        print("\nSelect team IDs to scan (comma-separated, e.g. '1,2'):")
+        try:
+            picked = _parse_team_ids(input("   > "))
+        except ValueError:
+            print("   team IDs must be integers")
+            continue
+        unknown = [t for t in picked if t not in valid]
+        if not picked:
+            print("   at least one team is required")
+        elif unknown:
+            print(f"   unknown team IDs: {unknown}")
+        else:
+            return picked
 
 
 def main() -> int:
@@ -100,7 +112,7 @@ def main() -> int:
     parser.add_argument('--insecure', action='store_true', help='Disable TLS verification (dev only)')
     parser.add_argument('--debug-auth', action='store_true', help='Print auth diagnostics')
     parser.add_argument('--dump-host-sample', action='store_true', help='Write first host object to hosts_sample.json then exit')
-    parser.add_argument('--teams', help="Comma-separated Team IDs (e.g. '1,2'). Default: all teams.")
+    parser.add_argument('--teams', help="Comma-separated Team IDs (e.g. '1,2'). Required unless OODA_TEAMS is set; prompts on a TTY.")
     parser.add_argument('--full-scan', action='store_true', help='Ignore last run timestamp and refetch everything')
     parser.add_argument('--complete-enrichment', action='store_true', help='Enrich ALL uncategorized software (slow)')
     parser.add_argument('--enrich-software', help='Comma-separated software names to enrich immediately')
@@ -121,49 +133,52 @@ def main() -> int:
         logger.error("provide FLEET_API_TOKEN (preferred) or FLEET_EMAIL+FLEET_PASSWORD in .env")
         return 1
 
+    # Resolve the Fleet token once: team listing and --dump-host-sample need it.
+    def _token() -> str | None:
+        if api_token:
+            return api_token
+        from src.auth import FleetAuthenticator
+        auth = FleetAuthenticator(fleet_url, verify=not insecure)
+        return auth.login(email, password, debug=debug)
+
+    # Team scope is mandatory: never fall back to scanning every team.
+    teams_raw = args.teams or env_vars.get('OODA_TEAMS', '')
+    try:
+        team_ids = _parse_team_ids(teams_raw)
+    except ValueError:
+        logger.error("--teams / OODA_TEAMS must be comma-separated integers")
+        return 1
+    if not team_ids:
+        tok = _token()
+        if not tok:
+            logger.error("login failed")
+            return 1
+        teams = _list_teams(fleet_url, tok, insecure, debug)
+        if sys.stdin.isatty():
+            team_ids = _interactive_team_select(teams)
+        else:
+            _print_teams(teams)
+            logger.error("no teams selected; pass --teams or set OODA_TEAMS")
+            return 1
+
     # --dump-host-sample bypasses the full ETL — keep it as a thin diagnostic.
     if args.dump_host_sample:
-        from src.auth import FleetAuthenticator
-        if api_token:
-            token = api_token
-        else:
-            auth = FleetAuthenticator(fleet_url, verify=not insecure)
-            token = auth.login(email, password, debug=debug)
-            if not token:
-                logger.error("login failed")
-                return 1
-        ext = FleetGraphExtractor(fleet_url, token, verify=not insecure, debug=debug)
-        hosts = ext.extract_host_data(team_ids=[], since=None, since_map={})
-        if hosts:
+        tok = _token()
+        if not tok:
+            logger.error("login failed")
+            return 1
+        ext = FleetGraphExtractor(fleet_url, tok, verify=not insecure, debug=debug)
+        first_page = next(ext.extract_host_pages(team_ids=team_ids, since=None, since_map={}), [])
+        if first_page:
             # Same directory as the watermark so it stays inside the writable
             # config mount when a container runs this diagnostic.
             sample_path = Path(STATE_FILE).parent / 'hosts_sample.json'
             with open(sample_path, 'w') as fh:
-                json.dump(hosts[0], fh, indent=2)
+                json.dump(first_page[0], fh, indent=2)
             logger.info("wrote %s (first host object)", sample_path)
         else:
             logger.info("no hosts extracted")
         return 0
-
-    team_ids: list[int] = []
-    if args.teams:
-        try:
-            team_ids = [int(t.strip()) for t in args.teams.split(',') if t.strip()]
-        except ValueError:
-            logger.error("--teams must be comma-separated integers")
-            return 1
-    elif sys.stdin.isatty() and not args.full_scan:
-        # Interactive selection requires an authenticated extractor.
-        if api_token:
-            tok = api_token
-        else:
-            from src.auth import FleetAuthenticator
-            auth = FleetAuthenticator(fleet_url, verify=not insecure)
-            tok = auth.login(email, password, debug=debug)
-            if not tok:
-                logger.error("login failed")
-                return 1
-        team_ids = _interactive_team_select(fleet_url, tok, insecure, debug)
 
     target_names = (
         [n.strip() for n in args.enrich_software.split(',')] if args.enrich_software else None
@@ -202,7 +217,7 @@ def main() -> int:
     elif result.snapshot_error:
         logger.warning("snapshot: %s", result.snapshot_error)
     logger.info("duration elapsed=%.1fs", result.duration_sec)
-    logger.info("synced teams=%s", result.teams_synced or "all")
+    logger.info("synced teams=%s", result.teams_synced)
     logger.info("dashboard url=http://localhost:8080")
     return 0
 

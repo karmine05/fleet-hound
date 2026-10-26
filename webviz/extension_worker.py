@@ -359,7 +359,12 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
         if blocklist:
             _cache_set(cache_dir, "mozilla:blocklist", blocklist)
         else:
-            blocklist = {}
+            # Fetch failed: an expired list beats none. Scoring with {} drops
+            # known-bad extensions below their risk floor for a full refresh window.
+            blocklist = _cache_get(cache_dir, "mozilla:blocklist", float("inf"))
+            if not isinstance(blocklist, dict):
+                raise RuntimeError("Mozilla blocklist unavailable and no cached copy; skipping cycle")
+            logger.warning("extension worker: blocklist fetch failed; using stale cache")
 
     scored = 0
     errors = 0
@@ -393,7 +398,7 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
 
     remaining = 0
     try:
-        remaining = len(_pick_stale(driver, 10_000, time.time() - REFRESH_INTERVAL_SEC))
+        remaining = queue_remaining(driver)
     except Exception:
         pass
 

@@ -135,7 +135,9 @@ def derive_extension_identity(software: dict) -> dict | None:
         source, name, display_name, installed_paths
     )
     if ext_id:
-        extension_key = f"ext:{store}:{ext_id}"
+        # Lowercase: ingestion lowercases Software.name, and name == extension_key
+        # for extensions, so a mixed-case key would churn nodes every cycle.
+        extension_key = f"ext:{store}:{ext_id}".lower()
     else:
         # Stable fallback for malformed data. The store lookup is skipped, but
         # the inventory row still exists and can be reviewed.

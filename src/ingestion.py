@@ -741,7 +741,9 @@ class MemgraphIngestion:
                 h.last_ingest_iso = host.last_ingest_iso,
                 h.last_software_sync_iso = NULL
         """
-        self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch")
+        if not self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch"):
+            # Hold the watermark so these hosts are re-fetched next cycle.
+            self.failed_software_host_ids.extend(h['fleet_host_id'] for h in host_batch)
 
     def _batch_create_user_relationships(self, session, user_rel_batch):
         """Batch create user-host relationships using UNWIND.
@@ -761,7 +763,8 @@ class MemgraphIngestion:
             SET u.email = rel.email, u.fullname = rel.fullname
             MERGE (u)-[:USES]->(h)
         """
-        self._execute_with_retry(session, query, {'rels': user_rel_batch}, "create user relationship batch")
+        if not self._execute_with_retry(session, query, {'rels': user_rel_batch}, "create user relationship batch"):
+            self.failed_software_host_ids.extend({r['fleet_host_id'] for r in user_rel_batch})
 
     def _extract_user_identifiers(self, host):
         """Extract user identifiers from host data.
@@ -1378,7 +1381,11 @@ class MemgraphIngestion:
                     stats.errors.append(f"label without id: {lbl.get('name')!r}")
                     continue
                 stats.labels_seen += 1
-                member_ids = member_map.get(fleet_id, [])
+                if fleet_id not in member_map:
+                    # Membership fetch failed this cycle; keep existing edges.
+                    stats.labels_unchanged += 1
+                    continue
+                member_ids = member_map[fleet_id]
                 changed, edges_added, edges_removed, orphans_count = self._sync_single_label_membership(
                     session, fleet_id, member_ids, now_iso,
                 )
@@ -2014,7 +2021,8 @@ class MemgraphIngestion:
         return stats
 
     def reap_stale_hosts(self, now_iso: "str | None" = None,
-                          reap_age_seconds: int = 604800) -> dict:
+                          reap_age_seconds: int = 604800,
+                          team_ids: "list[int] | None" = None) -> dict:
         """DETACH DELETE :Host nodes whose last_ingest_iso is older than cutoff.
 
         Signal: every successful host MERGE refreshes `last_ingest_iso`. If a
@@ -2048,8 +2056,9 @@ class MemgraphIngestion:
                 "MATCH (h:Host) "
                 "WHERE h.last_ingest_iso IS NOT NULL "
                 "  AND h.last_ingest_iso < $cutoff "
+                "  AND ($teams IS NULL OR coalesce(h.team_id, 0) IN $teams) "
                 "RETURN count(h) AS n",
-                cutoff=cutoff,
+                cutoff=cutoff, teams=list(team_ids) if team_ids else None,
             ).single()
             reaped = int(rec['n']) if rec else 0
             if reaped > 0:
@@ -2057,8 +2066,9 @@ class MemgraphIngestion:
                     "MATCH (h:Host) "
                     "WHERE h.last_ingest_iso IS NOT NULL "
                     "  AND h.last_ingest_iso < $cutoff "
+                    "  AND ($teams IS NULL OR coalesce(h.team_id, 0) IN $teams) "
                     "DETACH DELETE h",
-                    cutoff=cutoff,
+                    cutoff=cutoff, teams=list(team_ids) if team_ids else None,
                 )
             stats['reaped'] = reaped
         return stats
