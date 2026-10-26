@@ -3070,18 +3070,30 @@ def get_shadow_it():
                         detection_id_counter += 1
         
         # ===== DETECTION 3: Version Sprawl (multiple versions of same software) =====
+        #
+        # Count distinct versions across the INSTALLED_ON EDGES (r.version = the
+        # version running on each host at last sync), NOT the node's
+        # s.last_version. s.last_version is a SINGLE node property (the max seen
+        # so far), so `COUNT(DISTINCT s.last_version)` can only ever be 1 per
+        # software and this detector would never fire. r.version is refreshed on
+        # every sync and stale rels are pruned, so it reflects the live
+        # per-host version distribution — which is exactly what "sprawl" means.
+        # The 'unknown' sentinel (ingestion default when Fleet reports no
+        # version) is excluded so a host with missing version data can't be
+        # mistaken for a distinct installed version.
         if detection_type_filter in ['all', 'version_sprawl']:
             version_sprawl_query = f"""
-                MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
-                WHERE s.last_version IS NOT NULL
-                  AND s.last_version <> ''
+                MATCH (s:Software)-[r:INSTALLED_ON]->(h:Host)
+                WHERE r.version IS NOT NULL
+                  AND r.version <> ''
+                  AND r.version <> 'unknown'
                   {team_clause} {platform_clause} {whitelist_clause} {label_clause}
                 WITH s.name AS software_name,
                      coalesce(s.display_name, s.name) AS display_name,
                      s.category AS db_category,
                      s.sources AS db_sources,
-                     COUNT(DISTINCT s.last_version) AS version_count,
-                     COLLECT(DISTINCT s.last_version) AS versions,
+                     COUNT(DISTINCT r.version) AS version_count,
+                     COLLECT(DISTINCT r.version) AS versions,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts
                 WHERE version_count > 2
