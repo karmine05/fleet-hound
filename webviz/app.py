@@ -13,50 +13,10 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
 from neo4j import GraphDatabase
-from neo4j.exceptions import AuthError, ClientError, ServiceUnavailable, TransientError
-
-# Host-filter helper (plan section 2A). Single source of truth for the
-# `?team=`, `?platform=`, `?labels=A,B&label_op=AND|OR` query-string contract
-# previously duplicated across ~6 endpoints. New scoping endpoints should
-# import from here rather than recreate the if-platform-then-AND pattern.
-from webviz.host_filters import (
-    FilterValidationError,
-    apply_composite_filter,
-    apply_host_filters,
-    apply_label_filter,
-    merge_filter_params,
-)
-from webviz.hostname_utils import (
-    disambiguated_display_name,
-    # Aliased so call sites can keep their local `hostname_counts` variable
-    # name without shadowing the helper.
-    hostname_counts as _hostname_counts,
-)
-
-# Shadow IT filter primitives (shared with categorize_software.py).
-# Pre-2026-05-07 these lived inline in this file; extracting to
-# src/shadow_it_filter.py let categorize_software.py reuse the same rules
-# for enrichment-candidate selection (so Wikidata stops getting hammered
-# with system-package lookups it has zero chance of resolving).
-from src.shadow_it_filter import (
-    DEV_LANGUAGE_SOURCES as _DEV_LANGUAGE_SOURCES,
-    EXTENSION_SOURCES as _EXTENSION_SOURCES,
-    MIN_OUTLIER_HOSTS as _MIN_OUTLIER_HOSTS,
-    SHADOW_IT_SOURCES as _SHADOW_IT_SOURCES,  # noqa: F401  (used by future endpoints)
-    SYSTEM_CATEGORY_TOKENS as _SYSTEM_CATEGORY_TOKENS,
-    SYSTEM_PACKAGE_RE as _SYSTEM_PACKAGE_RE,
-    USER_APP_SOURCES as _USER_APP_SOURCES,
-    classify_extension_type as _classify_extension_type,
-    compute_per_platform_thresholds as _compute_per_platform_thresholds,
-    get_outlier_pct as _get_outlier_pct,
-    has_user_app_source as _has_user_app_source,  # noqa: F401  (used by future endpoints)
-    is_non_app_source as _is_non_app_source,
-    is_system_package as _is_system_package,
-)
+from neo4j.exceptions import AuthError, ClientError, ServiceUnavailable
 
 # /app on the container has webviz/, src/, categorize_software.py side by side
 # (Dockerfile copies them all). Make /app importable for `from src.snapshot import …`
@@ -85,6 +45,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static')
+# Revalidate static files (ETag -> cheap 304) so a deploy never serves a
+# stale app.js/app.css from heuristic browser caching.
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 
 # ----------------------------------------------------------------------------
@@ -274,11 +237,8 @@ if _bool_env("INSECURE", False) and OODA_ENABLED:
 # running outlier / high-risk / version-sprawl detection.
 # ---------------------------------------------------------------------------
 
-# Shadow IT filter primitives now live in src/shadow_it_filter.py and are
-# imported above as _SYSTEM_PACKAGE_RE / _SYSTEM_CATEGORY_TOKENS /
-# _DEV_LANGUAGE_SOURCES / _EXTENSION_SOURCES / _USER_APP_SOURCES /
-# _is_non_app_source / _is_system_package. Single source of truth shared
-# with categorize_software.py.
+# Shadow IT filter primitives live in src/shadow_it_filter.py (shared with
+# categorize_software.py); the shadow_it blueprint imports them directly.
 
 
 def _word_match(pattern: str, text_lower: str) -> bool:
@@ -538,10 +498,19 @@ def _enforce_auth():
 
 @app.after_request
 def _security_headers(response):
-    # Conservative defaults safe for an SPA that serves a single inline-JS HTML.
+    # Conservative defaults for the SPA (index.html + /static assets).
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-Frame-Options", "DENY")
+    # All script/style lives in /static (no inline script or on* handlers),
+    # so an injected <script> or attribute handler cannot run. Inline style
+    # attributes stay allowed: the UI builds markup with style="..." widely.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    )
     return response
 
 

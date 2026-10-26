@@ -627,7 +627,7 @@ Total: ~3-4 weeks for one engineer. Phase 0 is independent and safe.
 |---|---|---|
 | Whitelist stores raw case, graph names are lowercased → `NOT s.name IN $whitelist` misses `Obsidian Web Clipper` | `webviz/app.py:2491` | Lowercase on save and load; migrate existing entries |
 | OODA "shadow IT" proxy counts all software with ≤3 hosts, no source filter | `webviz/ooda_worker.py:245` | Add `s.sources` intersection with `SHADOW_IT_SOURCES` |
-| Enricher categorizes extensions via Wikidata | `webviz/enrich_worker.py:116` | `WHERE NOT s.name STARTS WITH 'ext:'` (after identity) |
+| Enricher categorizes extensions via Wikipedia | `webviz/enrich_worker.py` `_pick_uncategorized` | Fixed: `coalesce(s.kind, '') <> 'browser_extension'` |
 | Snapshot omits `versions` and edge props | `src/snapshot.py:154` | Add `s.versions`; edge props in `INSTALLED_ON` lines |
 | Dead `_batch_create_software` duplicates grouped logic | `src/ingestion.py:671` | Delete |
 | Case-variant dedupe would merge same-named Chrome/Edge extensions | `src/ingestion.py:1418` | Gate to `software_key STARTS WITH 'name:'` |

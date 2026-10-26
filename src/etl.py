@@ -461,7 +461,6 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         users = extractor.extract_all_users()
         result.users_extracted = len(users)
 
-        known_host_ids: set = set()
         hosts_seen = 0
         host_pages_seen = 0
         host_extract_truncated = False
@@ -477,9 +476,6 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
                     host_pages_seen += 1
                     for h in page:
                         hosts_seen += 1
-                        hid = h.get('id')
-                        if hid is not None:
-                            known_host_ids.add(hid)
                         yield h
             except Exception:
                 host_extract_truncated = True
@@ -487,11 +483,10 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         hosts_iter = _streaming_host_iter()
         logger.info("etl: extracted users=%d; host extraction will stream", len(users))
 
-        # Label extraction. Membership lists are needed for orphan computation,
-        # but that math now happens AFTER streaming ingest completes (we don't
-        # know `known_host_ids` until the host stream drains). Label payload
-        # is still fetched here so a /labels failure can be logged early —
-        # the actual graph sync happens below post-ingest.
+        # Label extraction. Membership lists feed the orphan computation, which
+        # runs against the graph AFTER streaming ingest completes. Label payload
+        # is fetched here so a /labels failure can be logged early — the
+        # actual graph sync happens below post-ingest.
         labels = []
         member_map: dict = {}
         if not cfg.skip_labels:
@@ -522,8 +517,8 @@ def _run_etl_locked(cfg: ETLConfig, token: str, result: ETLResult, t0: float) ->
         failed_sw_hosts: list = []
         with MemgraphIngestion(cfg.memgraph_uri) as ingestion:
             ingestion.create_constraints()
-            # Streaming ingest — drains hosts_iter, populating known_host_ids
-            # + hosts_seen via the side-effecting wrapper above.
+            # Streaming ingest — drains hosts_iter, counting hosts_seen via the
+            # side-effecting wrapper above.
             ingestion.create_graph_relationships(hosts_iter, extractor, global_users=users)
             result.hosts_extracted = hosts_seen
 

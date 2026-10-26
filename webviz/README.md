@@ -63,18 +63,22 @@ UI guarantees:
 
 ```text
 webviz/
-├── app.py               # Flask routes, auth, scope/label filters, blast radius, diff
+├── app.py               # Flask app, auth, security headers, worker lifecycle
+├── routes/              # one blueprint per endpoint group (graph, search, blast_radius, …)
 ├── graph_sample.py      # degree-ranked, type-balanced sampler for the Command Deck
-├── enrich_worker.py     # Wikidata categorization (leader-elected, cached)
+├── enrich_worker.py     # Wikipedia categorization (leader-elected, cached)
 ├── extension_worker.py  # extension metadata + risk scoring (leader-elected, cached)
 ├── ooda_worker.py       # Observe→Orient→Decide→Act supervisor
 └── static/
-    ├── index.html       # entire UI: markup, CSS, D3 v7 logic
+    ├── index.html       # markup only
+    ├── app.js           # all UI logic (D3 v7); event bindings at the bottom
+    ├── app.css          # all styles
+    ├── boot.js          # pre-paint theme + boot-error banner (loaded in <head>)
     ├── d3.v7.min.js     # vendored, no CDN
     └── fonts/           # local woff2, no external requests
 ```
 
-No build step, no bundler, no npm. Editing `static/index.html` is the whole front-end workflow; rebuild the image to ship it.
+No build step, no bundler, no npm. Edit the files in `static/` and rebuild the image to ship. The server sends `Content-Security-Policy: script-src 'self'`, so never add inline `<script>` or `on*=` attributes: bind events in `app.js` with `addEventListener`.
 
 ## API
 
@@ -98,7 +102,7 @@ All routes are under `/api/` and require the token except `/api/health`.
 | `GET /api/extensions/status`, `POST /api/extensions/refresh`, `GET /api/extensions/detail` | Worker state and per-extension detail. |
 | `GET /api/snapshots?limit=N` | Newest-first snapshot metadata (default 100, cap 500). |
 | `GET /api/diff?from=<ts>&to=<ts>` | Added/removed/changed nodes, edges, and properties. |
-| `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikidata worker. |
+| `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikipedia worker. |
 | `GET /api/ooda/status`, `/findings`, `/cycles`, `POST /api/ooda/trigger` | Autonomy supervisor. |
 
 Errors are JSON: `{"error": "...", "message": "..."}` with a 4xx/5xx status. Detail text is only included when `WEBVIZ_DEBUG_ERRORS=true`.
@@ -117,7 +121,7 @@ Read from the container environment (supplied by `.env` through Compose):
 | `STATE_FILE` | `/app/config/.state.json` | Compose sets it; the rootfs is read-only. |
 | `SNAPSHOT_DIR` | `config/snapshots` | Under the `/app/config` mount. |
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | `30` / `5000` | Pruned after each ETL run. |
-| `ENRICHER_ENABLED`, `ENRICHER_INTERVAL_SEC`, `ENRICHER_BATCH_SIZE` | `true` / worker defaults | Wikidata categorization. |
+| `ENRICHER_ENABLED`, `ENRICHER_INTERVAL_SEC`, `ENRICHER_BATCH_SIZE` | `true` / worker defaults | Wikipedia categorization. |
 | `EXTENSION_WORKER_ENABLED`, `_INTERVAL_SEC`, `_BATCH_SIZE`, `_PARALLELISM` | `true` / worker defaults | Extension intel. |
 | `OODA_ENABLED`, `OODA_INTERVAL_SEC`, `OODA_FULL_SCAN_EVERY` | `false` | Autonomous ETL. |
 | `OODA_TEAMS` | *(required)* | Fleet team IDs to scan, comma-separated. ETL and OODA refuse to run without it; `./start.sh` prompts once and saves it. |
@@ -129,7 +133,7 @@ Read from the container environment (supplied by `.env` through Compose):
 - `/api/graph/full` without `sample` returns everything; the Overview always asks for a sample (`120` desktop, fewer on phones) so first paint stays cheap.
 - Long force simulations are bounded; labels are counter-scaled and decluttered rather than rendered for every node.
 - Blast-radius and Shadow IT queries are scoped by team/platform/label before traversal, so the walk never starts from the whole graph.
-- Workers are leader-elected with `fcntl` locks, so two gunicorn workers don't double-hit Wikidata or the extension stores.
+- Workers are leader-elected with `fcntl` locks, so two gunicorn workers don't double-hit Wikipedia or the extension stores.
 
 ## Troubleshooting
 
