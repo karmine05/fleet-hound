@@ -902,9 +902,15 @@ textarea {
     pointer-events: none;
 }
 .cluster-label {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
-    fill: var(--text-tertiary);
+    letter-spacing: 0.02em;
+    fill: var(--text-secondary);
+    /* Halo so headings stay legible over edges crossing the gap. */
+    paint-order: stroke;
+    stroke: var(--bg-primary);
+    stroke-width: 3px;
+    stroke-linejoin: round;
     pointer-events: none;
     text-anchor: middle;
 }

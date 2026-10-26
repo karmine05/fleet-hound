@@ -3841,6 +3841,16 @@ function _clusterKey(node) {
     return 'users';
 }
 
+// Display text for a _clusterKey(); the raw key stays the d3 data key.
+function _clusterLabel(key) {
+    if (key === 'users') return 'Users';
+    const [kind, ...rest] = key.split(':');
+    const name = rest.join(':');
+    if (kind === 'team') return name === 'no-team' ? 'Hosts · No team' : `Hosts · ${name}`;
+    if (kind === 'cat') return `Software · ${name === 'uncategorized' ? 'Uncategorized' : name}`;
+    return key;
+}
+
 function _applyClusterForces(data) {
     // Group the nodes the simulation actually renders. data.nodes also
     // holds nodes dropped by filterDisconnected, whose stale x/y from an
@@ -3931,9 +3941,21 @@ function _applyClusterForces(data) {
         lblSel.enter().append('text').attr('class', 'cluster-label')
             .merge(lblSel)
             .attr('x', p => d3.mean(p.pts, c => c[0]))
-            .attr('y', p => d3.min(p.pts, c => c[1]) - 8)
-            .text(p => p.key);
+            .attr('y', p => d3.min(p.pts, c => c[1]) - 8 / _clusterZoomK())
+            .text(p => _clusterLabel(p.key));
+        _sizeClusterLabels();
     };
+    // Labels sit in the zoom root, so counter-scale them like node
+    // labels: fitGraph() zooms a large layout out to ~0.4 and 11px
+    // headings shrank to 4px.
+    const _clusterZoomK = () => (_graphZoomTransform && _graphZoomTransform.k) || 1;
+    const _sizeClusterLabels = () => {
+        const k = _clusterZoomK();
+        labelLayer.selectAll('text.cluster-label')
+            .style('font-size', `${12 / k}px`)
+            .style('stroke-width', `${3 / k}px`);
+    };
+    if (_graphZoom) _graphZoom.on('zoom.cluster', _sizeClusterLabels);
 
     // Initial render so hulls are visible immediately.
     _renderHulls();
@@ -3960,6 +3982,7 @@ function _removeClusterForces() {
     simulation.force('clusterX', null);
     simulation.force('clusterY', null);
     simulation.on('tick.cluster', null);
+    if (_graphZoom) _graphZoom.on('zoom.cluster', null);
     const linkForce = simulation.force('link');
     if (linkForce) linkForce.strength(0.2); // renderGraph's default
     const chargeForce = simulation.force('charge');
