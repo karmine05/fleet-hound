@@ -163,7 +163,7 @@ def search_all():
                 if team_filter != 'all':
                     host_query += " AND toString(h.team_id) = $team_id"
                 host_query += label_flt_fragment
-                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name, h.team_id AS team_id"
                 # Apply limit to search results too if requested
                 host_query += f" LIMIT {cypher_limit}"
 
@@ -190,7 +190,7 @@ def search_all():
                 host_query += label_flt_fragment
                 params.update(label_flt_params)
 
-                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+                host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name, h.team_id AS team_id"
                 # Apply default limit if no term
                 host_query += f" LIMIT {cypher_limit}"
 
@@ -203,6 +203,7 @@ def search_all():
                     'os_version': record['os_version'],
                     'platform': record['platform'],
                     'team_name': record['team_name'],
+                    'team_id': record['team_id'],
                 })
 
         # Search/load users
@@ -371,7 +372,7 @@ def search_all():
             host_query += label_flt_fragment
             params.update(label_flt_params)
 
-            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name, h.team_id AS team_id"
             host_query += f" LIMIT {CONNECTED_HOST_CAP}"
 
             host_result = session.run(host_query, **params)
@@ -382,6 +383,7 @@ def search_all():
                     'os_version': record['os_version'],
                     'platform': record['platform'],
                     'team_name': record['team_name'],
+                    'team_id': record['team_id'],
                 })
 
         if user_ids_loaded and (node_type == 'user' or node_type == 'all'):
@@ -404,7 +406,7 @@ def search_all():
             host_query += label_flt_fragment
             params.update(label_flt_params)
 
-            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name"
+            host_query += " RETURN DISTINCT h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform, h.team_name AS team_name, h.team_id AS team_id"
             host_query += f" LIMIT {CONNECTED_HOST_CAP}"
 
             host_result = session.run(host_query, **params)
@@ -415,6 +417,7 @@ def search_all():
                     'os_version': record['os_version'],
                     'platform': record['platform'],
                     'team_name': record['team_name'],
+                    'team_id': record['team_id'],
                 })
 
         # Materialize host viz nodes — dedupe by fleet_host_id, disambiguate
@@ -444,6 +447,12 @@ def search_all():
                 "type": "host",
                 "details": f"{hr['os_version'] or ''} ({hr['platform'] or ''}){team_info}",
             })
+            # Clusters and team colouring read these; without them every
+            # searched host groups as "No team".
+            if hr.get('team_id') is not None:
+                nodes[-1]["team_id"] = hr['team_id']
+            if hr.get('team_name'):
+                nodes[-1]["team_name"] = hr['team_name']
             node_ids.add(host_id)
 
         # Now get all relationships between the loaded nodes

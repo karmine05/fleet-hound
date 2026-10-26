@@ -14,6 +14,16 @@ from webviz.hostname_utils import hostname_counts as _hostname_counts, disambigu
 import json
 from webviz.app import DEBUG_ERROR_DETAILS, driver, logger
 
+
+def _with_team(node, record):
+    """Copy the host's team onto its viz node; clusters and team filters
+    read these, and a node without them groups as "No team"."""
+    if record.get('team_id') is not None:
+        node['team_id'] = record['team_id']
+    if record.get('team_name'):
+        node['team_name'] = record['team_name']
+    return node
+
 bp = Blueprint("graph", __name__)
 
 @bp.route("/api/graph")
@@ -41,7 +51,9 @@ def get_graph_data():
             RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
                             h.hostname AS hostname,
                             h.os_version AS os_version,
-                            h.platform AS platform
+                            h.platform AS platform,
+                            h.team_id AS team_id,
+                            h.team_name AS team_name
         """)
         host_records = list(host_result)
         hostname_counts = _hostname_counts(host_records)
@@ -52,14 +64,14 @@ def get_graph_data():
             if fid is None:
                 continue
             display_name = disambiguated_display_name(hn, fid, hostname_counts)
-            nodes.append({
+            nodes.append(_with_team({
                 "id": f"host_{fid}",
                 "name": hn,
                 "display_name": display_name,
                 "fleet_host_id": fid,
                 "type": "host",
                 "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
-            })
+            }, record))
 
         user_result = session.run("""
             MATCH (u:User)-[:USES]->(h:Host)
@@ -389,7 +401,9 @@ def get_software_hosts(software_name):
             RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
                             h.hostname AS hostname,
                             h.os_version AS os_version,
-                            h.platform AS platform
+                            h.platform AS platform,
+                            h.team_id AS team_id,
+                            h.team_name AS team_name
         """, name=software_name)
 
         host_records_raw = list(host_result)
@@ -402,14 +416,14 @@ def get_software_hosts(software_name):
             if host_id in node_ids:
                 continue  # belt-and-suspenders: skip if same fid already added
             display_name = disambiguated_display_name(hn, fid, hostname_counts)
-            nodes.append({
+            nodes.append(_with_team({
                 "id": host_id,
                 "name": hn,
                 "display_name": display_name,
                 "fleet_host_id": fid,
                 "type": "host",
                 "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
-            })
+            }, record))
             node_ids.add(host_id)
 
         # Get users connected to these hosts
@@ -503,7 +517,8 @@ def get_host_software(hostname):
             host_result = session.run(
                 "MATCH (h:Host {fleet_host_id: $fid}) "
                 "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
-                "       h.os_version AS os_version, h.platform AS platform",
+                "       h.os_version AS os_version, h.platform AS platform, "
+                "       h.team_id AS team_id, h.team_name AS team_name",
                 fid=int(fid_raw),
             )
         else:
@@ -511,7 +526,8 @@ def get_host_software(hostname):
                 "MATCH (h:Host) "
                 "WHERE toLower(h.hostname) = toLower($hostname) "
                 "RETURN h.fleet_host_id AS fleet_host_id, h.hostname AS hostname, "
-                "       h.os_version AS os_version, h.platform AS platform "
+                "       h.os_version AS os_version, h.platform AS platform, "
+                "       h.team_id AS team_id, h.team_name AS team_name "
                 "ORDER BY h.last_seen DESC LIMIT 1",
                 hostname=hostname
             )
@@ -531,14 +547,14 @@ def get_host_software(hostname):
         # but the field exists so client code that reads
         # `d.display_name || d.name` produces the expected label.
         host_id = f"host_{fleet_host_id}"
-        nodes.append({
+        nodes.append(_with_team({
             "id": host_id,
             "name": canonical_hostname,
             "display_name": canonical_hostname,
             "fleet_host_id": fleet_host_id,
             "type": "host",
             "details": f"{host_data['os_version'] or ''} ({host_data['platform'] or ''})"
-        })
+        }, host_data))
         node_ids.add(host_id)
 
         # Get ALL users connected to this host — match by fleet_host_id.
