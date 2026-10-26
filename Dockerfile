@@ -36,13 +36,15 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD python -c "import sys, urllib.request; r = urllib.request.urlopen('http://localhost:8080/api/health', timeout=5); sys.exit(0 if r.status == 200 else 1)" || exit 1
 
-# Gunicorn: bind 0.0.0.0 (container network). Two sync workers is enough for
-# this dashboard and leaves RAM for the in-process OODA/enricher/extension
-# threads. Timeout is 120s so a blast-radius query doesn't get killed mid-walk.
+# Gunicorn: bind 0.0.0.0 (container network). Two workers x 4 threads: a slow
+# query no longer blocks a whole worker (and /api/health with it), and RAM is
+# still left for the in-process OODA/enricher/extension threads. Timeout is
+# 120s so a blast-radius query doesn't get killed mid-walk.
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8080", \
      "--workers", "2", \
-     "--worker-class", "sync", \
+     "--worker-class", "gthread", \
+     "--threads", "4", \
      "--timeout", "120", \
      "--graceful-timeout", "30", \
      "--no-control-socket", \

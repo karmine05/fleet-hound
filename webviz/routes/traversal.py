@@ -16,6 +16,8 @@ from webviz.app import DEBUG_ERROR_DETAILS, SNAPSHOT_DIR, driver, logger
 bp = Blueprint("traversal", __name__)
 
 _TYPED_ID_RE = re.compile(r"^(host|user|software)_(.+)$")
+# Max nodes in a /api/correlate ego network; matches the graph render budget order.
+CORRELATE_NODE_CAP = 500
 
 def _resolve_typed_id(typed_id: str):
     """Parse `host_<hostname>` / `user_<username>` / `software_<name>` into (kind, name).
@@ -274,14 +276,45 @@ def get_correlate():
     label = _node_label_for_kind(kind)
     key = _key_prop_for_kind(kind)
 
-    cypher = (
-        f"MATCH (n:{label} {{{key}: $name}})-[r:USES|INSTALLED_ON *1..{depth}]-(m) "
-        f"RETURN n, m, r"
-    )
-
+    # Bounded hop-by-hop expansion. A variable-length path match enumerates
+    # every path (popular software x hosts x their software) and blocked a
+    # gunicorn worker for seconds per hover; here each hop is one LIMITed
+    # query and the whole ego network is capped at CORRELATE_NODE_CAP nodes.
+    recs = []
+    truncated = False
     try:
         with driver.session() as session:
-            recs = list(session.run(cypher, name=name))
+            seed = session.run(
+                f"MATCH (n:{label} {{{key}: $name}}) RETURN n, id(n) AS nid LIMIT 1",
+                name=name,
+            ).single()
+            if seed is None:
+                return jsonify({"nodes": [], "links": [], "truncated": False})
+            recs.append({"n": seed["n"]})
+            seen = {seed["nid"]}
+            frontier = [seed["nid"]]
+            for _ in range(depth):
+                budget = CORRELATE_NODE_CAP - len(seen)
+                if budget <= 0 or not frontier:
+                    truncated = truncated or bool(frontier)
+                    break
+                rows = list(session.run(
+                    "MATCH (a)-[r:USES|INSTALLED_ON]-(b) "
+                    "WHERE id(a) IN $frontier AND NOT id(b) IN $seen "
+                    # Return a and b too: a bare relationship carries hollow
+                    # endpoint nodes (no labels/properties).
+                    "RETURN a, r, b, id(b) AS bid LIMIT $limit",
+                    frontier=frontier, seen=list(seen), limit=budget + 1,
+                ))
+                if len(rows) > budget:
+                    truncated = True
+                    rows = rows[:budget]
+                frontier = []
+                for row in rows:
+                    recs.append({"n": row["a"], "m": row["b"], "r": [row["r"]]})
+                    if row["bid"] not in seen:
+                        seen.add(row["bid"])
+                        frontier.append(row["bid"])
     except TransientError as exc:
         logger.warning("correlate transient: %s", exc)
         return jsonify({"error": "Database transient error"}), 503
@@ -293,17 +326,19 @@ def get_correlate():
     link_keys = set()
     links = []
 
+    by_element_id = {}
     for rec in recs:
         for graph_node in (rec.get("n"), rec.get("m")):
             obj = _serialize_graph_node(graph_node)
             if obj:
                 nodes_by_id[obj["id"]] = obj
+                by_element_id[graph_node.element_id] = obj
         rels = rec.get("r") or []
         # Walk the relationship list — each rel has start_node / end_node / type.
         for r in rels:
             try:
-                start_obj = _serialize_graph_node(r.start_node)
-                end_obj = _serialize_graph_node(r.end_node)
+                start_obj = by_element_id.get(r.start_node.element_id) or _serialize_graph_node(r.start_node)
+                end_obj = by_element_id.get(r.end_node.element_id) or _serialize_graph_node(r.end_node)
             except AttributeError:
                 continue
             if not start_obj or not end_obj:
@@ -328,7 +363,7 @@ def get_correlate():
                 "type": _link_type_for_rel(r.type),
             })
 
-    return jsonify({"nodes": list(nodes_by_id.values()), "links": links})
+    return jsonify({"nodes": list(nodes_by_id.values()), "links": links, "truncated": truncated})
 
 @bp.route("/api/snapshots")
 def list_snapshots_route():
