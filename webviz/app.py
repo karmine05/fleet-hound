@@ -1538,27 +1538,43 @@ def search_software():
             node_ids.add(software_id)
             software_count += 1
 
-        # Get ALL hosts that have any of the matching software, with optional platform filter
+        # Get ALL hosts that have any of the matching software, with optional
+        # platform filter. Keyed on fleet_host_id (stable, unique) — hostname
+        # is NOT unique (Fleet's default "mac.lan" collision) and would both
+        # over-match and never line up with the host_<fid> ids the rest of the
+        # app emits.
         if platform_filter == 'all':
             host_result = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform
+                RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
+                               h.hostname AS hostname,
+                               h.os_version AS os_version,
+                               h.platform AS platform
             """, search_term=search_term)
         else:
             host_result = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
                   AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN DISTINCT h.hostname AS hostname, h.os_version AS os_version, h.platform AS platform
+                RETURN DISTINCT h.fleet_host_id AS fleet_host_id,
+                               h.hostname AS hostname,
+                               h.os_version AS os_version,
+                               h.platform AS platform
             """, search_term=search_term, platform=platform_filter)
 
-        for record in host_result:
-            host_id = f"host_{record['hostname']}"
+        host_records = [record for record in host_result if record['fleet_host_id'] is not None]
+        hostname_counts = _hostname_counts(host_records)
+        for record in host_records:
+            fid = record['fleet_host_id']
+            host_id = f"host_{fid}"
             if host_id not in node_ids:
+                hn = record['hostname']
                 nodes.append({
                     "id": host_id,
-                    "name": record['hostname'],
+                    "name": hn,
+                    "display_name": disambiguated_display_name(hn, fid, hostname_counts),
+                    "fleet_host_id": fid,
                     "type": "host",
                     "details": f"{record['os_version'] or ''} ({record['platform'] or ''})"
                 })
@@ -1598,19 +1614,19 @@ def search_software():
             software_host_links = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN s.name AS software_name, h.hostname AS hostname
+                RETURN s.name AS software_name, h.fleet_host_id AS fleet_host_id
             """, search_term=search_term)
         else:
             software_host_links = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
                   AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN s.name AS software_name, h.hostname AS hostname
+                RETURN s.name AS software_name, h.fleet_host_id AS fleet_host_id
             """, search_term=search_term, platform=platform_filter)
 
         for record in software_host_links:
             source_id = f"software_{record['software_name']}"
-            target_id = f"host_{record['hostname']}"
+            target_id = f"host_{record['fleet_host_id']}"
             if source_id in node_ids and target_id in node_ids:
                 links.append({
                     "source": source_id,
@@ -1623,19 +1639,19 @@ def search_software():
             user_host_links = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
-                RETURN DISTINCT u.username AS username, h.hostname AS hostname
+                RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id
             """, search_term=search_term)
         else:
             user_host_links = session.run("""
                 MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
                 WHERE toLower(s.name) CONTAINS toLower($search_term)
                   AND toLower(h.platform) CONTAINS toLower($platform)
-                RETURN DISTINCT u.username AS username, h.hostname AS hostname
+                RETURN DISTINCT u.username AS username, h.fleet_host_id AS fleet_host_id
             """, search_term=search_term, platform=platform_filter)
 
         for record in user_host_links:
             source_id = f"user_{record['username']}"
-            target_id = f"host_{record['hostname']}"
+            target_id = f"host_{record['fleet_host_id']}"
             if source_id in node_ids and target_id in node_ids:
                 links.append({
                     "source": source_id,
