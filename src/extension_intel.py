@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import html
 import io
 import json
 import logging
@@ -214,6 +215,8 @@ _KNOWN_PUBLISHERS = (
     "paypal", "stripe", "shopify", "atlassian", "slack", "zoom", "dropbox",
     "box", "evernote", "notion", "spotify", "netflix", "adguard", "brave",
     "opera", "vivaldi", "duckduckgo", "proton", "tampermonkey", "ghostery",
+    # Legal names the stores show for brands above (Chrome Web Store, 2026-10).
+    "agilebits", "duck duck go", "google ireland",
 )
 
 # Cyrillic/Greek characters that render like Latin letters. Used only to raise
@@ -815,6 +818,7 @@ _CHROME_HOSTS = frozenset({
     "clients2.googleusercontent.com",  # CRX CDN (codebase target)
     "redirector.gvt1.com",          # CRX CDN redirector
     "edgedl.me.gvt1.com",           # CRX CDN edge download host
+    "chromewebstore.google.com",    # detail page (publisher name)
 })
 _EDGE_HOSTS = frozenset({"microsoftedge.microsoft.com"})
 _AMO_HOSTS = frozenset({"addons.mozilla.org"})
@@ -991,6 +995,22 @@ def _parse_crx(data: bytes) -> dict:
         return manifest
 
 
+# Publisher link on a Chrome Web Store detail page:
+#   <a ... data-publisher-id="u<32 hex>" ...>AgileBits Inc</a>
+# Bounded quantifiers keep this linear on the ~1 MB untrusted page.
+_CWS_PUBLISHER_RE = re.compile(
+    rb'data-publisher-id="u[0-9a-f]{32}"[^>]{0,400}>([^<]{1,150})</a>'
+)
+
+
+def _chrome_publisher(page: bytes) -> str | None:
+    match = _CWS_PUBLISHER_RE.search(page)
+    if not match:
+        return None
+    name = html.unescape(match.group(1).decode("utf-8", "replace")).strip()
+    return name or None
+
+
 def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None) -> dict:
     client = client or HttpClient()
     meta = {"store": "chrome", "status": "unknown", "url": (
@@ -1033,6 +1053,17 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
             "version": updatecheck.get("version"),
             "url": meta["url"],
         })
+        # update2 carries no developer field; the detail page does. Without it
+        # no Chrome-family extension can ever count as a reputable publisher.
+        dstatus, dheaders, dbody, _ = client.get(
+            meta["url"], allowed_hosts=_CHROME_HOSTS, max_bytes=2 * 1024 * 1024
+        )
+        if _mark_rate_limited(meta, dstatus, dheaders):
+            return meta
+        if dstatus == 200 and dbody:
+            publisher = _chrome_publisher(dbody)
+            if publisher:
+                meta["publisher"] = publisher
         codebase = updatecheck.get("codebase") or ""
         expected_hash = (updatecheck.get("hash_sha256") or "").lower()
         if not codebase:
@@ -1475,6 +1506,12 @@ def _self_check() -> None:
     ])
     assert count == 2 and max_cvss == 8.8 and "CVE-2024-0001" in json_blob
     assert publisher_is_reputable("1Password Devs"), "AMO author suffix"
+    assert publisher_is_reputable("AgileBits Inc") and publisher_is_reputable("Duck Duck Go, Inc.")
+    assert publisher_is_reputable("Google Ireland, Ltd.") and not publisher_is_reputable("eyeo GmbH")
+    page = (b'<a class="x" href="./publisher/agilebits-inc/u1" data-publisher-id='
+            b'"udb847e9815e2e1626d9ddb346d722811" jslog="1">AgileBits &amp; Co</a>')
+    assert _chrome_publisher(page) == "AgileBits & Co"
+    assert _chrome_publisher(b"<html>no publisher link</html>") is None
     assert not publisher_is_reputable("Totally Not 1Password Devs")
     print("extension_intel self-check: OK")
 
