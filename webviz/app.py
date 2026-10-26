@@ -28,6 +28,12 @@ from webviz.host_filters import (
     apply_label_filter,
     merge_filter_params,
 )
+from webviz.hostname_utils import (
+    disambiguated_display_name,
+    # Aliased so call sites can keep their local `hostname_counts` variable
+    # name without shadowing the helper.
+    hostname_counts as _hostname_counts,
+)
 
 # Shadow IT filter primitives (shared with categorize_software.py).
 # Pre-2026-05-07 these lived inline in this file; extracting to
@@ -621,18 +627,41 @@ def get_software():
         return jsonify({"error": "Database connection failed"}), 500
     limit = _bounded_limit()
     with driver.session() as session:
+        # Sorted by install count so a defaulted `limit` returns the most
+        # widespread software first (an unordered LIMIT is arbitrary).
+        # OPTIONAL MATCH keeps orphan Software nodes that have no INSTALLED_ON
+        # edge — they surface with host_count = 0 at the end of the list
+        # instead of vanishing (a plain MATCH would silently drop them).
+        # `versions` is capped at 25 entries per software: it's the largest
+        # field in the response (a single browser node can carry dozens of
+        # historical versions) and the list view only needs a sample of the
+        # spread, not the full history. The cap is applied in Python (keeps
+        # the Cypher portable and the row shape simple); 25 entries is enough
+        # to render any realistic "N versions" badge.
         result = session.run(
             """
             MATCH (s:Software)
+            OPTIONAL MATCH (s)-[:INSTALLED_ON]->(h:Host)
+            WITH s, count(DISTINCT h) AS host_count
+            ORDER BY host_count DESC, s.name ASC
             RETURN s.name AS name,
                    coalesce(s.display_name, s.name) AS display_name,
-                   s.versions AS versions, s.last_version AS last_version,
-                   s.kind AS kind, s.extension_key AS extension_key
+                   s.versions AS versions,
+                   s.last_version AS last_version,
+                   s.kind AS kind,
+                   s.extension_key AS extension_key,
+                   host_count
             LIMIT $limit
             """,
             limit=limit,
         )
-        return jsonify([r.data() for r in result])
+        rows = []
+        for r in result:
+            row = r.data()
+            versions = row.get("versions") or []
+            row["versions"] = versions[:25]
+            rows.append(row)
+        return jsonify(rows)
 
 @app.route("/api/teams")
 def get_teams():
@@ -704,10 +733,16 @@ def get_labels():
 
     include_query = request.args.get("include_query", "").strip().lower() == "true"
 
+    # l.query is the (potentially large) osquery that defines a dynamic
+    # label. It is only needed behind ?include_query=true, so only SELECT it
+    # then — the UI fires /api/labels on every label-chip toggle and paying
+    # for the query text every time is pure waste.
+    query_select = "                       l.query AS query,\n" if include_query else ""
+
     try:
         with driver.session() as session:
             result = session.run(
-                """
+                f"""
                 MATCH (l:Label)
                 OPTIONAL MATCH (l)<-[r:HAS_LABEL]-(:Host)
                 WITH l, count(r) AS live_host_count
@@ -720,8 +755,7 @@ def get_labels():
                        coalesce(l.last_synced_iso, '') AS last_synced_iso,
                        coalesce(l.last_label_sync_status, 'unknown') AS last_label_sync_status,
                        coalesce(l.consecutive_failures, 0) AS consecutive_failures,
-                       l.query AS query,
-                       coalesce(l.orphan_member_count, 0) AS orphan_member_count,
+{query_select}                       coalesce(l.orphan_member_count, 0) AS orphan_member_count,
                        coalesce(l.orphan_member_ids, []) AS orphan_member_ids,
                        coalesce(l.orphan_member_truncated, false) AS orphan_member_truncated
                 ORDER BY l.name
@@ -1256,21 +1290,12 @@ def search_all():
             seen_fids.add(fid)
             host_records_unique.append(hr)
 
-        hostname_counts: dict = {}
-        for hr in host_records_unique:
-            hn = hr['hostname']
-            if hn:
-                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
-
+        hostname_counts = _hostname_counts(host_records_unique)
         for hr in host_records_unique:
             fid = hr['fleet_host_id']
             hn = hr['hostname']
             host_id = f"host_{fid}"
-            display_name = (
-                f"{hn} #{fid}"
-                if hn and hostname_counts.get(hn, 0) > 1
-                else hn
-            )
+            display_name = disambiguated_display_name(hn, fid, hostname_counts)
             team_info = f" - Team: {hr.get('team_name', 'No team')}" if hr.get('team_name') else ""
             nodes.append({
                 "id": host_id,
@@ -1977,22 +2002,14 @@ def get_graph_data():
                             h.platform AS platform
         """)
         host_records = list(host_result)
-        hostname_counts: dict = {}
-        for record in host_records:
-            hn = record['hostname']
-            if hn:
-                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+        hostname_counts = _hostname_counts(host_records)
 
         for record in host_records:
             fid = record['fleet_host_id']
             hn = record['hostname']
             if fid is None:
                 continue
-            display_name = (
-                f"{hn} #{fid}"
-                if hn and hostname_counts.get(hn, 0) > 1
-                else hn
-            )
+            display_name = disambiguated_display_name(hn, fid, hostname_counts)
             nodes.append({
                 "id": f"host_{fid}",
                 "name": hn,
@@ -2095,11 +2112,7 @@ def get_full_graph_data():
             # physical machines that share Fleet's default hostname. Without
             # this, 4 different Macs all render as identical "mac.lan" red dots
             # and the operator can't tell which is which.
-            hostname_counts: dict = {}
-            for record in host_records:
-                hn = record['hostname']
-                if hn:
-                    hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+            hostname_counts = _hostname_counts(host_records)
 
             for record in host_records:
                 # Node id is keyed on fleet_host_id (stable, unique). hostname
@@ -2108,11 +2121,7 @@ def get_full_graph_data():
                 fid = record['fleet_host_id']
                 hn = record['hostname']
                 node_id = f"host_{fid}"
-                display_name = (
-                    f"{hn} #{fid}"
-                    if hn and hostname_counts.get(hn, 0) > 1
-                    else hn
-                )
+                display_name = disambiguated_display_name(hn, fid, hostname_counts)
                 node_obj = {
                     "id": node_id,
                     "name": hn,
@@ -2337,11 +2346,7 @@ def get_software_hosts(software_name):
         """, name=software_name)
 
         host_records_raw = list(host_result)
-        hostname_counts: dict = {}
-        for record in host_records_raw:
-            hn = record['hostname']
-            if hn:
-                hostname_counts[hn] = hostname_counts.get(hn, 0) + 1
+        hostname_counts = _hostname_counts(host_records_raw)
 
         for record in host_records_raw:
             fid = record['fleet_host_id']
@@ -2349,11 +2354,7 @@ def get_software_hosts(software_name):
             host_id = f"host_{fid}"
             if host_id in node_ids:
                 continue  # belt-and-suspenders: skip if same fid already added
-            display_name = (
-                f"{hn} #{fid}"
-                if hn and hostname_counts.get(hn, 0) > 1
-                else hn
-            )
+            display_name = disambiguated_display_name(hn, fid, hostname_counts)
             nodes.append({
                 "id": host_id,
                 "name": hn,
