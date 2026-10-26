@@ -211,8 +211,8 @@ def _pick_stale(driver, limit: int, cutoff_ts: float):
         WITH s, count(DISTINCT h) AS host_count,
              collect(DISTINCT r.version) AS versions,
              collect(DISTINCT h.hostname) AS hosts,
-             collect(DISTINCT r.installed_path) AS paths
-        RETURN properties(s) AS props, host_count, versions, hosts, paths
+             collect(DISTINCT {{path: r.installed_path, platform: h.platform}}) AS installs
+        RETURN properties(s) AS props, host_count, versions, hosts, installs
         ORDER BY host_count DESC
         LIMIT $limit
     """
@@ -239,7 +239,7 @@ def _group_rows(rows):
             "names": [],
             "hostnames": set(),
             "versions": set(),
-            "paths": set(),
+            "installs": set(),
             "props": props,
         })
         group["names"].append(props.get("name"))
@@ -249,9 +249,10 @@ def _group_rows(rows):
         for version in row.get("versions") or []:
             if version:
                 group["versions"].add(version)
-        for path in row.get("paths") or []:
-            if path:
-                group["paths"].add(path)
+        # Keep path-less installs: store trust fails closed on them.
+        for inst in row.get("installs") or []:
+            if isinstance(inst, dict):
+                group["installs"].add((inst.get("path"), inst.get("platform")))
     return list(groups.values())
 
 
@@ -380,8 +381,9 @@ def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
     record = dict(props)
     record["host_count"] = len(group["hostnames"])
     record["versions"] = sorted(group["versions"])
-    # Per-host install paths: store trust needs evidence of a store install.
-    record["install_paths"] = sorted(group["paths"])
+    # Per-host installs: store trust needs every install to be a store install.
+    record["installs"] = [{"path": p, "platform": pl}
+                          for p, pl in sorted(group["installs"], key=lambda t: (t[0] or "", t[1] or ""))]
     # Nodes predating the ingestion change have no `store`; recover it from
     # the canonical key so the right adapter is still chosen.
     if not record.get("store") and str(group["key"]).startswith("ext:"):
