@@ -3825,6 +3825,8 @@ function toggleClusters() {
     } else {
         _removeClusterForces();
     }
+    // Groups land somewhere new; refit once the layout settles.
+    _graphNeedsFit = true;
     simulation.alpha(0.6).restart();
 }
 
@@ -3840,48 +3842,82 @@ function _clusterKey(node) {
 }
 
 function _applyClusterForces(data) {
+    // Group the nodes the simulation actually renders. data.nodes also
+    // holds nodes dropped by filterDisconnected, whose stale x/y from an
+    // earlier layout drew hulls around empty space.
     const groups = new Map();
-    (data.nodes || []).forEach(n => {
+    simulation.nodes().forEach(n => {
         const k = _clusterKey(n);
         if (!groups.has(k)) groups.set(k, []);
         groups.get(k).push(n);
     });
     const groupKeys = Array.from(groups.keys());
     const cols = Math.ceil(Math.sqrt(groupKeys.length || 1));
+    const rows = Math.ceil((groupKeys.length || 1) / cols);
     const container = document.getElementById('graph');
     const w = container ? container.clientWidth : 1000;
     const h = container ? container.clientHeight : 700;
-    const cellW = w / cols;
-    const cellH = h / Math.ceil((groupKeys.length || 1) / cols);
+    // Size cells to the largest group, not the viewport: a 100-node
+    // group packed by forceCollide needs far more room than a
+    // viewport/3 cell, and undersized cells made neighbours overlap.
+    // fitGraph() zooms to whatever extent this produces.
+    // Packed area ~ sum of collision discs; 1.2 covers packing slack.
+    const collide = simulation.force('collision');
+    const collideR = collide ? collide.radius() : () => 20;
+    const groupRadius = nodes => 1.2 * Math.sqrt(d3.sum(nodes, n => collideR(n) ** 2));
+    const maxR = Math.max(1, ...Array.from(groups.values(), groupRadius));
+    const cell = Math.max(200, 2 * maxR + 120);
 
     const centroids = new Map();
     groupKeys.forEach((k, idx) => {
-        const cx = (idx % cols) * cellW + cellW / 2;
-        const cy = Math.floor(idx / cols) * cellH + cellH / 2;
+        const cx = w / 2 + ((idx % cols) - (cols - 1) / 2) * cell;
+        const cy = h / 2 + (Math.floor(idx / cols) - (rows - 1) / 2) * cell;
         centroids.set(k, { x: cx, y: cy });
     });
 
     simulation
-        .force('clusterX', d3.forceX(d => (centroids.get(_clusterKey(d)) || { x: w / 2 }).x).strength(0.15))
-        .force('clusterY', d3.forceY(d => (centroids.get(_clusterKey(d)) || { y: h / 2 }).y).strength(0.15));
+        .force('clusterX', d3.forceX(d => (centroids.get(_clusterKey(d)) || { x: w / 2 }).x).strength(0.3))
+        .force('clusterY', d3.forceY(d => (centroids.get(_clusterKey(d)) || { y: h / 2 }).y).strength(0.3));
+    // Global repulsion at -320 spreads each group wider than its cell;
+    // forceCollide alone keeps nodes from stacking.
+    const chargeForce = simulation.force('charge');
+    if (chargeForce) chargeForce.strength(-40);
+    // Host-software links span groups and strength is per edge, so a
+    // host with 100 installs out-pulls its cluster even at 0.03. Edges
+    // still draw; they just stop shaping the layout while grouped.
+    const linkForce = simulation.force('link');
+    if (linkForce) linkForce.strength(0);
 
     // Hulls + labels — recomputed on tick but throttled to ~10fps so the
     // O(N + group_count * pts log pts) hull pass doesn't shadow the main
     // d3 simulation tick at 60fps. Reduced-motion: render hulls once,
     // skip subsequent recomputes to avoid jitter.
-    const svg = d3.select('#graph svg');
-    svg.selectAll('.cluster-hull-layer').remove();
-    svg.selectAll('.cluster-label-layer').remove();
-    const hullLayer = svg.insert('g', ':first-child').attr('class', 'cluster-hull-layer');
-    const labelLayer = svg.append('g').attr('class', 'cluster-label-layer');
+    // Hulls live inside the zoom root so they pan and zoom with the
+    // nodes; on the bare <svg> they stayed in screen space and drifted
+    // off their nodes after fitGraph() or any zoom.
+    const root = d3.select('#graph svg .graph-root');
+    root.selectAll('.cluster-hull-layer').remove();
+    root.selectAll('.cluster-label-layer').remove();
+    const hullLayer = root.insert('g', ':first-child').attr('class', 'cluster-hull-layer');
+    const labelLayer = root.append('g').attr('class', 'cluster-label-layer');
+    const hullPad = 18;
 
     const _renderHulls = () => {
         const polygons = [];
         groups.forEach((nodes, key) => {
-            const pts = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y))
-                             .map(n => [n.x, n.y]);
-            if (pts.length < 2) return;
-            const hull = pts.length >= 3 ? d3.polygonHull(pts) : null;
+            const placed = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
+            if (!placed.length) return;
+            // Ring each node with 8 points so the hull wraps the circles
+            // instead of running through their centres, and so 1-2 node
+            // groups still get an outline.
+            const pts = [];
+            placed.forEach(n => {
+                for (let i = 0; i < 8; i++) {
+                    const a = (i / 8) * 2 * Math.PI;
+                    pts.push([n.x + hullPad * Math.cos(a), n.y + hullPad * Math.sin(a)]);
+                }
+            });
+            const hull = d3.polygonHull(pts);
             polygons.push({ key, hull, pts });
         });
         const sel = hullLayer.selectAll('path.cluster-hull').data(polygons.filter(p => p.hull), p => p.key);
@@ -3924,9 +3960,13 @@ function _removeClusterForces() {
     simulation.force('clusterX', null);
     simulation.force('clusterY', null);
     simulation.on('tick.cluster', null);
-    const svg = d3.select('#graph svg');
-    svg.selectAll('.cluster-hull-layer').remove();
-    svg.selectAll('.cluster-label-layer').remove();
+    const linkForce = simulation.force('link');
+    if (linkForce) linkForce.strength(0.2); // renderGraph's default
+    const chargeForce = simulation.force('charge');
+    if (chargeForce) chargeForce.strength(-320); // renderGraph's default
+    const root = d3.select('#graph svg .graph-root');
+    root.selectAll('.cluster-hull-layer').remove();
+    root.selectAll('.cluster-label-layer').remove();
 }
 
 // Re-wire correlation hover after every renderGraph(); patch the global.
