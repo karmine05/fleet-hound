@@ -44,8 +44,8 @@ class FleetAuthenticator:
             return None
 
         if debug:
-            snippet = response.text[:300].replace('\n', ' ')
-            logger.debug("login status=%d body[0:300]=%r", response.status_code, snippet)
+            # Never log the body: a successful login response carries the session token.
+            logger.debug("login status=%d", response.status_code)
 
         if response.status_code == 200:
             try:

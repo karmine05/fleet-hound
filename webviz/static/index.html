@@ -7807,6 +7807,7 @@
             try {
                 const response = await fetch(`/api/shadow-it?${params}`);
                 const data = await response.json();
+                if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
                 shadowITData = data;
 
                 renderShadowComposition(data);
@@ -8096,11 +8097,15 @@
         // ========================================
         // UTILITIES
         // ========================================
+        // Quotes must be escaped too: results land inside attr="..." values.
         function escapeHtml(text) {
-            if (!text) return '';
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+            if (text == null) return '';
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         function truncateText(text, maxLength) {
@@ -9458,7 +9463,7 @@
                             ${ext.install_users != null ? ` · ${Number(ext.install_users).toLocaleString()} installs` : ' · install count unavailable'}
                         </div>
                     </div>
-                    ${ext.store_url ? `<div class="detail-row"><div class="detail-label">Store listing</div><div class="detail-value"><a href="${escapeHtml(ext.store_url)}" target="_blank" rel="noopener noreferrer" class="text-sm">${escapeHtml(ext.store_url)}</a></div></div>` : ''}
+                    ${/^https:\/\//i.test(ext.store_url || '') ? `<div class="detail-row"><div class="detail-label">Store listing</div><div class="detail-value"><a href="${escapeHtml(ext.store_url)}" target="_blank" rel="noopener noreferrer" class="text-sm">${escapeHtml(ext.store_url)}</a></div></div>` : ''}
                     <div class="detail-row">
                         <div class="detail-label">Why this score</div>
                         <div class="detail-value">${signals}</div>

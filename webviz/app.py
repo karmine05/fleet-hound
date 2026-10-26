@@ -465,6 +465,14 @@ def _is_loopback(addr: str) -> bool:
     return any(ip in net for net in _LOOPBACK_NETS)
 
 
+def _is_loopback_host(host: str) -> bool:
+    hostname = host or ""
+    if not hostname.endswith("]"):  # strip :port, but not from a bare "[::1]"
+        hostname = hostname.rsplit(":", 1)[0]
+    hostname = hostname.strip("[]").lower()
+    return hostname == "localhost" or _is_loopback(hostname)
+
+
 def _client_ip() -> str:
     return (request.remote_addr or "").strip()
 
@@ -511,7 +519,9 @@ def _enforce_auth():
         }), 401
 
     # GETs: loopback always OK, others require explicit anonymous-read opt-in.
-    if _is_loopback(_client_ip()):
+    # Host check blocks DNS rebinding and local tunnels/proxies (which connect
+    # from 127.0.0.1 but carry a public Host header).
+    if _is_loopback(_client_ip()) and _is_loopback_host(request.host):
         return None
     if WEBVIZ_ALLOW_ANONYMOUS_READ:
         return None
@@ -662,7 +672,6 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "database": "connected",
-        "memgraph_uri": MEMGRAPH_URI
     }), 200
 
 @app.route("/api/authorize-software", methods=['POST'])

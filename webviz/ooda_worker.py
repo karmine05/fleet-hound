@@ -290,7 +290,7 @@ def _decide_phase(driver) -> tuple[dict, dict]:
                 summary["shadow_it_count"] = len(shadow)
     except Exception as exc:
         logger.warning("ooda: decide queries failed: %s", exc)
-        findings["error"] = f"{type(exc).__name__}: {exc}"
+        findings["error"] = type(exc).__name__
     return findings, summary
 
 
