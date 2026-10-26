@@ -2657,6 +2657,29 @@ def authorize_software():
             payload["details"] = str(e)
         return jsonify(payload), 500
 
+def _shadow_it_users_by_software(session, software_names):
+    """Map software name -> sorted list of usernames on hosts that have it.
+
+    Batched form of the per-software user lookup that used to run once per
+    detection candidate inside /api/shadow-it — up to one Bolt round-trip per
+    software (thousands of queries on a normal fleet, the endpoint's dominant
+    cost). One `s.name IN $names` query returns every candidate's user set;
+    names with no reachable user simply map to [].
+    """
+    names = list(dict.fromkeys(n for n in software_names if n))
+    if not names:
+        return {}
+    rows = session.run(
+        """
+        MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
+        WHERE s.name IN $names
+        RETURN s.name AS name, COLLECT(DISTINCT u.username) AS users
+        """,
+        names=names,
+    )
+    return {r["name"]: sorted(r["users"] or []) for r in rows}
+
+
 @app.route("/api/shadow-it")
 def get_shadow_it():
     """Detect Shadow IT - unauthorized or risky software installations.
@@ -2876,8 +2899,13 @@ def get_shadow_it():
             # Add outlier_threshold to filter_params
             filter_params['outlier_threshold'] = OUTLIER_THRESHOLD
             
-            result = session.run(outlier_query, **filter_params)
-            for record in result:
+            outlier_rows = list(session.run(outlier_query, **filter_params))
+            # Batch the per-software user lookup (replaces the N+1 pattern:
+            # one query for every candidate instead of one per candidate).
+            outlier_users_by_name = _shadow_it_users_by_software(
+                session, [r['software_name'] for r in outlier_rows]
+            )
+            for record in outlier_rows:
                 # Skip OS-managed system packages and dev-language transitive
                 # deps — neither is a deliberate user install. Browser/IDE
                 # extensions are NOT skipped (2026-06-10): they are first-class
@@ -2892,14 +2920,7 @@ def get_shadow_it():
                 ):
                     continue
 
-                # Get users on affected hosts
-                users_query = """
-                    MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                    RETURN COLLECT(DISTINCT u.username) AS users
-                """
-                users_result = session.run(users_query, software_name=record['software_name'])
-                users_record = users_result.single()
-                users = users_record['users'] if users_record else []
+                users = outlier_users_by_name.get(record['software_name'], [])
 
                 # Risk level based on install count
                 risk_level = "high" if record['host_count'] == 1 else "medium"
@@ -2965,9 +2986,12 @@ def get_shadow_it():
                        db_category, db_desc, db_sources
             """
             
-            result = session.run(all_software_query, **filter_params)
-
-            for record in result:
+            high_risk_rows = list(session.run(all_software_query, **filter_params))
+            # Batched user lookup (replaces the per-candidate N+1 query).
+            high_risk_users_by_name = _shadow_it_users_by_software(
+                session, [r['software_name'] for r in high_risk_rows]
+            )
+            for record in high_risk_rows:
                 software_lower = record['software_name'].lower()
                 display_lower = (record.get('display_name') or record['software_name']).lower()
                 db_categories = record.get('db_category') or []
@@ -3007,14 +3031,7 @@ def get_shadow_it():
                             break
 
                 if matched_category:
-                    # Get users on affected hosts
-                    users_query = """
-                        MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                        RETURN COLLECT(DISTINCT u.username) AS users
-                    """
-                    users_result = session.run(users_query, software_name=record['software_name'])
-                    users_record = users_result.single()
-                    users = users_record['users'] if users_record else []
+                    users = high_risk_users_by_name.get(record['software_name'], [])
                     
                     # All high-risk category detections are high risk
                     risk_level = "high"
@@ -3102,8 +3119,12 @@ def get_shadow_it():
                 LIMIT 20
             """
 
-            result = session.run(version_sprawl_query, **filter_params)
-            for record in result:
+            version_sprawl_rows = list(session.run(version_sprawl_query, **filter_params))
+            # Batched user lookup (replaces the per-candidate N+1 query).
+            version_sprawl_users_by_name = _shadow_it_users_by_software(
+                session, [r['software_name'] for r in version_sprawl_rows]
+            )
+            for record in version_sprawl_rows:
                 # System packages and dev-language deps routinely show many
                 # versions across distro releases / lockfile drift — that's
                 # package-manager state, not Shadow IT. Extensions remain
@@ -3115,14 +3136,7 @@ def get_shadow_it():
                 ):
                     continue
 
-                # Get users on affected hosts
-                users_query = """
-                    MATCH (s:Software {name: $software_name})-[:INSTALLED_ON]->(h:Host)<-[:USES]-(u:User)
-                    RETURN COLLECT(DISTINCT u.username) AS users
-                """
-                users_result = session.run(users_query, software_name=record['software_name'])
-                users_record = users_result.single()
-                users = users_record['users'] if users_record else []
+                users = version_sprawl_users_by_name.get(record['software_name'], [])
                 
                 # Risk level based on version count
                 if record['version_count'] > 5:
