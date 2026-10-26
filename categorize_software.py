@@ -16,6 +16,7 @@ Production-grade defenses against Wikidata's flaky free SPARQL endpoint:
 import argparse
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
@@ -86,6 +87,18 @@ USER_AGENT = 'FleetHoundSoftwareCategorizer/1.0 (https://github.com/fleethound)'
 # title + description + extract for any encyclopedia entry. ~100-300ms typical
 # response, generous rate limits, and excellent uptime.
 WIKIPEDIA_REST_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+
+# A Wikipedia summary counts as a hit only if it mentions one of these.
+_SOFTWARE_HINT_RE = re.compile(
+    r"\b(software|application|app|apps|program|programs|utility|utilities|tool|tools|"
+    r"toolkit|library|framework|browser|editor|client|server|daemon|shell|terminal|"
+    r"command[- ]line|package|plug-?in|extension|operating system|database|compiler|"
+    r"interpreter|programming language|ide|sdk|api|emulator|video game|messaging|"
+    r"messenger|driver|firmware|codec|open[- ]source|freeware|proprietary|"
+    r"vpn|antivirus|password manager|cloud-based|web-based|communication platform|"
+    r"collaboration)\b",
+    re.IGNORECASE,
+)
 
 # Failure-cache cooldown. After a software fails enrichment (HTTP 404 / no
 # entry), don't re-query for this many days. Reduces wasted API calls every
@@ -240,7 +253,8 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
         return EnrichResult.MISS, None
     if response.status_code == 429:
         retry_after = response.headers.get('Retry-After')
-        wait_s = int(retry_after) if (retry_after and retry_after.isdigit()) else 30
+        # Capped: this sleeps inside a pool thread and ignores stop requests.
+        wait_s = min(int(retry_after), 120) if (retry_after and retry_after.isdigit()) else 30
         logger.warning("rate limited by wikipedia; waiting %ds", wait_s)
         time.sleep(wait_s)
         return EnrichResult.TRANSIENT, None
@@ -264,6 +278,12 @@ def get_software_info(software_name: str, http: requests.Session) -> Tuple[str, 
     description = data.get('description') or ''
     extract = data.get('extract') or ''
     if not description and not extract:
+        return EnrichResult.MISS, None
+
+    # Titles are bare package names, so Wikipedia often answers with an
+    # unrelated article ("fish" -> the animal, "card shark" -> a gambler).
+    # Only accept summaries that read like software.
+    if not _SOFTWARE_HINT_RE.search(f"{description} {extract}"):
         return EnrichResult.MISS, None
 
     categories = infer_categories_from_description(description, extract)

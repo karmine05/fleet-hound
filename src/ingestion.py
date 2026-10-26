@@ -348,6 +348,7 @@ class MemgraphIngestion:
             # Grouped software structure: List of {fleet_host_id: int, software_list: []}.
             # Keyed by Fleet's stable id; hostname carried only for diagnostic logs.
             software_grouped_batch = []
+            empty_sw_hosts: list = []
             sw_written_fids: set = set()  # scopes the post-ingest dedupe sweep
 
             if total_hosts is None:
@@ -450,6 +451,11 @@ class MemgraphIngestion:
 
                 # User Relationships — match Host by fleet_host_id (stable).
                 extracted_users = self._extract_user_identifiers(host)
+                # Stale USES pruning needs a positive signal: only when Fleet
+                # actually sent a users list (populate_users) for this host.
+                host_batch[-1]['usernames'] = (
+                    extracted_users if isinstance(host.get('users'), list) else None
+                )
                 for uname in extracted_users:
                      # Simple lookup for enrichment
                      user = user_lookup.get(uname)
@@ -486,6 +492,17 @@ class MemgraphIngestion:
 
                 if skip_sw:
                     skipped_unchanged_sw += 1
+                elif (isinstance(host.get('software'), list) and not host['software']
+                        and fleet_sw_updated
+                        and sw_synced_map.get(fleet_host_id) not in (None, fleet_sw_updated)):
+                    # Fleet re-inventoried this host (timestamp moved) and now
+                    # reports zero software: drop its stale INSTALLED_ON edges.
+                    # An empty list without a timestamp change could be a
+                    # truncated fetch, so that case still keeps the edges.
+                    empty_sw_hosts.append({
+                        'fleet_host_id': fleet_host_id,
+                        'fleet_software_updated_at': fleet_sw_updated,
+                    })
                 else:
                     software_list = host.get('software', [])
                     if software_list:
@@ -591,6 +608,16 @@ class MemgraphIngestion:
                 self._batch_create_user_relationships(session, user_rel_batch)
             if software_grouped_batch:
                 self._batch_create_software_grouped(session, software_grouped_batch)
+            if empty_sw_hosts:
+                self._execute_with_retry(session, """
+                    UNWIND $rows AS row
+                    MATCH (h:Host {fleet_host_id: row.fleet_host_id})
+                    OPTIONAL MATCH (:Software)-[r:INSTALLED_ON]->(h)
+                    DELETE r
+                    WITH DISTINCT h, row
+                    SET h.fleet_software_updated_at_synced = row.fleet_software_updated_at
+                """, {'rows': empty_sw_hosts}, "prune INSTALLED_ON for emptied hosts")
+                logger.info("pruned software edges on hosts now reporting none count=%d", len(empty_sw_hosts))
 
             # Post-ingest sweep: collapse any duplicate INSTALLED_ON edges the
             # parallel-chunk MERGE race may have produced this cycle (see
@@ -734,6 +761,16 @@ class MemgraphIngestion:
         if not self._execute_with_retry(session, query, {'hosts': host_batch}, "create host batch"):
             # Hold the watermark so these hosts are re-fetched next cycle.
             self.failed_software_host_ids.extend(h['fleet_host_id'] for h in host_batch)
+            return
+        # Drop USES edges to users Fleet no longer reports on the host. The
+        # MERGE in _batch_create_user_relationships re-adds current ones.
+        self._execute_with_retry(session, """
+            UNWIND $hosts AS host
+            WITH host WHERE host.usernames IS NOT NULL
+            MATCH (u:User)-[r:USES]->(h:Host {fleet_host_id: host.fleet_host_id})
+            WHERE NOT u.username IN host.usernames
+            DELETE r
+        """, {'hosts': host_batch}, "prune stale USES edges")
 
     def _batch_create_user_relationships(self, session, user_rel_batch):
         """Batch create user-host relationships using UNWIND.

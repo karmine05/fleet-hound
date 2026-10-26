@@ -17,6 +17,27 @@ CONNECTED_HOST_CAP = 500
 
 bp = Blueprint("search", __name__)
 
+
+def _lower_regex_literals(pattern: str) -> str:
+    """Lowercase a regex for matching against toLower(text), escapes intact.
+
+    Memgraph's regex engine has no (?i) flag, and pattern.lower() turned
+    \\D/\\S/\\W/\\B into \\d/\\s/\\w/\\b. Letters after a backslash are
+    copied verbatim; every other letter (classes included, so [A-Z] -> [a-z])
+    is lowercased.
+    """
+    out = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        out.append(ch.lower())
+        i += 1
+    return "".join(out)
+
 @bp.route("/api/search")
 def search_all():
     """Universal search endpoint for all node types (hosts, users, software).
@@ -148,7 +169,7 @@ def search_all():
 
                 params = {'search_term': search_term}
                 if search_mode == 'regex' and not case_sensitive:
-                    params['search_term_lower'] = search_term.lower()
+                    params['search_term_lower'] = _lower_regex_literals(search_term)
                 if platform_filter != 'all':
                     params['platform'] = platform_filter
                 if team_filter != 'all':
@@ -199,7 +220,7 @@ def search_all():
                 """
                 params = {'search_term': search_term}
                 if search_mode == 'regex' and not case_sensitive:
-                    params['search_term_lower'] = search_term.lower()
+                    params['search_term_lower'] = _lower_regex_literals(search_term)
 
                 if platform_filter != 'all':
                     user_query += " AND toLower(h.platform) CONTAINS toLower($platform)"
@@ -259,7 +280,7 @@ def search_all():
                 """
                 params = {'search_term': search_term}
                 if search_mode == 'regex' and not case_sensitive:
-                    params['search_term_lower'] = search_term.lower()
+                    params['search_term_lower'] = _lower_regex_literals(search_term)
 
                 if platform_filter != 'all':
                     software_query += " AND toLower(h.platform) CONTAINS toLower($platform)"

@@ -4648,17 +4648,24 @@
                 return url.indexOf('/api/') === 0;
             };
 
-            const readToken = () =>
-                (localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || '').trim();
+            // sessionStorage only: a long-lived localStorage token is what an XSS
+            // would steal. Storage can throw (blocked site data), so guard it.
+            const safe = (fn, fallback) => { try { return fn(); } catch (_e) { return fallback; } };
+            // One-time migration: drop any token an older build left in localStorage.
+            const legacy = safe(() => localStorage.getItem(TOKEN_KEY), null);
+            if (legacy) {
+                safe(() => { if (!sessionStorage.getItem(TOKEN_KEY)) sessionStorage.setItem(TOKEN_KEY, legacy); });
+                safe(() => localStorage.removeItem(TOKEN_KEY));
+            }
+
+            const readToken = () => (safe(() => sessionStorage.getItem(TOKEN_KEY), '') || '').trim();
 
             const writeToken = (value) => {
                 if (!value) {
-                    localStorage.removeItem(TOKEN_KEY);
-                    sessionStorage.removeItem(TOKEN_KEY);
+                    safe(() => sessionStorage.removeItem(TOKEN_KEY));
                     return;
                 }
-                localStorage.setItem(TOKEN_KEY, value);
-                sessionStorage.setItem(TOKEN_KEY, value);
+                safe(() => sessionStorage.setItem(TOKEN_KEY, value));
             };
 
             const attachToken = (init, token) => {
@@ -5235,10 +5242,9 @@
                     // Performance guardrail: SVG-based force layouts melt at ~800
                     // nodes. Beyond that we render the most-connected slice and
                     // surface a clear status so the user knows it's a partial view.
-                    const RENDER_BUDGET = 800;
                     let renderData = data;
-                    if (data.nodes.length > RENDER_BUDGET) {
-                        renderData = capGraphForRender(data, RENDER_BUDGET);
+                    if (data.nodes.length > GRAPH_RENDER_BUDGET) {
+                        renderData = capGraphForRender(data, GRAPH_RENDER_BUDGET);
                         showStatus(`Loaded ${data.nodes.length} nodes — showing top ${renderData.nodes.length} by connections. Use search to drill in.`, false);
                     } else {
                         showStatus(`Loaded ${data.nodes.length} nodes, ${data.links.length} relationships`);
@@ -5261,6 +5267,8 @@
          * between them. Used as a soft cap for the initial overview render so
          * SVG force layouts stay smooth on real-world fleets (≥1k nodes).
          */
+        const GRAPH_RENDER_BUDGET = 800;  // SVG force layouts degrade beyond this
+
         function capGraphForRender(data, budget) {
             const degree = new Map();
             data.links.forEach(l => {
@@ -5746,12 +5754,15 @@
             d3.selectAll('.node').classed('highlight-node', false);
             d3.selectAll('.link').classed('highlight-link', false);
 
+            const isLatestExpand = beginRequest('expand');
             if (clickedNode.type === 'host') {
                 showStatus(`Loading software for ${clickedNode.name}...`);
                 const fidQS = clickedNode.fleet_host_id != null ? `?fleet_host_id=${encodeURIComponent(clickedNode.fleet_host_id)}` : '';
                 fetch(`/api/host/${encodeURIComponent(clickedNode.name)}/software${fidQS}`)
                     .then(response => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
                     .then(hostData => {
+                        if (!isLatestExpand()) return;
+                        hostData = hostData.nodes.length > GRAPH_RENDER_BUDGET ? capGraphForRender(hostData, GRAPH_RENDER_BUDGET) : hostData;
                         currentData = hostData;
                         renderGraph(hostData);
                         setTimeout(() => {
@@ -5769,8 +5780,10 @@
                 const softwareLabel = clickedNode.display_name || clickedNode.name;
                 showStatus(`Loading hosts with ${softwareLabel}...`);
                 fetch(`/api/software/${encodeURIComponent(clickedNode.name)}/hosts`)
-                    .then(response => response.json())
+                    .then(response => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
                     .then(softwareData => {
+                        if (!isLatestExpand()) return;
+                        softwareData = softwareData.nodes.length > GRAPH_RENDER_BUDGET ? capGraphForRender(softwareData, GRAPH_RENDER_BUDGET) : softwareData;
                         currentData = softwareData;
                         renderGraph(softwareData);
                         setTimeout(() => {
@@ -5882,9 +5895,11 @@
                 if (_hasLabelScope) statusMsg += ` (scoped to ${_scope.labels.length} label${_scope.labels.length === 1 ? '' : 's'})`;
                 showStatus(statusMsg + '...');
 
+                const isLatest = beginRequest('graph');
                 fetch(`/api/search?${searchParam}${typeParam}${platformParam}${teamParam}${labelsParam}${modeParam}${caseParam}`)
                     .then(response => response.json())
                     .then(data => {
+                        if (!isLatest()) return;
                         if (data.error) {
                             showStatus(`Search Error: ${data.message || data.error}`, true);
                             return;
@@ -6250,9 +6265,11 @@
             scopeQs.set('type', type);
             scopeQs.set('limit', '1000');
 
+            const isLatest = beginRequest('blastList');
             fetch(`/api/search?${scopeQs.toString()}`)
                 .then(res => res.json())
                 .then(data => {
+                    if (!isLatest()) return;
                     blastEntities = data.nodes.filter(n => n.type === type);
                     renderBlastList(blastEntities, true);
                 })
@@ -6291,7 +6308,9 @@
             // the initial load; an explicit pick (Graph → Blast radius) has
             // already set selectedEntityId and wins.
             if (autoSelect && !selectedEntityId) {
-                const starter = entities.find((e) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(e.name)) || entities[0];
+                // Skip UUIDs and names with no visible letter/digit (Fleet reports
+                // some software named just U+200E).
+                const starter = entities.find((e) => /[\p{L}\p{N}]/u.test(e.name) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(e.name)) || entities[0];
                 const item = listContainer.querySelectorAll('.entity-item')[entities.indexOf(starter)];
                 if (item && starter) selectBlastEntity(starter, item);
             }
@@ -6312,9 +6331,11 @@
                 scopeQs.set('type', type);
                 scopeQs.set('q', term);
                 scopeQs.set('limit', '100');
+                const isLatest = beginRequest('blastList');
                 fetch(`/api/search?${scopeQs.toString()}`)
                     .then(res => res.json())
                     .then(data => {
+                        if (!isLatest()) return;
                         const results = data.nodes.filter(n => n.type === type);
                         renderBlastList(results);
                     })
@@ -6362,9 +6383,11 @@
                 ? `&labels=${encodeURIComponent(labelScope.labels)}&label_op=${encodeURIComponent(labelScope.label_op)}`
                 : '';
 
-            fetch(`/api/blast-radius?type=${type}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}${labelParams}`)
+            const isLatest = beginRequest('blast');
+            fetch(`/api/blast-radius?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}&team=${encodeURIComponent(teamFilter)}&ignore_defaults=${ignoreDefaults}${exclusionParams}${labelParams}`)
                 .then(res => res.json())
                 .then(data => {
+                    if (!isLatest()) return;
                     if (data.error) throw new Error(data.error);
                     updateBlastMetrics(data);
                     renderBlastDiagram(data);
@@ -7806,8 +7829,10 @@
             }
 
             try {
+                const isLatest = beginRequest('shadow');
                 const response = await fetch(`/api/shadow-it?${params}`);
                 const data = await response.json();
+                if (!isLatest()) return;
                 if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
                 shadowITData = data;
 
@@ -8098,6 +8123,15 @@
         // ========================================
         // UTILITIES
         // ========================================
+        // Per-view request sequencing: a slow earlier response must not paint
+        // over a newer one. Usage: const isLatest = beginRequest('key');
+        // then bail out of the response handler when !isLatest().
+        const _reqSeq = {};
+        function beginRequest(key) {
+            const n = (_reqSeq[key] = (_reqSeq[key] || 0) + 1);
+            return () => _reqSeq[key] === n;
+        }
+
         // Quotes must be escaped too: results land inside attr="..." values.
         function escapeHtml(text) {
             if (text == null) return '';
@@ -9250,8 +9284,10 @@
             });
 
             try {
+                const isLatest = beginRequest('extensions');
                 const resp = await fetch(`/api/extensions?${params}`);
                 const data = await resp.json();
+                if (!isLatest()) return;
                 if (!resp.ok) throw new Error(data.error || 'query failed');
 
                 const summary = data.summary || {};
@@ -9846,7 +9882,7 @@
                             <div class="tooltip-row"><span>Connections</span><strong>${HOUND.fmt.int(d.degree)}</strong></div>`);
                     })
                     .on('mousemove', (event) => {
-                        HOUND.tooltip.hide();
+                        HOUND.tooltip.move(event.clientX, event.clientY);
                     })
                     .on('mouseleave', clearHover)
                     .on('focus', function (event, d) {

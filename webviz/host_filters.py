@@ -23,12 +23,13 @@ with caller-supplied parameter names (plan section R6).
 Multi-label semantics
 ---------------------
 
-Both AND and OR use a single size-comprehension pattern that traverses
-HAS_LABEL once per row, eliminating the cartesian-product risk that
-multiple MATCH clauses would carry:
+Both AND and OR quantify over the requested names against one pattern
+comprehension of the host's label names, eliminating the cartesian-product
+risk that multiple MATCH clauses would carry. Duplicate names or duplicate
+HAS_LABEL edges cannot skew the result:
 
-    AND: size([(h)-[:HAS_LABEL]->(_l:Label) WHERE _l.name IN $names | _l]) = size($names)
-    OR:  size([(h)-[:HAS_LABEL]->(_l:Label) WHERE _l.name IN $names | _l]) >= 1
+    AND: all(_n IN $names WHERE _n IN [(h)-[:HAS_LABEL]->(_l:Label) | _l.name])
+    OR:  any(_n IN $names WHERE _n IN [(h)-[:HAS_LABEL]->(_l:Label) | _l.name])
 
 Predictable plan, single traversal, no risk of inflating row count.
 
@@ -67,7 +68,7 @@ def _split_labels(raw: str) -> list:
     """
     if not raw:
         return []
-    return [seg.strip() for seg in raw.split(",") if seg.strip()]
+    return list(dict.fromkeys(seg.strip() for seg in raw.split(",") if seg.strip()))
 
 
 def apply_host_filters(args: Mapping, host_var: str = "h",
@@ -122,11 +123,12 @@ def apply_host_filters(args: Mapping, host_var: str = "h",
                 raise FilterValidationError(
                     "label_op must be one of: AND, OR (case-insensitive)"
                 )
-            comparator = "=" if label_op_raw == "AND" else ">="
-            rhs = "size($_flt_labels)" if label_op_raw == "AND" else "1"
+            # all()/any() over the requested names: a size() comparison broke
+            # on duplicate names (A,A matched nothing) and duplicate edges.
+            quantifier = "all" if label_op_raw == "AND" else "any"
             parts.append(
-                f"size([({host_var})-[:HAS_LABEL]->(_l:Label) "
-                f"WHERE _l.name IN $_flt_labels | _l]) {comparator} {rhs}"
+                f"{quantifier}(_n IN $_flt_labels WHERE _n IN "
+                f"[({host_var})-[:HAS_LABEL]->(_l:Label) | _l.name])"
             )
             params["_flt_labels"] = names
 

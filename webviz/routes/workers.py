@@ -371,12 +371,14 @@ def extension_detail():
         return jsonify({"error": "Database connection failed"}), 500
 
     name_fallback = key[5:] if key.startswith("name:") else key
-    query = """
+    # Extension guard: without it, key=<any software name> returned that
+    # node's full property map.
+    query = f"""
         MATCH (s:Software)
-        WHERE s.extension_key = $key OR s.name = $name_fallback
+        WHERE (s.extension_key = $key OR s.name = $name_fallback) AND {_EXT_WHERE}
         OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
         RETURN properties(s) AS props,
-               collect(DISTINCT {
+               collect(DISTINCT {{
                    hostname: h.hostname,
                    version: r.version,
                    source: r.source,
@@ -384,7 +386,7 @@ def extension_detail():
                    installed_path: r.installed_path,
                    first_seen: r.first_seen,
                    last_seen: r.last_seen
-               }) AS hosts
+               }}) AS hosts
     """
     try:
         with driver.session() as session:

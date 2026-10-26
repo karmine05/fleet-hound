@@ -99,7 +99,7 @@ class FleetGraphExtractor:
         retries: bumped from 3 to 5 to cover Cloudflare 502 windows on slow
             Fleet endpoints (large `/hosts?populate_software=true` pages can
             blow past CF's 100s upstream timeout — see global CLAUDE.md note).
-            5 attempts with capped exponential backoff gives ~30s total cover.
+            5 attempts with capped exponential backoff gives ~80s total cover.
         timeout: per-call override of self.timeout. Caller passes e.g. 120 for
             the host-listing endpoint where populate_software is expensive at
             10k+ hosts; default (60s) protects everything else.
@@ -122,9 +122,11 @@ class FleetGraphExtractor:
                 # we don't spend 8 minutes on a hopeless run.
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                     retry_after = resp.headers.get('Retry-After')
-                    backoff = min(0.5 * (2 ** attempt), 16.0)
-                    if resp.status_code == 429 and retry_after and retry_after.isdigit():
-                        backoff = max(backoff, int(retry_after))
+                    # 2s, 6s, 18s, 54s (~80s total): Cloudflare 502 windows on
+                    # slow /hosts pages outlast a sub-10s schedule.
+                    backoff = min(2.0 * (3 ** attempt), 60.0)
+                    if resp.status_code in (429, 503) and retry_after and retry_after.isdigit():
+                        backoff = max(backoff, min(int(retry_after), 120))
                     if self.debug:
                         logger.warning(
                             "GET %s status=%d retrying_in=%.1fs attempt=%d/%d",

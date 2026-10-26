@@ -14,6 +14,7 @@ must degrade to a local, explainable score instead of failing ingestion.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
@@ -226,6 +227,20 @@ def _normalise_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
+# Same mapping as the names they are compared with ("1password" -> "lpassword").
+_NORMALISED_BRANDS = tuple(dict.fromkeys(_normalise_name(b) for b in _BRANDS))
+
+# Trailing legal/corporate words dropped before comparing publisher names, so
+# "Google LLC" / "Meta Platforms, Inc." / "Avast Software s.r.o." match.
+_PUBLISHER_SUFFIXES = frozenset({
+    "inc", "llc", "ltd", "limited", "corp", "corporation", "co", "company",
+    "gmbh", "ag", "sa", "srl", "sro", "bv", "plc", "pty", "software", "systems",
+    "security", "technologies", "platforms", "labs", "lab",
+    # Store author names often append these (AMO: "1Password Devs").
+    "devs", "dev", "developers", "developer", "team",
+})
+
+
 def _edit_distance_at_most_one(a: str, b: str) -> bool:
     if a == b:
         return True
@@ -288,10 +303,11 @@ def name_anomaly_signals(name: str, display_name: str = "", *,
         add("dotted-identifier-name", 4, "name looks like a reverse-DNS identifier")
 
     compact = _normalise_name(display)
-    if len(compact) >= 5:
-        for brand in _BRANDS:
-            if compact == brand:
-                break
+    # The exact brand spelling ("1Password") is the brand itself, not a
+    # typosquat; only look-alikes ("1Passw0rd", "adgaurd") are flagged.
+    exact = re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKC", display).casefold())
+    if len(compact) >= 5 and exact not in _BRANDS:
+        for brand in _NORMALISED_BRANDS:
             if _edit_distance_at_most_one(compact, brand):
                 add("typosquat-brand", 18,
                     f"name is one edit away from the '{brand}' brand")
@@ -306,19 +322,25 @@ def name_anomaly_signals(name: str, display_name: str = "", *,
     return signals, min(penalty, 35)
 
 
-def publisher_is_reputable(*values) -> bool:
-    """True when vendor/developer metadata names a known publisher.
+def _normalise_publisher(value) -> str:
+    words = re.sub(r"[^\w\s]+", "", unicodedata.normalize("NFKC", _clean_str(value))
+                   .casefold()).split()
+    while len(words) > 1 and words[-1] in _PUBLISHER_SUFFIXES:
+        words.pop()
+    return " ".join(words)
 
-    The extension display name is intentionally NOT consulted: typosquatters
-    put the brand in the name, not in the verified publisher field.
+
+_NORMALISED_PUBLISHERS = frozenset(_normalise_publisher(p) for p in _KNOWN_PUBLISHERS)
+
+
+def publisher_is_reputable(*values) -> bool:
+    """True when a store-sourced developer/publisher field IS a known publisher.
+
+    Callers pass store fields only: Fleet's host-reported `vendor` and the
+    display name are attacker-influenced. Normalized equality, not a word
+    search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
     """
-    haystack = " ".join(_clean_str(v) for v in values if v).casefold()
-    if not haystack:
-        return False
-    return any(
-        re.search(rf"(?<![a-z0-9]){re.escape(p)}(?![a-z0-9])", haystack)
-        for p in _KNOWN_PUBLISHERS
-    )
+    return any(_normalise_publisher(v) in _NORMALISED_PUBLISHERS for v in values if v)
 
 
 # ---------------------------------------------------------------------------
@@ -361,20 +383,25 @@ def _as_string_list(value) -> list[str]:
     return []
 
 
-def _permission_sets(meta: dict, record: dict) -> tuple[set[str], set[str], set[str]]:
+def _permission_sets(meta: dict, record: dict) -> tuple[set[str], set[str], set[str], set[str]]:
     raw_perms = _as_string_list(meta.get("permissions") or record.get("permissions"))
     raw_hosts = _as_string_list(meta.get("host_permissions") or record.get("host_permissions"))
     matches = _as_string_list(
         meta.get("content_script_matches") or record.get("content_script_matches")
     )
+    raw_optional = _as_string_list(
+        meta.get("optional_permissions") or record.get("optional_permissions")
+    )
     perms: set[str] = set()
     hosts: set[str] = set(raw_hosts)
     for p in raw_perms:
         (hosts if _HOST_PATTERN_RE.match(p) else perms).add(p)
-    return perms, hosts, set(matches)
+    optional = {p for p in raw_optional if not _HOST_PATTERN_RE.match(p)} - perms
+    return perms, hosts, set(matches), optional
 
 
-def _capability(perms: set[str], hosts: set[str], matches: set[str]) -> tuple[int, list[dict]]:
+def _capability(perms: set[str], hosts: set[str], matches: set[str],
+                optional: set[str] = frozenset()) -> tuple[int, list[dict]]:
     score = 0
     signals: list[dict] = []
     for perm in sorted(perms):
@@ -385,6 +412,19 @@ def _capability(perms: set[str], hosts: set[str], matches: set[str]) -> tuple[in
                 "code": f"permission:{perm}",
                 "weight": weight,
                 "detail": f"requests the '{perm}' permission",
+            })
+    # Optional permissions are granted at runtime, so half weight, and their
+    # total never exceeds what the required permissions contribute.
+    budget = score
+    for perm in sorted(optional):
+        weight = min(round(_PERMISSION_WEIGHTS.get(perm, 0) * 0.5), budget)
+        if weight > 0:
+            budget -= weight
+            score += weight
+            signals.append({
+                "code": f"optional-permission:{perm}",
+                "weight": weight,
+                "detail": f"may request the '{perm}' permission at runtime",
             })
     if hosts & _ALL_URLS:
         score += 20
@@ -415,7 +455,8 @@ def _capability(perms: set[str], hosts: set[str], matches: set[str]) -> tuple[in
             "weight": 5,
             "detail": f"injects a content script into {len(matches)} pattern(s)",
         })
-    if not hosts:
+    # Content scripts reach page content too, so only discount when neither exists.
+    if not hosts and not matches:
         score = round(score * 0.6)
     return min(100, score), signals
 
@@ -644,16 +685,14 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
             "intel_error": None,
         }
 
-    perms, hosts, matches = _permission_sets(meta, record)
-    capability, cap_signals = _capability(perms, hosts, matches)
+    perms, hosts, matches, optional = _permission_sets(meta, record)
+    capability, cap_signals = _capability(perms, hosts, matches, optional)
     signals = list(cap_signals)
 
     publisher = _clean_str(
         meta.get("developer") or meta.get("publisher") or record.get("vendor")
     )
-    reputable = publisher_is_reputable(
-        meta.get("developer"), meta.get("publisher"), record.get("vendor")
-    )
+    reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
     trust, trust_signals = _trust_score(meta, record, reputable=reputable)
     threat, threat_signals = _threat_score(meta, record, blocklist_entry)
     signals.extend(threat_signals)
@@ -839,6 +878,27 @@ def _json_loads(body: bytes):
         return None
 
 
+def _header(headers: dict, name: str) -> str:
+    name = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == name:
+            return _clean_str(value)
+    return ""
+
+
+def _mark_rate_limited(meta: dict, status: int, headers: dict) -> bool:
+    """Flag 429 / 503+Retry-After so the worker trips its per-store breaker.
+
+    `error` is set so the result is never cached; `rate_limited` tells the
+    worker to leave the item unstamped for the next cycle.
+    """
+    if status == 429 or (status == 503 and _header(headers, "Retry-After")):
+        meta["error"] = f"{meta.get('store')} store HTTP {status} (rate limited)"
+        meta["rate_limited"] = True
+        return True
+    return False
+
+
 def _first(data: dict, *keys):
     for key in keys:
         value = data.get(key)
@@ -941,7 +1001,9 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
         "https://clients2.google.com/service/update2/crx"
         f"?response=updatecheck&prodversion=131.0&acceptformat=crx2,crx3&x={query}"
     )
-    status, _, body, error = client.get(url, allowed_hosts=_CHROME_HOSTS, max_bytes=1_000_000)
+    status, headers, body, error = client.get(url, allowed_hosts=_CHROME_HOSTS, max_bytes=1_000_000)
+    if _mark_rate_limited(meta, status, headers):
+        return meta
     if error and status == 0:
         meta["error"] = error
         return meta
@@ -1008,9 +1070,15 @@ def fetch_edge_metadata(extension_id: str, *, client: HttpClient | None = None) 
         f"https://microsoftedge.microsoft.com/addons/detail/{extension_id}"
     )}
     url = f"https://microsoftedge.microsoft.com/addons/getproductdetailsbycrxid/{extension_id}"
-    status, _, body, error = client.get(url, allowed_hosts=_EDGE_HOSTS, max_bytes=2_000_000)
+    status, headers, body, error = client.get(url, allowed_hosts=_EDGE_HOSTS, max_bytes=2_000_000)
+    if _mark_rate_limited(meta, status, headers):
+        return meta
+    if status == 404:
+        meta["status"] = "not_found"
+        meta["error"] = "edge detail returned 404"
+        return meta
     data = _json_loads(body) if body else None
-    if data is None:
+    if status != 200 or data is None:
         meta["error"] = error or f"edge detail HTTP {status}"
         return meta
     if not data:
@@ -1025,7 +1093,7 @@ def fetch_edge_metadata(extension_id: str, *, client: HttpClient | None = None) 
         verified = developer.get("verified", verified)
         developer = _first(developer, "name", "displayName", "publisherName")
     meta.update({
-        "status": "public" if status in (200, 404) else "unknown",
+        "status": "public",
         "name": _clean_str(_first(data, "name", "extensionName")) or manifest_fields.get("name"),
         "version": _clean_str(_first(data, "version", "latestVersion")) or manifest_fields.get("version"),
         "users": _as_int(_first(data, "users", "userCount", "usersCount", "installCount")),
@@ -1049,7 +1117,9 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         f"https://addons.mozilla.org/firefox/addon/{urllib.parse.quote(guid, safe='')}/"
     )}
     url = f"https://addons.mozilla.org/api/v5/addons/addon/{urllib.parse.quote(guid, safe='')}/"
-    status, _, body, error = client.get(url, allowed_hosts=_AMO_HOSTS, max_bytes=2_000_000)
+    status, headers, body, error = client.get(url, allowed_hosts=_AMO_HOSTS, max_bytes=2_000_000)
+    if _mark_rate_limited(meta, status, headers):
+        return meta
     if status == 401:
         meta["status"] = "unlisted"
         meta["error"] = "AMO returned 401 (unlisted or self-distributed)"
@@ -1149,7 +1219,7 @@ def fetch_mozilla_blocklist(*, client: HttpClient | None = None) -> dict:
         if not url or url in seen_urls:
             break
         seen_urls.add(url)
-        status, _, body, error = client.get(
+        status, headers, body, error = client.get(
             url, allowed_hosts=_MOZILLA_HOSTS, max_bytes=8 * 1024 * 1024
         )
         if status != 200 or not body:
@@ -1160,9 +1230,86 @@ def fetch_mozilla_blocklist(*, client: HttpClient | None = None) -> dict:
             break
         for record in payload.get("data") or []:
             if isinstance(record, dict) and record.get("guid"):
-                records[str(record["guid"])] = record
-        url = payload.get("next")
+                guid = str(record["guid"])
+                prior = records.get(guid)
+                if prior is not None:
+                    # Mozilla files separate records per blocked version range
+                    # for one GUID; keep every range, not just the last record.
+                    record = {**record, "versionRange": list(prior.get("versionRange") or [])
+                              + list(record.get("versionRange") or [])}
+                records[guid] = record
+        # Kinto paginates via the Next-Page header; `next` kept as a fallback.
+        url = _header(headers, "Next-Page") or payload.get("next")
     return records
+
+
+@functools.lru_cache(maxsize=4096)
+def _guid_regex(guid: str):
+    """Compile a `/pattern/` blocklist GUID once. None for plain/invalid GUIDs."""
+    if len(guid) < 3 or not guid.startswith("/") or not guid.endswith("/"):
+        return None
+    try:
+        return re.compile(guid[1:-1])
+    except re.error:
+        return None
+
+
+def _version_key(version: str) -> list[tuple]:
+    # Per dot part: numeric prefix, then "no suffix" sorts after a suffix
+    # (1.0a < 1.0, like Mozilla pre-releases), then the suffix as a string.
+    key = []
+    for part in str(version).strip().split("."):
+        if part == "*":  # "1.2.*" = any 1.2.x
+            key.append((math.inf, True, ""))
+            continue
+        m = re.match(r"(\d*)(.*)", part)
+        key.append((int(m.group(1) or 0), not m.group(2), m.group(2)))
+    return key
+
+
+def compare_versions(a: str, b: str) -> int:
+    ka, kb = _version_key(a), _version_key(b)
+    pad = (0, True, "")
+    n = max(len(ka), len(kb))
+    ka += [pad] * (n - len(ka))
+    kb += [pad] * (n - len(kb))
+    return (ka > kb) - (ka < kb)
+
+
+def _version_blocked(entry: dict, versions) -> bool:
+    ranges = [r for r in entry.get("versionRange") or [] if isinstance(r, dict)]
+    known = [v for v in versions or () if _clean_str(v)]
+    if not ranges or not known:
+        return True  # no range = every version; unknown installed version fails closed
+    for rng in ranges:
+        lo = _clean_str(rng.get("minVersion")) or "*"
+        hi = _clean_str(rng.get("maxVersion")) or "*"
+        for v in known:
+            if (lo == "*" or compare_versions(v, lo) >= 0) and \
+                    (hi == "*" or compare_versions(v, hi) <= 0):
+                return True
+    return False
+
+
+def match_blocklist(blocklist: dict, extension_id: str, versions=()) -> dict | None:
+    """Return the blocklist record covering `extension_id` at any of `versions`.
+
+    `blocklist` is the raw {guid: record} map from fetch_mozilla_blocklist()
+    (JSON-cacheable). GUIDs may be exact IDs or `/regex/` patterns; regexes
+    are compiled lazily and memoised. Empty `versions` fails closed.
+    """
+    extension_id = _clean_str(extension_id)
+    if not extension_id or not blocklist:
+        return None
+    entry = blocklist.get(extension_id)
+    if isinstance(entry, dict) and _version_blocked(entry, versions):
+        return entry
+    for guid, entry in blocklist.items():
+        rx = _guid_regex(guid) if guid.startswith("/") else None
+        if rx and isinstance(entry, dict) and rx.search(extension_id) \
+                and _version_blocked(entry, versions):
+            return entry
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1246,11 +1393,89 @@ def _self_check() -> None:
     })
     assert any(s["code"] == "typosquat-brand" for s in typo["risk_signals"]), typo
 
+    # Brand list is normalised like names: the real brand is not its own typosquat.
+    assert not name_anomaly_signals("1Password")[0]
+    assert any(s["code"] == "typosquat-brand" for s in name_anomaly_signals("1Passw0rd")[0])
+    assert any(s["code"] == "typosquat-brand" for s in name_anomaly_signals("G00gle")[0])
+
+    # Reputation: store fields only, exact normalised names only.
+    vendor_only = analyze_extension({
+        "store": "chrome", "extension_id": "b" * 32, "name": "helper",
+        "vendor": "Google", "host_count": 1, "store_meta": {"status": "public"},
+    })
+    assert vendor_only["publisher_reputable"] is False, vendor_only
+    assert not publisher_is_reputable("Box Hill Scams")
+    assert not publisher_is_reputable("Meta Tools")
+    assert publisher_is_reputable("Google LLC") and publisher_is_reputable("Meta Platforms, Inc.")
+    assert publisher_is_reputable("AdGuard Software Ltd")
+
+    # Capability: content-script matches cancel the "no host permissions" discount.
+    no_hosts, _ = _capability({"cookies"}, set(), set())
+    with_cs, _ = _capability({"cookies"}, set(), {"https://example.com/*"})
+    assert no_hosts == round(15 * 0.6) and with_cs == 15 + 5, (no_hosts, with_cs)
+    opt, opt_signals = _capability({"storage"}, {"https://a/*"}, set(), {"debugger"})
+    assert opt == 1 + 1 + 2, (opt, opt_signals)  # optional capped at required total
+    opt, _ = _capability({"cookies"}, {"https://a/*"}, set(), {"debugger"})
+    assert opt == 15 + 12 + 2, opt
+
+    # Mozilla blocklist: regex GUIDs, versionRange, unknown version fails closed.
+    blocklist = {
+        "/^((evil@a\\.com)|(\\{0000-bad\\}))$/": {"why": "regex", "versionRange": []},
+        "old@b.com": {"why": "old only", "versionRange": [
+            {"minVersion": "0", "maxVersion": "1.2.*"},
+            {"minVersion": "2.0b1", "maxVersion": "2.0"},
+        ]},
+        "all@c.com": {"why": "all", "versionRange": [{"minVersion": "0", "maxVersion": "*"}]},
+    }
+    assert match_blocklist(blocklist, "evil@a.com")["why"] == "regex"
+    assert match_blocklist(blocklist, "{0000-bad}", ["9"])["why"] == "regex"
+    assert match_blocklist(blocklist, "evil@a.comx") is None
+    assert match_blocklist(blocklist, "old@b.com", ["1.1"])["why"] == "old only"
+    assert match_blocklist(blocklist, "old@b.com", ["1.2.9"]) is not None
+    assert match_blocklist(blocklist, "old@b.com", ["1.10"]) is None
+    assert match_blocklist(blocklist, "old@b.com", ["2.0a1"]) is None
+    assert match_blocklist(blocklist, "old@b.com", ["2.0b3"]) is not None
+    assert match_blocklist(blocklist, "old@b.com", ["3.0"]) is None
+    assert match_blocklist(blocklist, "old@b.com", ["3.0", "1.0"]) is not None
+    assert match_blocklist(blocklist, "old@b.com", []) is not None  # fail closed
+    assert match_blocklist(blocklist, "all@c.com", ["99.1"]) is not None
+    assert match_blocklist(blocklist, "nobody@d.com", ["1"]) is None
+    json.loads(json.dumps(blocklist))  # raw map stays cacheable
+    assert compare_versions("1.10", "1.9") == 1 and compare_versions("1.0", "1.0.0") == 0
+
+    # Adapters: Edge 404 is not_found; 429 / 503+Retry-After flag the breaker;
+    # blocklist follows the Next-Page header.
+    class _Fake:
+        def __init__(self, *responses):
+            self.responses = list(responses)
+
+        def get(self, url, **_):
+            return self.responses.pop(0)
+
+    edge_404 = fetch_edge_metadata("x" * 32, client=_Fake((404, {}, b'{"name":"x"}', None)))
+    assert edge_404["status"] == "not_found", edge_404
+    edge_ok = fetch_edge_metadata("x" * 32, client=_Fake((200, {}, b'{"name":"x"}', None)))
+    assert edge_ok["status"] == "public" and not edge_ok.get("error"), edge_ok
+    edge_500 = fetch_edge_metadata("x" * 32, client=_Fake((500, {}, b'{"name":"x"}', None)))
+    assert edge_500["status"] == "unknown" and edge_500.get("error"), edge_500
+    amo_429 = fetch_amo_metadata("a@b", client=_Fake((429, {}, b"", None)))
+    assert amo_429.get("rate_limited") and amo_429.get("error"), amo_429
+    chrome_503 = fetch_chrome_metadata("a" * 32, client=_Fake((503, {"retry-after": "60"}, b"", None)))
+    assert chrome_503.get("rate_limited"), chrome_503
+    paged = fetch_mozilla_blocklist(client=_Fake(
+        (200, {"Next-Page": "https://firefox.settings.services.mozilla.com/p2"},
+         b'{"data":[{"guid":"a@b"}]}', None),
+        (200, {}, b'{"data":[{"guid":"c@d"}]}', None),
+    ))
+    assert set(paged) == {"a@b", "c@d"}, paged
+
     json_blob, count, max_cvss = summarize_vulnerabilities([
         {"cve": "CVE-2024-0001", "cvss_score": 8.8},
         {"cve": "CVE-2024-0002", "cvss_score": 5.1},
     ])
     assert count == 2 and max_cvss == 8.8 and "CVE-2024-0001" in json_blob
+    assert publisher_is_reputable("1Password Devs"), "AMO author suffix"
+    assert not publisher_is_reputable("Totally Not 1Password Devs")
     print("extension_intel self-check: OK")
 
 
