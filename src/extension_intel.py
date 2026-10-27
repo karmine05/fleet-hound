@@ -170,6 +170,21 @@ def derive_extension_identity(software: dict) -> dict | None:
     }
 
 
+# Built-in (component) extension install roots per store, matched against the
+# lowercased path with "/" -> "\\". Windows: Program Files or the per-user
+# AppData\\Local install; macOS: the app bundle under /Applications.
+_WIN_ROOT = r"[a-z]:\\(?:program files(?: \(x86\))?|users\\[^\\]+\\appdata\\local)\\"
+_BUILTIN_PATH_RES = {
+    "chrome": re.compile(_WIN_ROOT + r"google\\chrome\\application\\"),
+    "edge": re.compile(_WIN_ROOT + r"microsoft\\edge\\application\\"),
+    "brave": re.compile(_WIN_ROOT + r"bravesoftware\\brave-browser\\application\\"),
+    "vivaldi": re.compile(_WIN_ROOT + r"vivaldi\\application\\"),
+    "firefox": re.compile(r"(?:" + _WIN_ROOT + r"mozilla firefox\\"
+                          r"|\\applications\\firefox\.app\\contents\\resources\\"
+                          r"|\\usr\\lib(?:64)?\\firefox(?:-esr)?\\)browser\\features\\"),
+}
+
+
 def is_browser_builtin(record: dict) -> bool:
     """True for vendor-shipped/component extensions that must never be flagged."""
     store = _clean_str(record.get("store")).lower()
@@ -184,13 +199,10 @@ def is_browser_builtin(record: dict) -> bool:
         paths = [paths]
     for path in paths:
         p = str(path).lower().replace("/", "\\")
-        if store == "chrome" and "\\google\\chrome\\application\\" in p:
-            return True
-        if store == "edge" and "\\microsoft\\edge\\application\\" in p:
-            return True
-        if store in ("brave", "opera", "vivaldi") and "\\application\\" in p:
-            return True
-        if store == "firefox" and ("\\browser\\features\\" in p or "/browser/features/" in p):
+        # Anchored at the browser's install root: a host-reported path is
+        # attacker-influenced, so "...\\application\\" elsewhere is not built-in.
+        rx = _BUILTIN_PATH_RES.get(store)
+        if rx and rx.match(p):
             return True
         # Every App Store Safari extension lives in its app's Contents/PlugIns,
         # so only extensions bundled with Safari itself or the OS are built-in.
@@ -864,7 +876,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 6
+SCORER_VERSION = 9
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -886,7 +898,9 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     if isinstance(installed_paths, str):
         installed_paths = [installed_paths]
 
-    builtin = bool(record.get("is_builtin")) or is_browser_builtin({
+    # Recomputed, not read from the node: ingestion sets is_builtin only when a
+    # host is re-ingested, so a stored flag lags behind built-in rule changes.
+    builtin = is_browser_builtin({
         "store": store,
         "extension_id": extension_id,
         "installed_paths": installed_paths,
@@ -2581,6 +2595,9 @@ def _self_check() -> None:
     # Built-in ID/path never hides a blocklist or feed hit; the flag survives.
     fx_builtin = {"store": "firefox", "extension_id": "evil@mozilla.org", "name": "x",
                   "host_count": 3, "versions": ["1.0"]}
+    stale = analyze_extension({"store": "safari", "is_builtin": True, "name": "Clipper", "host_count": 1,
+                               "installed_paths": ["/Applications/C.app/Contents/PlugIns/C.appex"]})
+    assert not stale["is_builtin"] and stale["risk_score"] > 0, stale
     assert analyze_extension(fx_builtin)["risk_score"] == 0
     flagged = analyze_extension(fx_builtin, blocklist_entry={"guid": "evil@mozilla.org"})
     assert flagged["risk_score"] >= 85 and flagged["known_bad"] and flagged["is_builtin"], flagged
@@ -2594,6 +2611,19 @@ def _self_check() -> None:
                                ["/Applications/Safari.app/Contents/PlugIns/Y.appex"]})
     assert not is_browser_builtin({"store": "safari", "extension_id": "com.x.z", "installed_paths":
                                    ["/Users/a/Downloads/Safari.app/Contents/PlugIns/Z.appex"]})
+    for store, path, want in [
+        ("chrome", r"C:\Program Files\Google\Chrome\Application\120.0\resources\x", True),
+        ("chrome", r"C:\Users\a\AppData\Local\Google\Chrome\Application\120.0\x", True),
+        ("chrome", r"C:\Users\a\Desktop\Google\Chrome\Application\x", False),
+        ("brave", r"C:\Users\x\Desktop\application\evil", False),
+        ("vivaldi", r"C:\Program Files\Vivaldi\Application\6.0\x", True),
+        ("edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\156.0\BHO\x.dll", True),
+        ("firefox", "/Applications/Firefox.app/Contents/Resources/browser/features/a.xpi", True),
+        ("firefox", r"C:\Program Files\Mozilla Firefox\browser\features\a.xpi", True),
+        ("firefox", "/tmp/browser/features/a.xpi", False),
+    ]:
+        got = is_browser_builtin({"store": store, "extension_id": "x", "installed_paths": [path]})
+        assert got is want, (store, path, got)
 
     # Typosquat: a store-vouched publisher's look-alike name is not penalised.
     assert name_anomaly_signals("Motion")[1] == 18

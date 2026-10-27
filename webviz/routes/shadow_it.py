@@ -48,6 +48,7 @@ SHADOW_CACHE_TTL_SEC = 30
 _SHADOW_CACHE_MAX = 64
 # Extension worker bands -> Shadow IT levels (the Shadow IT UI has no "critical").
 _EXT_BAND_TO_LEVEL = {"critical": "high", "high": "high", "medium": "medium", "low": "low"}
+_LEVEL_RANK = {"low": 0, "medium": 1, "high": 2}
 _shadow_cache: dict = {}
 _shadow_cache_lock = threading.Lock()
 
@@ -319,13 +320,16 @@ def _get_shadow_it_uncached():
                 # Risk level based on install count, unless the extension
                 # worker already scored this node: its band wins, so the
                 # Shadow IT and Extensions views agree on the same software.
-                # Built-ins are exempt: their risk 0 rests on host-reported
-                # IDs/paths, which must not lower a rare install's level.
+                # Built-ins take the higher of the two: their risk 0 rests on
+                # host-reported IDs/paths, which must not lower a rare install's
+                # level, but a threat-listed built-in's band must still raise it.
                 risk_level = "high" if record['host_count'] == 1 else "medium"
                 risk_reason = (f"Risk is {risk_level.upper()} because this software is installed on only "
                                f"{record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).")
                 ext_band = record.get('ext_band')
-                if ext_band in _EXT_BAND_TO_LEVEL and not record.get('ext_builtin'):
+                if ext_band in _EXT_BAND_TO_LEVEL and (
+                        not record.get('ext_builtin')
+                        or _LEVEL_RANK[_EXT_BAND_TO_LEVEL[ext_band]] > _LEVEL_RANK[risk_level]):
                     risk_level = _EXT_BAND_TO_LEVEL[ext_band]
                     risk_reason = (f"Risk is {risk_level.upper()} from the browser-extension risk score "
                                    f"({record.get('ext_score')}/100, band {ext_band}). Installed on "
