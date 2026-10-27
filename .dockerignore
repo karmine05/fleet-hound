@@ -1,0 +1,22 @@
+# Build context is sent to the Docker daemon: keep secrets, runtime state and
+# local tooling out of it. The Dockerfile COPYs only what it needs.
+.env
+.env.*
+!.env.example
+.git
+.github
+config/*
+!config/known_publishers.json
+!config/extension_threat_feeds.json
+tests/
+docs/
+assets/
+**/__pycache__
+*.py[cod]
+.pytest_cache/
+.playwright-mcp/
+.claude*
+.mcp*
+.planning/
+graphify-out/
+*.log
