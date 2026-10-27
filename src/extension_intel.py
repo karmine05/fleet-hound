@@ -1173,6 +1173,9 @@ def _manifest_fields(meta: dict) -> dict:
     }
 
 
+_MAX_MANIFEST_BYTES = 1024 * 1024
+
+
 def _parse_crx(data: bytes) -> dict:
     """Return manifest.json from a CRX2/CRX3 or plain ZIP payload."""
     if not data:
@@ -1201,12 +1204,16 @@ def _parse_crx(data: bytes) -> dict:
         infos = zf.infolist()
         if len(infos) > 5000:
             raise ValueError("CRX contains too many files")
-        if sum(max(0, i.file_size) for i in infos) > 25 * 1024 * 1024:
-            raise ValueError("CRX uncompressed size exceeds 25 MB")
+        # Only manifest.json is ever decompressed, so cap that entry, not the
+        # archive: real extensions (Bitwarden) exceed 80 MB uncompressed. The
+        # bounded read holds even if the entry under-reports its size.
         try:
-            raw = zf.read("manifest.json")
+            with zf.open("manifest.json") as fh:
+                raw = fh.read(_MAX_MANIFEST_BYTES + 1)
         except KeyError as exc:
             raise ValueError("CRX has no manifest.json") from exc
+        if len(raw) > _MAX_MANIFEST_BYTES:
+            raise ValueError("manifest.json exceeds 1 MB")
         manifest = json.loads(raw.decode("utf-8-sig", errors="replace"))
         if not isinstance(manifest, dict):
             raise ValueError("manifest.json is not an object")
@@ -1331,9 +1338,12 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
         "https://chromewebstore.google.com/detail/" + urllib.parse.quote(extension_id, safe="")
     )}
     query = urllib.parse.quote(f"id={extension_id}&uc", safe="")
+    # Far-future Chrome version: update2 answers "noupdate" (no codebase) when
+    # the item's minimum_chrome_version exceeds prodversion, and a pinned real
+    # version goes stale as vendors raise their minimum.
     url = (
         "https://clients2.google.com/service/update2/crx"
-        f"?response=updatecheck&prodversion=131.0&acceptformat=crx2,crx3&x={query}"
+        f"?response=updatecheck&prodversion=999.0&acceptformat=crx2,crx3&x={query}"
     )
     status, headers, body, error = client.get(url, allowed_hosts=_CHROME_HOSTS, max_bytes=1_000_000)
     if _mark_rate_limited(meta, status, headers):
@@ -1383,11 +1393,18 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
         codebase = updatecheck.get("codebase") or ""
         expected_hash = (updatecheck.get("hash_sha256") or "").lower()
         if not codebase:
-            meta["manifest_error"] = "update2 returned no codebase"
+            # "noupdate": Google serves no package for this ID (e.g. MV2 items
+            # Chrome no longer runs). Nothing was parsed, so nothing is suspect.
+            meta["manifest_unavailable"] = f"update2 status {check_status or 'missing'}, no codebase"
             return meta
         cstatus, _, crx, cerr = client.get(
             codebase, allowed_hosts=_CHROME_HOSTS, max_bytes=50 * 1024 * 1024
         )
+        if cstatus == 200 and cerr == "response too large":
+            # Our download cap, not a bad package (ad blockers bundle >50 MB of
+            # filter lists). A truncated ZIP has no central directory to read.
+            meta["manifest_unavailable"] = "CRX exceeds 50 MB download cap"
+            return meta
         if cstatus != 200 or not crx:
             meta["manifest_error"] = cerr or f"CRX HTTP {cstatus}"
             return meta
@@ -1972,6 +1989,50 @@ def _self_check() -> None:
         "developer_email": "info@hackademix.net", "trader": False,
         "privacy_disclosure": "The developer has disclosed that it will not collect or use your data",
     }, listing
+    class _NoUpdate:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url, **_):
+            self.urls.append(url)
+            if "update2" in url:
+                return 200, {}, (b'<gupdate xmlns="http://www.google.com/update2/response"><app>'
+                                 b'<updatecheck status="noupdate"/></app></gupdate>'), None
+            return 404, {}, b"", None
+    def _zip(files):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, data in files.items():
+                z.writestr(n, data)
+        return buf.getvalue()
+    # Large archives parse (only the manifest is read); a huge manifest does not.
+    big = _zip({"manifest.json": '{"manifest_version": 3}', "blob.bin": b"\0" * (40 << 20)})
+    assert _parse_crx(big) == {"manifest_version": 3}
+    try:
+        _parse_crx(_zip({"manifest.json": b" " * (_MAX_MANIFEST_BYTES + 10) + b"{}"}))
+        raise AssertionError("oversized manifest accepted")
+    except ValueError as exc:
+        assert "exceeds 1 MB" in str(exc)
+
+    class _HugeCrx(_NoUpdate):
+        def get(self, url, **_):
+            if "update2" in url:
+                return 200, {}, (b'<gupdate><app><updatecheck status="ok" version="1" '
+                                 b'codebase="https://clients2.googleusercontent.com/x.crx"/></app></gupdate>'), None
+            if url.endswith(".crx"):
+                return 200, {}, b"Cr24\x03\x00\x00\x00", "response too large"
+            return 404, {}, b"", None
+    huge = fetch_chrome_metadata("c" * 32, client=_HugeCrx())
+    assert "manifest_error" not in huge and "50 MB" in huge["manifest_unavailable"], huge
+
+    nu = _NoUpdate()
+    served_none = fetch_chrome_metadata("c" * 32, client=nu)
+    assert "prodversion=999.0" in nu.urls[0], nu.urls
+    assert served_none["status"] == "public" and "manifest_error" not in served_none, served_none
+    nu_result = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
+                                   "host_count": 1, "store_meta": served_none})
+    assert not any(s["code"] == "manifest-unparseable" for s in nu_result["risk_signals"]), nu_result
+
     assert _chrome_listing(b"<h2>Related</h2>5 users<div>Featured</div>") == {}
     assert _chrome_listing(b'<a aria-label="The publisher has a good record with no history'
                            b' of violations. Learn more.">') == {"established_publisher": True}
