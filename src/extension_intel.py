@@ -788,6 +788,14 @@ def _threat_score(meta: dict, record: dict, blocklist_entry: dict | None) -> tup
         signals.append({"code": "poor-public-reputation", "weight": 15,
                         "detail": f"rated {rating:.1f}/5 by {rating_count:,} reviewers"})
 
+    # Never fail open: a package we could not inspect (store serves none, or
+    # it exceeds our download cap, which an attacker can pad past) has an
+    # unknown capability score, so it must not look clean.
+    if meta.get("manifest_unavailable") and not meta.get("manifest_error"):
+        threat = max(threat, 15)
+        signals.append({"code": "manifest-uninspected", "weight": 15,
+                        "detail": str(meta["manifest_unavailable"])[:200]})
+
     if meta.get("manifest_error"):
         threat = max(threat, 30)
         signals.append({"code": "manifest-unparseable", "weight": 30,
@@ -2032,6 +2040,9 @@ def _self_check() -> None:
     nu_result = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
                                    "host_count": 1, "store_meta": served_none})
     assert not any(s["code"] == "manifest-unparseable" for s in nu_result["risk_signals"]), nu_result
+    # Uninspected must not fail open: it carries its own non-zero signal.
+    assert any(s["code"] == "manifest-uninspected" for s in nu_result["risk_signals"]), nu_result
+    assert nu_result["threat_score"] >= 15 and huge.get("crx_hash_verified") is None
 
     assert _chrome_listing(b"<h2>Related</h2>5 users<div>Featured</div>") == {}
     assert _chrome_listing(b'<a aria-label="The publisher has a good record with no history'
