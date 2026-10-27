@@ -9,10 +9,10 @@
 | Action | Where |
 |---|---|
 | 1. Preserve extension identity/fields at ingestion | `src/ingestion.py` (additive `extension_key`, `kind`, `store`, `extension_id`, `browser`, per-host edge props `version/source/browser/installed_path/first_seen/last_seen`, vuln + signature summaries). MERGE key stays `name`. |
-| 2. Free/no-auth store-metadata adapters | `src/extension_intel.py` (Chrome update2 + CRX manifest, Edge product-details, AMO, Mozilla blocklist; host allowlist, size caps, offline degrades to local score) |
+| 2. Free/no-auth store-metadata adapters | `src/extension_intel.py` (Chrome Web Store listing RPC, update2 + CRX manifest for unlisted items, Edge product-details, AMO, Mozilla blocklist; host allowlist, size caps, offline degrades to local score) |
 | 3. Risk-scoring engine | `src/extension_intel.py::analyze_extension` (capability / trust / threat / exposure + name-anomaly + rarity + download rules; built-ins score 0; blocklist + ≥100k installs ⇒ ≥95) |
 | 4. Worker + API + UI | `webviz/extension_worker.py` (leader-elected, cached, status/trigger files), `/api/extensions[...]` in `webviz/app.py`, "Extensions" tab in `webviz/static/index.html` |
-| 5. Store-listing reputation (2026-10-27) | Chrome-family detail page (`_chrome_listing`: users, rating, Featured, "no history of violations" badge, updated, developer email/website, EU trader, privacy disclosure); Edge `activeInstallCount`/`isBadgedAsFeatured`/website/privacy URL; AMO `promoted`, `support_email`, homepage, privacy policy. Scoring: featured +5 trust, established publisher +10 trust, rating < 2.5 from ≥ 50 reviewers ⇒ `poor-public-reputation` threat 15. Abuse reports stay private on every store, so ratings and takedowns are the only public complaint signals. Safari has no store lookup: Fleet reports no bundle ID to query the App Store with. |
+| 5. Store-listing reputation (2026-10-27) | Chrome-family listing RPC (`fetch_chrome_listings`, replaced the detail-page scrape: users, rating, Featured, updated, developer email/website, EU trader, privacy disclosure, the "no history of violations" badge from `[0][8]` and `[0][15]` (both matched the badge on every listing probed)); Edge `activeInstallCount`/`isBadgedAsFeatured`/website/privacy URL; AMO `promoted`, `support_email`, homepage, privacy policy. Scoring: featured +5 trust, established publisher +10 trust, rating < 2.5 from ≥ 50 reviewers ⇒ `poor-public-reputation` threat 15. Abuse reports stay private on every store, so ratings and takedowns are the only public complaint signals. Safari has no store lookup: Fleet reports no bundle ID to query the App Store with. |
 | 6. Open threat feeds + self-reported coverage (2026-10-27) | `config/extension_threat_feeds.json` (data file, no code change to add a feed; ships MalExt Sentry: store takedowns + Unit 42 / Socket / researcher reports, ~8k IDs, daily). `load_threat_feeds` / `fetch_threat_feed` / `match_threat_feeds` / `classify_feed_reason` in `src/extension_intel.py`: malware-class reasons => known-bad (risk >= 85), adware/hijack => risk >= 70, other takedowns => >= 60. Worker re-scores newly listed fleet extensions in the same cycle. Edge IDs unknown to Edge's store fall back to the Chrome Web Store. AMO add-ons read MV + content scripts from the hash-verified signed XPI. Per-store coverage (`/api/extensions/status` -> `coverage`) makes a failing adapter visible without inspecting single extensions. |
 
 Runnable self-check (inside the container, so it uses the shipped code and env):
@@ -146,6 +146,7 @@ New/changed `:Software` properties:
 | `privacy_policy_url` | string | store |
 | `first_seen` / `last_seen` | datetime | ingest |
 | `intel_refreshed_at` | datetime | worker |
+| `intel_fingerprint` | sha1 hex | worker: hash of the scoring inputs at the last write |
 | `decision` | enum | `allow`, `review`, `block` |
 | `decision_by` / `decision_at` / `decision_note` | | analyst |
 
@@ -201,8 +202,9 @@ Rollback: keep `name` and `extension_id` on every node. Take a snapshot before m
 
 | Source | Gives | Endpoint | Auth | Verified | Notes |
 |---|---|---|---|---|---|
-| Chrome update2 | exists/removed, latest version, SHA-256, size, CRX URL | `https://clients2.google.com/service/update2/crx?response=updatecheck&prodversion=131.0&acceptformat=crx2,crx3&x=id%3D{ID}%26uc` | none | ✅ | `status="ok"` or `error-unknownApplication`; parse XML |
-| Chrome CRX | `manifest.json` (permissions, hosts, MV, update_url), file list | `codebase` URL from update2 | none | ✅ | Follow redirects only to `clients2.google.com` / `storage.googleapis.com`; SHA-256 matches update2 `hash_sha256` |
+| Chrome Web Store listing RPC | listed or not, name, version, full `manifest.json`, users, rating, rating count, category slug, Featured, updated, developer email/website, publisher ID + name, EU trader, privacy disclosure, privacy policy URL | `POST https://chromewebstore.google.com/_/ChromeWebStoreConsumerFeUi/data/batchexecute?rpcids=xY2Ddd&hl=en&rt=c`, form `f.req=[[["xY2Ddd","[\"{ID}\"]",null,"1"],…]]` | none | ✅ (2026-10-27) | Undocumented internal RPC the store front end uses; Google has no public read API (the Chrome Web Store API is publisher-only). Batches up to 40 IDs per POST (~50 KB each). Response starts `)]}'`, then length-prefixed lines of `wrb.fr` envelopes in any order, keyed by tag. A null payload carries a code in `env[5]`: `[7]` = removed (scored as `removed`), `[5]` = unknown ID (update2 then tells unlisted from never published), `[8]` = rate limited, anything else = an error that falls back to the last good listing. A payload whose ID or shape does not match is rejected whole. Publisher name is `[10][5]` (`[10][7]` is the trader's legal name, null for non-traders) |
+| Chrome update2 | exists/removed, latest version, SHA-256, size, CRX URL — queried only when the listing RPC returns null |  `https://clients2.google.com/service/update2/crx?response=updatecheck&prodversion=131.0&acceptformat=crx2,crx3&x=id%3D{ID}%26uc` | none | ✅ | `status="ok"` or `error-unknownApplication`; parse XML |
+| Chrome CRX | `manifest.json` (permissions, hosts, MV, update_url), file list — unlisted items only (listed items get the manifest from the RPC) | `codebase` URL from update2 | none | ✅ | Follow redirects only to `clients2.google.com` / `storage.googleapis.com`; SHA-256 matches update2 `hash_sha256` |
 | Edge product details | name, version, users, rating, developer, category, privacyData, manifest JSON, isMV2 | `https://microsoftedge.microsoft.com/addons/getproductdetailsbycrxid/{ID}` | none | ✅ | Can return a JSON body with HTTP 404 — only HTTP 200 is `public`; 404 or `null`/empty is `not_found` |
 | Edge CRX | — | — | — | ❌ | Download endpoint returns HTTP 500; use detail JSON manifest |
 | AMO addon API | name, version, permissions, host_permissions, optional_permissions, hash, size, users, ratings, status | `https://addons.mozilla.org/api/v5/addons/addon/{GUID}/` | none | ✅ | URL-encode GUID; 404 = built-in, 401 = unlisted/self-distributed |
@@ -292,7 +294,7 @@ Fleet API ──> extractor ──> ingestion ──> Memgraph
 | File | Responsibility |
 |---|---|
 | `src/extension_intel.py` | Pure logic: store adapters, manifest analyzer, scoring, policy export. No Flask, no DB. Testable. |
-| `webviz/extension_worker.py` | Leader-elected background worker: pick stale nodes, call adapters, write graph, cache/status. |
+| `webviz/extension_worker.py` | Leader-elected background worker: fingerprint every extension, fetch only due listings, re-score changed ones, batch-write graph, cache/status. |
 | `webviz/app.py` | APIs: list/detail/decision/status/policy. |
 | `webviz/static/index.html` | "Extensions" tab. |
 | `config/extension_policy.json` | Generated policy + decisions. |
@@ -309,36 +311,38 @@ Why not inline in ingestion:
 ### 5.2 Worker loop
 
 1. Acquire `fcntl` lock (same pattern as `enrich_worker.py`).
-2. Select `:Software` where `kind = 'browser_extension'` and (`intel_refreshed_at` is null or older than TTL), ordered by host count desc, limit 50.
-3. For each:
-   - Store adapter by `store`.
-   - If version changed or no manifest: download CRX (Chrome), parse detail JSON (Edge), call AMO.
-   - Analyze manifest → permissions, hosts, MV, content scripts.
-   - Compute capability/trust.
-   - Threat feeds (only for new/changed versions; cache by hash).
-   - Compute exposure from graph.
-   - Composite risk + signals.
-   - Write properties.
-4. Refresh the global Mozilla blocklist once per cycle.
-5. Write status (last run, counts, errors, source health).
-6. Sleep; respect `EXTENSION_WORKER_INTERVAL_SEC` (default 6h).
+2. Load every extension identity in one query, grouped by `extension_key` (host counts, versions, installs, stored fingerprints).
+3. Per group, compute a fingerprint: sha1 over `SCORER_VERSION`, store, ID, sorted host versions, sorted (path, platform) installs, host count, whether it is rare in the fleet (< 3% of ≥ 10 hosts; not the raw fleet count, so an enrolment does not re-score everything), the ingestion-owned node fields the scorer reads (name, display name, vendor, builtin flag, installed paths, max CVSS, vulnerabilities), a digest of its blocklist match and threat-feed hits, the `known_publishers.json` content hash, and the cached listing. A failed fleet host count query skips the cycle.
+4. A store call is due only when: there is no cached listing; a host reports a version newer than the cached listing's that was not already reported at the last fetch (older or equal does not fetch, and a store that stays behind is not refetched every cycle); the extension has a new blocklist or threat-feed hit; or the listing is past its TTL.
+5. Work set = due groups plus groups whose fingerprint differs from `s.intel_fingerprint`. Everything else is skipped with no network and no graph write.
+6. Drain the work set this cycle in chunks of `EXTENSION_WORKER_BATCH_SIZE`, until it is empty, the stop event fires, or only rate-limited items remain. Per chunk:
+   - One batched Chrome listing RPC for every due Chrome-family item. Unknown IDs (code 5) go through update2 (unlisted vs never published).
+   - Edge and AMO items are fetched one by one in the thread pool.
+   - Re-score (pure, local) when the fingerprint changed, the listing was refetched, or the refetch failed (so `intel_error` shows it).
+   - One `UNWIND` write per chunk. Rows match `s.extension_key = row.key`; legacy `name:` keys match `s.name`. There is no OR across properties, so the index is used.
+7. Refresh the global Mozilla blocklist and threat feeds once per cycle.
+8. Write status: `queue_remaining` (work items left), and `last_cycle` with `due`, `scored`, `fetched` and `refresh_failed` per store, `cache_hits`, `unchanged_skipped`, `deferred`, `rate_limited_stores`. `/api/extensions*` reads `queue_remaining` from this file, not from a live query.
+9. Sleep; respect `EXTENSION_WORKER_INTERVAL_SEC` (default 6h).
 
-TTLs:
+Cache tiers (JSON files under `EXTENSION_CACHE_DIR`, key prefix `v11`):
 
-| Data | TTL |
-|---|---|
-| Store metadata | 24h |
-| Blocklist | 6h |
-| Manifest | until version change |
-| VT/URL reputation | 24h per hash/domain |
-| Static scan | until version change |
-| Exposure score | every cycle (graph query is cheap) |
+| Data | Key | TTL |
+|---|---|---|
+| Store listing, Chrome family | `listing:{store}:{id}` | 7 days (batched RPC; doubles as the takedown check) |
+| Store listing, Edge / Firefox | `listing:{store}:{id}` | 21 to 28 days, jittered by a stable hash of the ID |
+| Package manifest | `manifest:{store}:{id}:{version}` | never (a version's package is immutable); a hit skips the XPI or unlisted-CRX download |
+| Blocklist / threat feeds | `mozilla:blocklist`, `feed:{name}` | 6h |
+| VT/URL reputation (planned) | | 24h per hash/domain |
+| Static scan (planned) | | until version change |
+| Exposure score | none | every cycle (graph query is cheap) |
+
+A refetch that fails falls back to the last good listing, with the failure in `intel_error`, so being offline never drops data. A rate-limited item whose other inputs changed is scored from its last good listing (or locally, for a new blocklist or feed hit with no listing) so a known-bad verdict is never held back; its listing refresh stays due. A rate-limited item with nothing else new is not written and is retried next cycle.
 
 ### 5.3 Failure handling
 
 - Per-source circuit breaker: 3 consecutive failures → skip source for 1h; status shows degraded.
 - Backoff with jitter on 429/5xx.
-- Implemented today: a per-store, per-cycle breaker. A 429 (or 503 with `Retry-After`) from a store trips it; that store's remaining items are skipped, not cached and not stamped (`intel_refreshed_ts` unchanged), so they retry next cycle. `last_cycle` reports `deferred` and `rate_limited_stores`.
+- Implemented today: a per-store, per-cycle breaker. A 429 (or 503 with `Retry-After`) from a store trips it; that store's remaining items are not fetched or cached, and are written only when another input changed (see above), so their listing refresh retries next cycle. A 429 from the batched Chrome listing RPC marks the rest of that batch without further requests. `last_cycle` reports `deferred` and `rate_limited_stores`.
 - One extension failure does not abort the batch.
 - Manifest parse failure → `risk_signals += "manifest-unparseable"`, risk ≥ 60.
 - Never follow arbitrary redirects (SSRF); allowlist store domains.
@@ -383,7 +387,7 @@ TTLs:
 | Unlisted | +5 |
 | Removed / not found | 0 |
 | Sideloaded | 0 |
-| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH. The list is data, not code: `config/known_publishers.json` (one entry per publisher with `added_at`; reloaded on change, no rebuild). Chrome-family trust is by Chrome Web Store publisher ID only (`chrome_publisher_ids`, from the listing's `data-publisher-id` link; a page with more than one distinct ID trusts nothing). Firefox trust is by AMO author user ID only (`amo_author_ids`). Edge exposes no publisher ID, so Edge trust is per extension (`edge_extension_ids`) and only while the store lists the ID as public. Names are display-only on all three stores because anyone can register a lookalike; only Safari still matches `match_names`. Store-ID trust also needs a store install on every host: each install path must fully match a known browser profile root under the user's home (Chrome/Chromium/Edge/Brave/Vivaldi/Opera/Arc/Comet/Dia `<root>/<profile>/Extensions/<id>/<version>`, Firefox `<root>/<profile>/extensions/<id>.xpi`, macOS/Linux/Windows). A missing path fails closed, except on ChromeOS hosts whose agent never reports one. An unpacked copy claiming the ID (manifest `key`) drops the trust and adds a `not-store-install` signal. Residual: a local user who copies an unpacked extension into the real profile directory still passes; osquery `from_webstore` would close that, but Fleet's software inventory does not expose it. Only trader-declared developers have a publisher link, so non-trader extensions stay unverified | +15 |
+| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH. The list is data, not code: `config/known_publishers.json` (one entry per publisher with `added_at`; reloaded on change, no rebuild). Chrome-family trust is by Chrome Web Store publisher ID only (`chrome_publisher_ids`, from the listing RPC's publisher ID; a payload for a different extension ID is rejected whole). Firefox trust is by AMO author user ID only (`amo_author_ids`). Edge exposes no publisher ID, so Edge trust is per extension (`edge_extension_ids`) and only while the store lists the ID as public. Names are display-only on all three stores because anyone can register a lookalike; only Safari still matches `match_names`. Store-ID trust also needs a store install on every host: each install path must fully match a known browser profile root under the user's home (Chrome/Chromium/Edge/Brave/Vivaldi/Opera/Arc/Comet/Dia `<root>/<profile>/Extensions/<id>/<version>`, Firefox `<root>/<profile>/extensions/<id>.xpi`, macOS/Linux/Windows). A missing path fails closed, except on ChromeOS hosts whose agent never reports one. An unpacked copy claiming the ID (manifest `key`) drops the trust and adds a `not-store-install` signal. Residual: a local user who copies an unpacked extension into the real profile directory still passes; osquery `from_webstore` would close that, but Fleet's software inventory does not expose it. | +15 |
 | MV3 | +10 |
 | Updated < 12 months | +15 |
 | Updated 12-24 months | +5 |
@@ -575,7 +579,7 @@ Reuse the existing Shadow IT table/filter patterns in `webviz/static/index.html`
 
 ### Phase 1 — Identity + store metadata (3-5 days)
 
-- `src/extension_intel.py` adapters: Chrome update2 + CRX, Edge detail JSON, AMO, Mozilla blocklist.
+- `src/extension_intel.py` adapters: Chrome Web Store listing RPC, update2 + CRX for unlisted items, Edge detail JSON, AMO, Mozilla blocklist.
 - Manifest analyzer + capability/trust scoring.
 - `webviz/extension_worker.py` with fcntl lock, cache, status.
 - Schema migration to `software_key`; dedupe; constraint swap.
