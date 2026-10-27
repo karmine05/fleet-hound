@@ -1151,19 +1151,22 @@ class HttpClient:
     def __init__(self, timeout: float = 12.0):
         self.timeout = timeout
 
-    def get(self, url: str, *, allowed_hosts, max_bytes: int = _MAX_HTTP_BYTES):
-        return self._request(url, None, allowed_hosts, max_bytes)
+    def get(self, url: str, *, allowed_hosts, max_bytes: int = _MAX_HTTP_BYTES,
+            headers: dict | None = None):
+        """`headers`: extra request headers, e.g. If-None-Match for a conditional GET."""
+        return self._request(url, None, allowed_hosts, max_bytes, headers)
 
     def post(self, url: str, form: dict, *, allowed_hosts, max_bytes: int = _MAX_HTTP_BYTES):
         """POST `form` url-encoded; same allowlist, redirect guard, cap and return shape as get()."""
         return self._request(url, urllib.parse.urlencode(form).encode(), allowed_hosts, max_bytes)
 
-    def _request(self, url: str, data: bytes | None, allowed_hosts, max_bytes: int):
+    def _request(self, url: str, data: bytes | None, allowed_hosts, max_bytes: int,
+                 extra_headers: dict | None = None):
         host = (urllib.parse.urlparse(url).hostname or "").lower()
         if host not in allowed_hosts:
             return 0, {}, b"", f"host not allowlisted: {host}"
         opener = urllib.request.build_opener(_SafeRedirectHandler(allowed_hosts))
-        headers = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
+        headers = {**(extra_headers or {}), "User-Agent": _USER_AGENT, "Accept": "*/*"}
         if data is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
         req = urllib.request.Request(url, data=data, headers=headers)
@@ -1843,8 +1846,25 @@ def fetch_store_metadata(store: str, extension_id: str, *,
         return {"store": store, "status": "unknown", "error": str(exc)}
 
 
-def fetch_mozilla_blocklist(*, client: HttpClient | None = None) -> dict:
-    """Return {guid: record} from the Mozilla add-on blocklist. Never raises."""
+# Returned by a conditional fetch when the server answers 304: the caller's
+# cached copy is still current.
+NOT_MODIFIED = object()
+
+
+def _conditional_headers(validators: dict | None) -> dict | None:
+    etag = _clean_str((validators or {}).get("etag"))
+    return {"If-None-Match": etag} if etag else None
+
+
+def fetch_mozilla_blocklist(*, client: HttpClient | None = None,
+                            validators: dict | None = None):
+    """Return {guid: record} from the Mozilla add-on blocklist. Never raises.
+
+    Returns {} unless every page was read: a partial list must never be
+    cached as the whole blocklist. `validators` ({"etag": ...}) makes the
+    first request conditional; a 304 returns NOT_MODIFIED, and a full read
+    stores the new ETag back into `validators`.
+    """
     client = client or HttpClient()
     url = (
         "https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/"
@@ -1852,19 +1872,27 @@ def fetch_mozilla_blocklist(*, client: HttpClient | None = None) -> dict:
     )
     records: dict[str, dict] = {}
     seen_urls = set()
-    for _ in range(20):
+    etag = None
+    for page in range(20):
         if not url or url in seen_urls:
             break
         seen_urls.add(url)
         status, headers, body, error = client.get(
-            url, allowed_hosts=_MOZILLA_HOSTS, max_bytes=8 * 1024 * 1024
+            url, allowed_hosts=_MOZILLA_HOSTS, max_bytes=8 * 1024 * 1024,
+            headers=_conditional_headers(validators) if page == 0 else None,
         )
-        if status != 200 or not body:
-            logger.warning("mozilla blocklist fetch failed: %s", error or status)
-            break
+        if page == 0 and status == 304:
+            return NOT_MODIFIED
+        if status != 200 or not body or error:
+            logger.warning("mozilla blocklist page %d failed: %s; discarding partial list",
+                           page + 1, error or status)
+            return {}
         payload = _json_loads(body)
         if not isinstance(payload, dict):
-            break
+            logger.warning("mozilla blocklist page %d is not JSON; discarding partial list", page + 1)
+            return {}
+        if page == 0:
+            etag = _header(headers, "ETag") or None
         for record in payload.get("data") or []:
             if isinstance(record, dict) and record.get("guid"):
                 guid = str(record["guid"])
@@ -1877,6 +1905,11 @@ def fetch_mozilla_blocklist(*, client: HttpClient | None = None) -> dict:
                 records[guid] = record
         # Kinto paginates via the Next-Page header; `next` kept as a fallback.
         url = _header(headers, "Next-Page") or payload.get("next")
+    if url and url not in seen_urls:
+        logger.warning("mozilla blocklist has more than 20 pages; discarding partial list")
+        return {}
+    if validators is not None and etag:
+        validators["etag"] = etag
     return records
 
 
@@ -2039,11 +2072,19 @@ def _feed_id_ok(platform: str, ext_id: str) -> bool:
     return bool(_FIREFOX_GUID_RE.match(ext_id))
 
 
-def fetch_threat_feed(feed: dict, *, client: HttpClient | None = None) -> dict | None:
-    """Return {extension_id_lower: {reason, source, date}} or None on failure. Never raises."""
+def fetch_threat_feed(feed: dict, *, client: HttpClient | None = None,
+                      validators: dict | None = None):
+    """Return {extension_id_lower: {reason, source, date}} or None on failure. Never raises.
+
+    `validators` ({"etag": ...}) makes the request conditional: a 304 returns
+    NOT_MODIFIED, and a 200 stores the new ETag back into `validators`.
+    """
     client = client or HttpClient(timeout=30.0)
-    status, _, body, error = client.get(feed["url"], allowed_hosts={feed["host"]},
-                                        max_bytes=32 * 1024 * 1024)
+    status, headers, body, error = client.get(feed["url"], allowed_hosts={feed["host"]},
+                                              max_bytes=32 * 1024 * 1024,
+                                              headers=_conditional_headers(validators))
+    if status == 304:
+        return NOT_MODIFIED
     if status != 200 or not body or error:
         logger.warning("threat feed %s fetch failed: %s", feed["name"], error or f"HTTP {status}")
         return None
@@ -2067,6 +2108,8 @@ def fetch_threat_feed(feed: dict, *, client: HttpClient | None = None) -> dict |
     except (csv.Error, ValueError) as exc:
         logger.warning("threat feed %s parse failed: %s", feed["name"], exc)
         return None
+    if validators is not None and _header(headers, "ETag"):
+        validators["etag"] = _header(headers, "ETag")
     return entries
 
 
@@ -2321,6 +2364,30 @@ def _self_check() -> None:
         (200, {}, b'{"data":[{"guid":"c@d"}]}', None),
     ))
     assert set(paged) == {"a@b", "c@d"}, paged
+    # A failed later page discards the partial list instead of returning page 1 only.
+    partial = fetch_mozilla_blocklist(client=_Fake(
+        (200, {"Next-Page": "https://firefox.settings.services.mozilla.com/p2"},
+         b'{"data":[{"guid":"a@b"}]}', None),
+        (502, {}, b"", None),
+    ))
+    assert partial == {}, partial
+
+    # Conditional GET: the ETag goes out as If-None-Match; 304 means "use the cache".
+    class _Cond:
+        def __init__(self, *responses):
+            self.responses, self.sent = list(responses), []
+
+        def get(self, url, *, headers=None, **_):
+            self.sent.append(headers)
+            return self.responses.pop(0)
+
+    val = {}
+    cond = _Cond((200, {"ETag": '"v1"'}, b'{"data":[{"guid":"a@b"}]}', None))
+    assert set(fetch_mozilla_blocklist(client=cond, validators=val)) == {"a@b"} and val == {"etag": '"v1"'}
+    assert cond.sent == [None], cond.sent
+    cond = _Cond((304, {}, b"", None))
+    assert fetch_mozilla_blocklist(client=cond, validators=val) is NOT_MODIFIED
+    assert cond.sent == [{"If-None-Match": '"v1"'}], cond.sent
 
     json_blob, count, max_cvss = summarize_vulnerabilities([
         {"cve": "CVE-2024-0001", "cvss_score": 8.8},
@@ -2520,6 +2587,10 @@ def _self_check() -> None:
                              + "c" * 32 + ",Policy Violation\nnot-an-id,Malware\n").encode(), None
     entries = fetch_threat_feed(feeds[0], client=_FeedClient())
     assert set(entries) == {"a" * 32, "b" * 32, "c" * 32}, entries
+    fval = {"etag": '"f1"'}
+    fcond = _Cond((304, {}, b"", None))
+    assert fetch_threat_feed(feeds[0], client=fcond, validators=fval) is NOT_MODIFIED
+    assert fcond.sent == [{"If-None-Match": '"f1"'}], fcond.sent
     index = {"t": {"platform": "chromium", "entries": entries}}
     assert match_threat_feeds(index, "firefox", "a" * 32) == []          # platform-scoped
     assert match_threat_feeds(index, "vivaldi", "A" * 32)[0]["severity"] == "malicious"

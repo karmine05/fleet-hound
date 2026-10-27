@@ -22,18 +22,12 @@ categorize_software.py so we don't fork the query.
 
 from __future__ import annotations
 
-import errno
-import fcntl
-import json
 import logging
-import os
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 import requests
@@ -49,76 +43,25 @@ from categorize_software import (  # noqa: E402
     get_software_info,
 )
 
+try:  # Docker layout: /app/webviz on sys.path
+    from worker_util import (atomic_write_json, fire_trigger as _fire_trigger, read_json,
+                             sleep_until, trigger_mtime as _trigger_mtime, try_acquire_lock)
+except ImportError:  # imported as the webviz package
+    from webviz.worker_util import (atomic_write_json, fire_trigger as _fire_trigger,  # type: ignore
+                                    read_json, sleep_until, trigger_mtime as _trigger_mtime,
+                                    try_acquire_lock)
+
 logger = logging.getLogger(__name__)
+
+
+def _read_status(path: str) -> dict:
+    data = read_json(path, {})
+    return data if isinstance(data, dict) else {}
+
 
 LOCK_PATH_DEFAULT = "/tmp/fleet-hound-enricher.lock"
 TRIGGER_PATH_DEFAULT = "/tmp/fleet-hound-enricher.trigger"
 STATUS_PATH_DEFAULT = "/app/config/enricher_status.json"
-
-# Trigger poll resolution. The loop's sleep is interrupted at this granularity
-# to check the trigger file's mtime; smaller = more responsive triggers, more CPU.
-_TRIGGER_POLL_SEC = 1.0
-
-
-def _atomic_write_json(path: str, payload: dict) -> None:
-    """Write JSON atomically (temp + rename). Tolerant of EROFS on the parent."""
-    parent = os.path.dirname(path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    fd, tmp = tempfile.mkstemp(prefix=".enricher.", suffix=".tmp", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, separators=(",", ":"))
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _read_status_file(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _try_acquire_lock(lock_path: str):
-    """Return an open file descriptor holding an exclusive flock, or None."""
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
-        logger.warning("enricher: cannot open lock file %s: %s", lock_path, exc)
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-            os.close(fd)
-            return None
-        os.close(fd)
-        return None
-    try:
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
-    except OSError:
-        pass
-    return fd
-
 
 def _pick_uncategorized(driver, batch_size: int):
     try:
@@ -203,20 +146,13 @@ def _queue_remaining(driver) -> int:
         return 0
 
 
-def _trigger_mtime(trigger_path: str) -> float:
-    try:
-        return os.path.getmtime(trigger_path)
-    except OSError:
-        return 0.0
-
-
 class _SharedStatus:
     """Mutable in-process state mirrored to STATUS_FILE for cross-worker reads."""
 
     def __init__(self, status_path: str, *, enabled: bool, running: bool):
         self.path = status_path
         self.lock = threading.Lock()
-        prior = _read_status_file(status_path)
+        prior = _read_status(status_path)
         self.enabled = enabled
         self.running = running
         self.last_tick_iso: Optional[str] = prior.get("last_tick_iso")
@@ -239,7 +175,7 @@ class _SharedStatus:
             "last_error": self.last_error,
         }
         try:
-            _atomic_write_json(self.path, payload)
+            atomic_write_json(self.path, payload, prefix=".enricher.")
         except OSError as exc:
             logger.warning("enricher: status flush failed: %s", exc)
 
@@ -356,15 +292,9 @@ def _loop(driver_provider, status: _SharedStatus, *,
 
             # Sleep until next tick OR until trigger file mtime advances.
             elapsed = time.time() - tick_started
-            deadline = time.time() + max(1.0, float(interval_sec) - elapsed)
-            while time.time() < deadline:
-                if stop_event.is_set():
-                    break
-                cur_mtime = _trigger_mtime(trigger_path)
-                if cur_mtime > last_trigger_seen:
-                    last_trigger_seen = cur_mtime
-                    break
-                time.sleep(_TRIGGER_POLL_SEC)
+            last_trigger_seen = sleep_until(
+                time.time() + max(1.0, float(interval_sec) - elapsed), trigger_path=trigger_path,
+                last_trigger=last_trigger_seen, stop_event=stop_event)
     finally:
         status.update(running=False)
         logger.info("enricher: loop exited")
@@ -394,7 +324,7 @@ def start_worker(driver_provider, *,
         logger.info("enricher: disabled via ENRICHER_ENABLED=false")
         return status, stop_event
 
-    fd = _try_acquire_lock(lock_path)
+    fd = try_acquire_lock(lock_path, "enricher")
     if fd is None:
         logger.info("enricher: another worker holds %s; this worker will not run the loop",
                     lock_path)
@@ -424,7 +354,7 @@ def start_worker(driver_provider, *,
 
 def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
     """Read the cross-worker shared status. Returns sane defaults if missing."""
-    data = _read_status_file(status_path)
+    data = _read_status(status_path)
     return {
         "enabled": bool(data.get("enabled", False)),
         "running": bool(data.get("running", False)),
@@ -437,26 +367,8 @@ def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
 def fire_trigger(trigger_path: str = TRIGGER_PATH_DEFAULT,
                  *, cooldown_sec: float = 30.0) -> tuple[bool, float]:
     """Touch the trigger file iff outside the cooldown window.
-
-    Cooldown is enforced by the file's existing mtime, so all gunicorn workers
-    share it. Returns (fired, retry_after_sec). retry_after_sec is 0 when fired,
-    otherwise the seconds until cooldown expires.
-    """
-    now = time.time()
-    last = _trigger_mtime(trigger_path)
-    if last > 0 and (now - last) < cooldown_sec:
-        return False, max(1.0, cooldown_sec - (now - last))
-    parent = os.path.dirname(trigger_path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    try:
-        Path(trigger_path).touch()
-    except OSError as exc:
-        logger.error("enricher: trigger touch failed: %s", exc)
-        return False, 0.0
-    return True, 0.0
+    Returns (fired, retry_after_sec)."""
+    return _fire_trigger(trigger_path, cooldown_sec=cooldown_sec, name="enricher")
 
 
 def queue_remaining(driver_provider) -> int:
