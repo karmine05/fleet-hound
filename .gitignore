@@ -72,6 +72,8 @@ secrets.py
 config/*
 # Known-good publisher list ships with the repo; operators edit it in place.
 !config/known_publishers.json
+# Open threat-feed definitions ship with the repo too.
+!config/extension_threat_feeds.json
 
 # Test suite + debug pages stay local; they never ship to GitHub.
 tests/

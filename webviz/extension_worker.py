@@ -35,7 +35,10 @@ try:  # Docker layout: /app/webviz + /app/src on sys.path
         analyze_extension,
         fetch_mozilla_blocklist,
         fetch_store_metadata,
+        fetch_threat_feed,
+        load_threat_feeds,
         match_blocklist,
+        match_threat_feeds,
         signals_json,
     )
 except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
@@ -45,7 +48,10 @@ except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
         analyze_extension,
         fetch_mozilla_blocklist,
         fetch_store_metadata,
+        fetch_threat_feed,
+        load_threat_feeds,
         match_blocklist,
+        match_threat_feeds,
         signals_json,
     )
 
@@ -169,6 +175,8 @@ class _SharedStatus:
         self.last_cycle = prior.get("last_cycle")
         self.queue_remaining = int(prior.get("queue_remaining", 0) or 0)
         self.sources = prior.get("sources")
+        self.threat_feeds = prior.get("threat_feeds") or []
+        self.coverage = prior.get("coverage") or []
 
     def update(self, **fields):
         with self.lock:
@@ -190,6 +198,8 @@ class _SharedStatus:
             "last_cycle": self.last_cycle,
             "queue_remaining": self.queue_remaining,
             "sources": self.sources,
+            "threat_feeds": self.threat_feeds,
+            "coverage": self.coverage,
         })
 
 
@@ -300,8 +310,8 @@ def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = 
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     extension_id = record["extension_id"]
     version = record.get("last_version") or ""
-    # v9: update2 at prodversion 999; large CRXs parse or report manifest_unavailable.
-    cache_key = f"v9:{store}:{extension_id}:{version}"
+    # v10: AMO metadata now includes the signed XPI manifest (MV, content scripts).
+    cache_key = f"v10:{store}:{extension_id}:{version}"
     cached = _cache_get(cache_dir, cache_key, METADATA_TTL_SEC)
     if cached is not None:
         return cached
@@ -386,8 +396,81 @@ def _write_result(driver, names, result: dict, extension_key: str) -> bool:
     return True
 
 
+def _load_feed_index(cache_dir: str) -> tuple[dict, list[dict]]:
+    """{feed_name: {"platform", "entries"}} plus per-feed health for status.
+
+    A failed fetch falls back to the last good copy; a feed with no copy at
+    all is reported, not fatal, so one dead feed never stops scoring.
+    """
+    index, health = {}, []
+    for feed in load_threat_feeds():
+        key = f"feed:{feed['name']}"
+        entries = _cache_get(cache_dir, key, BLOCKLIST_TTL_SEC)
+        error = None
+        if not isinstance(entries, dict):
+            entries = fetch_threat_feed(feed)
+            if entries is not None:
+                _cache_set(cache_dir, key, entries)
+            else:
+                error = "fetch failed"
+                entries = _cache_get(cache_dir, key, float("inf"))
+                if isinstance(entries, dict):
+                    error = "fetch failed; using stale copy"
+        if isinstance(entries, dict):
+            index[feed["name"]] = {"platform": feed["platform"], "entries": entries}
+        health.append({"name": feed["name"], "platform": feed["platform"],
+                       "entries": len(entries) if isinstance(entries, dict) else 0,
+                       "error": error})
+    return index, health
+
+
+def _coverage(driver) -> list[dict]:
+    """Per-store enrichment fill rates, so a broken adapter shows up in status
+    on its own instead of being noticed one extension at a time."""
+    with driver.session() as session:
+        rows = session.run(f"""
+            MATCH (s:Software) WHERE {_EXT_WHERE} AND NOT coalesce(s.is_builtin, false)
+            WITH coalesce(s.store, 'unknown') AS store, s
+            RETURN store,
+                   count(s) AS total,
+                   count(s.extension_id) AS with_id,
+                   sum(CASE WHEN s.store_status = 'public' THEN 1 ELSE 0 END) AS listed,
+                   count(s.install_users) AS with_users,
+                   count(s.rating) AS with_rating,
+                   count(s.manifest_version) AS manifest_parsed,
+                   count(s.developer_email) AS with_email,
+                   sum(CASE WHEN s.risk_signals_json CONTAINS 'manifest-uninspected' THEN 1 ELSE 0 END) AS uninspected,
+                   sum(CASE WHEN s.risk_signals_json CONTAINS 'threat-feed:' THEN 1 ELSE 0 END) AS feed_hits,
+                   collect(DISTINCT s.intel_error)[..5] AS errors
+            ORDER BY total DESC
+        """).data()
+    for row in rows:
+        row["errors"] = [e for e in row.get("errors") or [] if e]
+    return rows
+
+
+def _expedite_feed_hits(driver, feed_index: dict) -> int:
+    """Mark fleet extensions newly listed by a feed for re-scoring this cycle."""
+    with driver.session() as session:
+        rows = session.run("""
+            MATCH (s:Software) WHERE s.kind = 'browser_extension' AND s.extension_id IS NOT NULL
+            RETURN DISTINCT s.extension_key AS key, s.store AS store, s.extension_id AS id,
+                   coalesce(s.risk_signals_json, '') AS sig
+        """).data()
+        keys = [r["key"] for r in rows
+                if any(f'"threat-feed:{h["feed"]}"' not in r["sig"]
+                       for h in match_threat_feeds(feed_index, r["store"] or "", r["id"]))]
+        if keys:
+            session.run("""
+                UNWIND $keys AS k MATCH (s:Software {extension_key: k})
+                SET s.intel_refreshed_ts = 0
+            """, keys=keys).consume()
+    return len(keys)
+
+
 def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
-                 stop_event: threading.Event, breaker: _StoreBreaker | None = None):
+                 stop_event: threading.Event, breaker: _StoreBreaker | None = None,
+                 feed_index: dict | None = None):
     """Fetch store metadata + score one extension identity (no DB writes).
 
     Safe to run in a thread pool: each group owns its record dict, cache
@@ -419,6 +502,8 @@ def _score_group(group, *, blocklist: dict, total_hosts: int, cache_dir: str,
             blocklist_entry=match_blocklist(
                 blocklist, record.get("extension_id") or "", versions
             ),
+            feed_hits=match_threat_feeds(feed_index or {}, record.get("store") or "",
+                                         record.get("extension_id") or ""),
             fleet_host_count=total_hosts,
         )
         return group, result, None
@@ -430,6 +515,8 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
                cache_dir: str, stop_event: threading.Event,
                parallelism: int = 4) -> dict:
     total_hosts = _total_hosts(driver)
+    feed_index, feed_health = _load_feed_index(cache_dir)
+    expedited = _expedite_feed_hits(driver, feed_index) if feed_index else 0
     cutoff = time.time() - REFRESH_INTERVAL_SEC
     rows = _pick_stale(driver, batch_size, cutoff)
     groups = _group_rows(rows)
@@ -456,7 +543,8 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
         futures = [
             pool.submit(_score_group, group, blocklist=blocklist,
                         total_hosts=total_hosts, cache_dir=cache_dir,
-                        stop_event=stop_event, breaker=breaker)
+                        stop_event=stop_event, breaker=breaker,
+                        feed_index=feed_index)
             for group in groups
         ]
         for fut in as_completed(futures):
@@ -494,9 +582,16 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
         "rate_limited_stores": breaker.tripped(),
         "total_hosts": total_hosts,
         "blocklist_entries": len(blocklist),
+        "feed_hits_expedited": expedited,
         "tick_iso": datetime.now(timezone.utc).isoformat(),
     }
+    try:
+        coverage = _coverage(driver)
+    except Exception as exc:  # noqa: BLE001 — health reporting must not fail the cycle
+        logger.warning("extension coverage query failed: %s", exc)
+        coverage = status.coverage
     status.update(
+        coverage=coverage,
         items_scored_total=status.items_scored_total + scored,
         queue_remaining=remaining,
         last_cycle=summary,
@@ -504,6 +599,7 @@ def _run_cycle(driver, status: _SharedStatus, *, batch_size: int,
             "mozilla_blocklist": bool(blocklist),
             "store_metadata": True,
         },
+        threat_feeds=feed_health,
     )
     return summary
 
@@ -594,6 +690,8 @@ def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
         "last_cycle": data.get("last_cycle"),
         "queue_remaining": int(data.get("queue_remaining", 0) or 0),
         "sources": data.get("sources"),
+        "threat_feeds": data.get("threat_feeds") or [],
+        "coverage": data.get("coverage") or [],
     }
 
 

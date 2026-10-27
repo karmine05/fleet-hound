@@ -14,6 +14,7 @@ must degrade to a local, explainable score instead of failing ingestion.
 
 from __future__ import annotations
 
+import csv
 import functools
 import hashlib
 import html
@@ -752,7 +753,7 @@ def _trust_score(meta: dict, record: dict, *, reputable: bool) -> tuple[int, lis
     if meta.get("crx_hash_verified") is True:
         score += 5
         signals.append({"code": "crx-hash-verified", "weight": 0,
-                        "detail": "CRX SHA-256 matches the update manifest"})
+                        "detail": "package SHA-256 matches the store's published hash"})
 
     return min(100, score), signals
 
@@ -833,6 +834,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
+                      feed_hits: list[dict] | None = None,
                       fleet_host_count: int | None = None) -> dict:
     """Compute an explainable 0-100 risk score for one extension identity.
 
@@ -916,6 +918,16 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     if sideload_signal:
         trust_signals.append(sideload_signal)
     threat, threat_signals = _threat_score(meta, record, blocklist_entry)
+    for hit in feed_hits or []:
+        threat = max(threat, int(hit.get("threat") or 0))
+        detail = f"{hit.get('feed')}: {hit.get('reason')}"
+        if hit.get("date"):
+            detail += f" (listed {hit['date']})"
+        if hit.get("source"):
+            detail += f" — {hit['source']}"
+        threat_signals.append({"code": f"threat-feed:{hit.get('feed')}",
+                               "weight": int(hit.get("threat") or 0), "detail": detail[:400]})
+    threat = min(100, threat)
     signals.extend(threat_signals)
 
     host_count = _as_int(record.get("host_count")) or 0
@@ -969,7 +981,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     )
 
     status = _clean_str(meta.get("status") or record.get("store_status") or "unknown").lower()
-    known_bad = bool(blocklist_entry)
+    known_bad = bool(blocklist_entry) or any(
+        h.get("severity") == "malicious" for h in feed_hits or [])
     if known_bad:
         # A blocklisted extension is never "low" regardless of popularity.
         risk = max(risk, 85)
@@ -987,6 +1000,10 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
                 "weight": 20,
                 "detail": f"blocked extension with {users:,} installs",
             })
+    elif feed_hits:
+        # Listed by an open threat feed: adware/hijacking is "high" outright;
+        # an unexplained takedown ranks with a store removal.
+        risk = max(risk, 70 if any(h.get("severity") == "unwanted" for h in feed_hits) else 60)
     elif status == "removed":
         risk = max(risk, 60)
     elif status == "not_found" and name_penalty >= 18:
@@ -1577,7 +1594,41 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         "privacy_policy_url": (meta["url"] + "privacy/") if data.get("has_privacy_policy") else None,
         "created_at": _clean_str(data.get("created")) or None,
     })
+    _amo_package_manifest(meta, file_info, client)
     return meta
+
+
+def _amo_package_manifest(meta: dict, file_info: dict, client: HttpClient) -> None:
+    """Fill manifest fields the AMO API omits (MV, content scripts) from the signed XPI."""
+    url = _clean_str(file_info.get("url"))
+    if (urllib.parse.urlparse(url).hostname or "").lower() not in _AMO_HOSTS:
+        meta["manifest_unavailable"] = "AMO lists no downloadable package"
+        return
+    if (_as_int(file_info.get("size")) or 0) > 50 * 1024 * 1024:
+        meta["manifest_unavailable"] = "XPI exceeds 50 MB download cap"
+        return
+    status, _, xpi, error = client.get(url, allowed_hosts=_AMO_HOSTS, max_bytes=50 * 1024 * 1024)
+    if status == 200 and error == "response too large":
+        meta["manifest_unavailable"] = "XPI exceeds 50 MB download cap"
+        return
+    if status != 200 or not xpi:
+        meta["manifest_unavailable"] = error or f"XPI HTTP {status}"
+        return
+    expected = _clean_str(file_info.get("hash")).lower()
+    if expected.startswith("sha256:"):
+        meta["crx_hash_verified"] = hashlib.sha256(xpi).hexdigest() == expected[7:]
+        if not meta["crx_hash_verified"]:
+            meta["manifest_error"] = "XPI SHA-256 does not match AMO"
+            return
+    try:
+        manifest = _parse_crx(xpi)
+    except ValueError as exc:
+        meta["manifest_error"] = str(exc)
+        return
+    for key, value in _manifest_fields({"manifest": manifest}).items():
+        # The API's permission lists stay authoritative; the package adds what it lacks.
+        if value not in (None, [], "") and not meta.get(key):
+            meta[key] = value
 
 
 def fetch_store_metadata(store: str, extension_id: str, *,
@@ -1591,7 +1642,15 @@ def fetch_store_metadata(store: str, extension_id: str, *,
         if store in ("chrome", "brave", "opera", "vivaldi", "chromium"):
             return fetch_chrome_metadata(extension_id, client=client)
         if store == "edge":
-            return fetch_edge_metadata(extension_id, client=client)
+            meta = fetch_edge_metadata(extension_id, client=client)
+            # Edge installs from the Chrome Web Store too; an ID Edge's store
+            # does not know is usually a CWS item, not an unknown sideload.
+            if meta.get("status") == "not_found" and _CHROME_EXTENSION_ID_RE.fullmatch(extension_id):
+                chrome = fetch_chrome_metadata(extension_id, client=client)
+                if chrome.get("status") == "public" or chrome.get("rate_limited"):
+                    chrome["resolved_from"] = "edge"
+                    return chrome
+            return meta
         if store == "firefox":
             return fetch_amo_metadata(extension_id, client=client)
         return {"store": store, "status": "unknown",
@@ -1711,6 +1770,148 @@ def match_blocklist(blocklist: dict, extension_id: str, versions=()) -> dict | N
 # ---------------------------------------------------------------------------
 # Graph-facing helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Open threat feeds (config/extension_threat_feeds.json)
+# ---------------------------------------------------------------------------
+
+# Feed definitions live in a data file so a new open-source feed is a data
+# edit, not a code change. Every extension is matched against every feed.
+_THREAT_FEEDS_CANDIDATES = (
+    "/app/config/extension_threat_feeds.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "config", "extension_threat_feeds.json"),
+)
+_FEED_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,40}")
+_FEED_PLATFORMS = {"chromium": CHROMIUM_STORES, "firefox": frozenset({"firefox"})}
+_FEED_MAX_ROWS = 200_000
+# Reason keywords -> (severity, threat). Matched as substrings of the
+# lowercased reason; first tier that matches wins.
+_FEED_SEVERITY = (
+    ("malicious", 100, ("malware", "spyware", "phish", "steal", "credential", "backdoor",
+                        "trojan", "ransom", "keylog", "exfiltrat", "cryptojack", "miner",
+                        "malicious", "rat ")),
+    ("unwanted", 70, ("adware", "hijack", "bundl", "suspicious", "fraud", "scam",
+                      "affiliate", "injection", "tracking")),
+)
+
+
+def _threat_feeds_path() -> str | None:
+    env = os.environ.get("EXTENSION_THREAT_FEEDS_FILE", "").strip()
+    if env:
+        return env
+    return next((p for p in _THREAT_FEEDS_CANDIDATES if os.path.exists(p)), None)
+
+
+def load_threat_feeds() -> list[dict]:
+    """Validated feed definitions. Bad entries are skipped with a warning."""
+    path = _threat_feeds_path()
+    if not path:
+        logger.error("threat feeds: no extension_threat_feeds.json found; no feed matching")
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.error("threat feeds: cannot read %s: %s", path, exc)
+        return []
+    feeds = []
+    for i, raw in enumerate(doc.get("feeds") or [] if isinstance(doc, dict) else []):
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError("entry is not an object")
+            name = _clean_str(raw.get("name"))
+            if not _FEED_NAME_RE.fullmatch(name):
+                raise ValueError(f"invalid name {name!r}")
+            url = _clean_str(raw.get("url"))
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host or "." not in host \
+                    or re.fullmatch(r"[\d.]+|\[?[0-9a-f:]+\]?", host) or host.endswith(".local"):
+                raise ValueError("url must be https on a public hostname")
+            if raw.get("format") != "csv":
+                raise ValueError("format must be 'csv'")
+            platform = raw.get("platform")
+            if platform not in _FEED_PLATFORMS:
+                raise ValueError(f"platform must be one of {sorted(_FEED_PLATFORMS)}")
+            id_field = _clean_str(raw.get("id_field"))
+            if not id_field:
+                raise ValueError("id_field is required")
+            datetime.fromisoformat(_clean_str(raw.get("added_at")).replace("Z", "+00:00"))
+            feeds.append({
+                "name": name, "url": url, "host": host, "platform": platform,
+                "id_field": id_field,
+                "reason_field": _clean_str(raw.get("reason_field")) or None,
+                "source_field": _clean_str(raw.get("source_field")) or None,
+                "date_field": _clean_str(raw.get("date_field")) or None,
+                "default_reason": _clean_str(raw.get("default_reason")) or "listed by threat feed",
+            })
+        except (ValueError, TypeError) as exc:
+            logger.warning("threat feeds: skipping entry %d: %s", i, exc)
+    return feeds
+
+
+def _feed_id_ok(platform: str, ext_id: str) -> bool:
+    if platform == "chromium":
+        return bool(_CHROME_EXTENSION_ID_RE.fullmatch(ext_id))
+    return bool(_FIREFOX_GUID_RE.match(ext_id))
+
+
+def fetch_threat_feed(feed: dict, *, client: HttpClient | None = None) -> dict | None:
+    """Return {extension_id_lower: {reason, source, date}} or None on failure. Never raises."""
+    client = client or HttpClient(timeout=30.0)
+    status, _, body, error = client.get(feed["url"], allowed_hosts={feed["host"]},
+                                        max_bytes=32 * 1024 * 1024)
+    if status != 200 or not body or error:
+        logger.warning("threat feed %s fetch failed: %s", feed["name"], error or f"HTTP {status}")
+        return None
+    entries: dict[str, dict] = {}
+    try:
+        reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig", errors="replace")))
+        if feed["id_field"] not in (reader.fieldnames or []):
+            logger.warning("threat feed %s: column %r missing", feed["name"], feed["id_field"])
+            return None
+        for n, row in enumerate(reader):
+            if n >= _FEED_MAX_ROWS:
+                break
+            ext_id = _clean_str(row.get(feed["id_field"])).lower()
+            if not _feed_id_ok(feed["platform"], ext_id):
+                continue
+            entries[ext_id] = {
+                "reason": (_clean_str(row.get(feed["reason_field"] or "")) or feed["default_reason"])[:120],
+                "source": _clean_str(row.get(feed["source_field"] or ""))[:300] or None,
+                "date": _clean_str(row.get(feed["date_field"] or ""))[:40] or None,
+            }
+    except (csv.Error, ValueError) as exc:
+        logger.warning("threat feed %s parse failed: %s", feed["name"], exc)
+        return None
+    return entries
+
+
+def classify_feed_reason(reason: str) -> tuple[str, int]:
+    """(severity, threat score) for a feed's free-text listing reason."""
+    text = f"{_clean_str(reason).lower()} "
+    for severity, threat, keywords in _FEED_SEVERITY:
+        if any(k in text for k in keywords):
+            return severity, threat
+    return "listed", 45  # policy violation / removed for an unstated reason
+
+
+def match_threat_feeds(feed_index: dict, store: str, extension_id: str) -> list[dict]:
+    """Hits for one extension. `feed_index` is {feed_name: {"platform", "entries"}}."""
+    ext_id = _clean_str(extension_id).lower()
+    if not ext_id:
+        return []
+    hits = []
+    for name, feed in sorted((feed_index or {}).items()):
+        if store not in _FEED_PLATFORMS.get(feed.get("platform"), ()):
+            continue
+        entry = (feed.get("entries") or {}).get(ext_id)
+        if entry:
+            severity, threat = classify_feed_reason(entry.get("reason"))
+            hits.append({"feed": name, **entry, "severity": severity, "threat": threat})
+    return hits
+
 
 def summarize_vulnerabilities(vulnerabilities) -> tuple[str, int, float | None]:
     """Return (json, count, max_cvss) suitable for Memgraph scalar properties."""
@@ -2032,6 +2233,73 @@ def _self_check() -> None:
             return 404, {}, b"", None
     huge = fetch_chrome_metadata("c" * 32, client=_HugeCrx())
     assert "manifest_error" not in huge and "50 MB" in huge["manifest_unavailable"], huge
+
+    # Threat feeds: parse, classify, scope by platform, score.
+    feed_tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump({"feeds": [
+        {"name": "t", "url": "https://feeds.example.org/x.csv", "format": "csv", "platform": "chromium",
+         "id_field": "id", "reason_field": "why", "added_at": "2026-10-27T00:00:00Z"},
+        {"name": "lan", "url": "https://192.168.1.5/x.csv", "format": "csv", "platform": "chromium",
+         "id_field": "id", "added_at": "2026-10-27T00:00:00Z"},                    # skipped: IP host
+        {"name": "plain", "url": "http://feeds.example.org/x.csv", "format": "csv", "platform": "chromium",
+         "id_field": "id", "added_at": "2026-10-27T00:00:00Z"},                    # skipped: not https
+        {"name": "nodate", "url": "https://feeds.example.org/x.csv", "format": "csv",
+         "platform": "chromium", "id_field": "id"},                                # skipped: no added_at
+    ]}, feed_tmp)
+    feed_tmp.close()
+    os.environ["EXTENSION_THREAT_FEEDS_FILE"] = feed_tmp.name
+    feeds = load_threat_feeds()
+    os.unlink(feed_tmp.name)
+    assert [f["name"] for f in feeds] == ["t"], feeds
+
+    class _FeedClient:
+        def get(self, url, *, allowed_hosts, **_):
+            assert allowed_hosts == {"feeds.example.org"}
+            return 200, {}, ("﻿id,why\n" + "a" * 32 + ",Malware\n" + "b" * 32 + ",Adware\n"
+                             + "c" * 32 + ",Policy Violation\nnot-an-id,Malware\n").encode(), None
+    entries = fetch_threat_feed(feeds[0], client=_FeedClient())
+    assert set(entries) == {"a" * 32, "b" * 32, "c" * 32}, entries
+    index = {"t": {"platform": "chromium", "entries": entries}}
+    assert match_threat_feeds(index, "firefox", "a" * 32) == []          # platform-scoped
+    assert match_threat_feeds(index, "vivaldi", "A" * 32)[0]["severity"] == "malicious"
+    assert classify_feed_reason("Adware")[0] == "unwanted"
+    assert classify_feed_reason("Policy Violation") == ("listed", 45)
+    for ext_id, floor, bad in (("a" * 32, 85, True), ("b" * 32, 70, False), ("c" * 32, 60, False)):
+        r = analyze_extension({"store": "edge", "extension_id": ext_id, "name": "x", "host_count": 1,
+                               "store_meta": {"status": "public", "users": 50}},
+                              feed_hits=match_threat_feeds(index, "edge", ext_id))
+        assert r["risk_score"] >= floor and r["known_bad"] is bad, (ext_id, r["risk_score"], r["known_bad"])
+        assert any(s["code"] == "threat-feed:t" for s in r["risk_signals"]), r
+
+    # Edge falls back to the Chrome Web Store for IDs Edge's store does not know.
+    class _EdgeMiss(_NoUpdate):
+        def get(self, url, **_):
+            if "microsoftedge" in url:
+                return 404, {}, b"", None
+            return super().get(url)
+    via = fetch_store_metadata("edge", "d" * 32, client=_EdgeMiss())
+    assert via["store"] == "chrome" and via["resolved_from"] == "edge", via
+
+    # AMO: manifest_version and content scripts come from the signed XPI.
+    xpi = _zip({"manifest.json": json.dumps({"manifest_version": 2, "content_scripts": [
+        {"matches": ["<all_urls>"], "js": ["c.js"]}]})})
+
+    class _Amo:
+        def __init__(self, digest):
+            self.digest = digest
+
+        def get(self, url, *, allowed_hosts, **_):
+            assert allowed_hosts == _AMO_HOSTS
+            if url.endswith(".xpi"):
+                return 200, {}, xpi, None
+            return 200, {}, json.dumps({"status": "public", "current_version": {"version": "1", "file": {
+                "url": "https://addons.mozilla.org/firefox/downloads/file/1/x.xpi",
+                "hash": "sha256:" + self.digest, "size": len(xpi), "permissions": ["tabs"]}}}).encode(), None
+    amo = fetch_amo_metadata("x@y.org", client=_Amo(hashlib.sha256(xpi).hexdigest()))
+    assert amo["manifest_version"] == 2 and amo["content_script_matches"] == ["<all_urls>"], amo
+    assert amo["permissions"] == ["tabs"] and amo["crx_hash_verified"] is True, amo
+    tampered = fetch_amo_metadata("x@y.org", client=_Amo("0" * 64))
+    assert tampered["manifest_error"] == "XPI SHA-256 does not match AMO", tampered
 
     nu = _NoUpdate()
     served_none = fetch_chrome_metadata("c" * 32, client=nu)
