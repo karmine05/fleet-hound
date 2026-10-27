@@ -300,8 +300,8 @@ def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = 
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     extension_id = record["extension_id"]
     version = record.get("last_version") or ""
-    # v6: metadata gained store-listing facts (users, rating, featured, contact).
-    cache_key = f"v6:{store}:{extension_id}:{version}"
+    # v7: store-listing facts re-parsed with markup-anchored (unspoofable) patterns.
+    cache_key = f"v7:{store}:{extension_id}:{version}"
     cached = _cache_get(cache_dir, cache_key, METADATA_TTL_SEC)
     if cached is not None:
         return cached
