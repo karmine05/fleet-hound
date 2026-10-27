@@ -26,8 +26,6 @@ Cross-worker correctness mirrors enrich_worker.py:
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import json
 import logging
 import os
@@ -56,6 +54,14 @@ from src.shadow_it_filter import (  # noqa: E402
     compute_per_platform_thresholds,
 )
 
+try:  # Docker layout: /app/webviz on sys.path
+    from worker_util import (atomic_write_json, fire_trigger as _fire_trigger, read_json,
+                             sleep_until, trigger_mtime as _trigger_mtime, try_acquire_lock)
+except ImportError:  # imported as the webviz package
+    from webviz.worker_util import (atomic_write_json, fire_trigger as _fire_trigger,  # type: ignore
+                                    read_json, sleep_until, trigger_mtime as _trigger_mtime,
+                                    try_acquire_lock)
+
 logger = logging.getLogger(__name__)
 
 LOCK_PATH_DEFAULT = "/tmp/fleet-hound-ooda.lock"
@@ -64,46 +70,12 @@ STATUS_PATH_DEFAULT = "/app/config/ooda_status.json"
 CYCLES_PATH_DEFAULT = "/app/config/ooda_cycles.jsonl"
 FINDINGS_PATH_DEFAULT = "/app/config/ooda_findings.json"
 
-_TRIGGER_POLL_SEC = 1.0
 _CYCLES_KEEP = 100  # most recent cycles retained
 
 
 # ----------------------------------------------------------------------------
 # Atomic JSON helpers
 # ----------------------------------------------------------------------------
-def _atomic_write_json(path: str, payload: dict | list) -> None:
-    parent = os.path.dirname(path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    fd, tmp = tempfile.mkstemp(prefix=".ooda.", suffix=".tmp", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, separators=(",", ":"))
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _read_json_file(path: str, default):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def _append_jsonl(path: str, row: dict) -> None:
     parent = os.path.dirname(path) or "."
     try:
@@ -147,35 +119,6 @@ def _trim_jsonl(path: str, keep: int) -> None:
 # ----------------------------------------------------------------------------
 # Single-leader lock
 # ----------------------------------------------------------------------------
-def _try_acquire_lock(lock_path: str):
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
-        logger.warning("ooda: cannot open lock file %s: %s", lock_path, exc)
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-            os.close(fd)
-            return None
-        os.close(fd)
-        return None
-    try:
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
-    except OSError:
-        pass
-    return fd
-
-
-def _trigger_mtime(trigger_path: str) -> float:
-    try:
-        return os.path.getmtime(trigger_path)
-    except OSError:
-        return 0.0
-
-
 # ----------------------------------------------------------------------------
 # Cycle records
 # ----------------------------------------------------------------------------
@@ -301,7 +244,7 @@ class _SharedStatus:
     def __init__(self, status_path: str, *, enabled: bool, running: bool):
         self.path = status_path
         self.lock = threading.Lock()
-        prior = _read_json_file(status_path, default={}) or {}
+        prior = read_json(status_path, default={}) or {}
         self.enabled = enabled
         self.running = running
         self.next_cycle_id: int = int(prior.get("next_cycle_id", 1))
@@ -330,7 +273,7 @@ class _SharedStatus:
             "cycles_failed": self.cycles_failed,
         }
         try:
-            _atomic_write_json(self.path, payload)
+            atomic_write_json(self.path, payload, prefix=".ooda.")
         except OSError as exc:
             logger.warning("ooda: status flush failed: %s", exc)
 
@@ -553,7 +496,7 @@ def _loop(driver_provider: Callable, status: _SharedStatus, *,
             findings, findings_summary = _decide_phase(driver)
             findings["cycle_id"] = cycle_id
             try:
-                _atomic_write_json(findings_path, findings)
+                atomic_write_json(findings_path, findings, prefix=".ooda.")
             except OSError as exc:
                 decide_err = f"findings write failed: {exc}"
                 logger.warning("ooda: %s", decide_err)
@@ -612,15 +555,9 @@ def _loop(driver_provider: Callable, status: _SharedStatus, *,
                       last_error=cycle_error)
 
         # Sleep until next tick OR until the trigger file mtime advances.
-        deadline = time.time() + max(1.0, float(interval_sec))
-        while time.time() < deadline:
-            if stop_event.is_set():
-                break
-            cur = _trigger_mtime(trigger_path)
-            if cur > last_trigger_seen:
-                last_trigger_seen = cur
-                break
-            time.sleep(_TRIGGER_POLL_SEC)
+        last_trigger_seen = sleep_until(
+            time.time() + max(1.0, float(interval_sec)), trigger_path=trigger_path,
+            last_trigger=last_trigger_seen, stop_event=stop_event)
 
     status.update(running=False)
     logger.info("ooda: loop exited")
@@ -656,7 +593,7 @@ def start_worker(driver_provider: Callable, *,
         logger.info("ooda: disabled via OODA_ENABLED=false")
         return status, stop_event
 
-    fd = _try_acquire_lock(lock_path)
+    fd = try_acquire_lock(lock_path, "ooda")
     if fd is None:
         logger.info("ooda: another worker holds %s; this worker will not run the loop",
                     lock_path)
@@ -691,7 +628,7 @@ def start_worker(driver_provider: Callable, *,
 
 
 def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
-    data = _read_json_file(status_path, default={}) or {}
+    data = read_json(status_path, default={}) or {}
     return {
         "enabled": bool(data.get("enabled", False)),
         "running": bool(data.get("running", False)),
@@ -707,25 +644,11 @@ def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
 def fire_trigger(trigger_path: str = TRIGGER_PATH_DEFAULT,
                  *, cooldown_sec: float = 60.0) -> tuple[bool, float]:
     """Touch the trigger file iff outside the cooldown window."""
-    now = time.time()
-    last = _trigger_mtime(trigger_path)
-    if last > 0 and (now - last) < cooldown_sec:
-        return False, max(1.0, cooldown_sec - (now - last))
-    parent = os.path.dirname(trigger_path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    try:
-        Path(trigger_path).touch()
-    except OSError as exc:
-        logger.error("ooda: trigger touch failed: %s", exc)
-        return False, 0.0
-    return True, 0.0
+    return _fire_trigger(trigger_path, cooldown_sec=cooldown_sec, name="ooda")
 
 
 def read_findings(findings_path: str = FINDINGS_PATH_DEFAULT) -> dict:
-    data = _read_json_file(findings_path, default=None)
+    data = read_json(findings_path, default=None)
     if isinstance(data, dict):
         return data
     return {

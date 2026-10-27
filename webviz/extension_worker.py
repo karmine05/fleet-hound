@@ -17,13 +17,11 @@ the worker must never be the reason ingestion or the API is unavailable.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import hashlib
 import json
 import logging
 import os
-import tempfile
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +41,7 @@ try:  # Docker layout: /app/webviz + /app/src on sys.path
         fetch_store_metadata,
         fetch_threat_feed,
         is_browser_builtin,
+        NOT_MODIFIED,
         load_threat_feeds,
         match_blocklist,
         match_threat_feeds,
@@ -63,11 +62,20 @@ except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
         fetch_store_metadata,
         fetch_threat_feed,
         is_browser_builtin,
+        NOT_MODIFIED,
         load_threat_feeds,
         match_blocklist,
         match_threat_feeds,
         signals_json,
     )
+
+try:  # Docker layout: /app/webviz on sys.path
+    from worker_util import (atomic_write_json, fire_trigger as _fire_trigger, read_json,
+                             sleep_until, trigger_mtime as _trigger_mtime, try_acquire_lock)
+except ImportError:  # imported as the webviz package
+    from webviz.worker_util import (atomic_write_json, fire_trigger as _fire_trigger,  # type: ignore
+                                    read_json, sleep_until, trigger_mtime as _trigger_mtime,
+                                    try_acquire_lock)
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +92,6 @@ LISTING_TTL_JITTER_SEC = 7 * 24 * 60 * 60
 BLOCKLIST_TTL_SEC = 6 * 60 * 60
 REFRESH_INTERVAL_SEC = 6 * 60 * 60
 
-_TRIGGER_POLL_SEC = 1.0
-
 _EXT_WHERE = "(s.kind = 'browser_extension' OR s.extension_key STARTS WITH 'ext:')"
 
 _CHROME_FAMILY = CHROMIUM_STORES - {"edge"}
@@ -94,70 +100,6 @@ _ADAPTER_STORES = CHROMIUM_STORES | {"firefox"}
 _MANIFEST_FIELDS = ("manifest_version", "permissions", "optional_permissions",
                     "host_permissions", "content_script_matches", "update_url",
                     "homepage_url", "crx_hash_verified")
-
-
-def _atomic_write_json(path: str, payload: dict) -> None:
-    parent = os.path.dirname(path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    try:
-        fd, tmp = tempfile.mkstemp(prefix=".extensions.", suffix=".tmp", dir=parent)
-    except OSError:
-        return
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, separators=(",", ":"), default=str)
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _read_json(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _try_acquire_lock(lock_path: str):
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(fd)
-        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-            logger.warning("extensions: lock acquisition failed: %s", exc)
-        return None
-    try:
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
-    except OSError:
-        pass
-    return fd
-
-
-def _trigger_mtime(trigger_path: str) -> float:
-    try:
-        return os.path.getmtime(trigger_path)
-    except OSError:
-        return 0.0
 
 
 def _cache_path(cache_dir: str, key: str) -> str:
@@ -178,11 +120,40 @@ def _cache_get(cache_dir: str, key: str, ttl: float):
         return None
 
 
+def _cache_touch(cache_dir: str, key: str) -> None:
+    """Restart the TTL of a cached copy the server confirmed unchanged (304)."""
+    try:
+        os.utime(_cache_path(cache_dir, key))
+    except OSError as exc:
+        logger.warning("extension cache touch failed key=%s: %s", key, exc)
+
+
+def _conditional_fetch(cache_dir: str, key: str, fetch):
+    """Refresh one expired cached document with a conditional GET.
+
+    Returns (document or None, fetched_fresh). The ETag lives next to the
+    copy under `<key>:meta` and is sent only while a copy exists to reuse.
+    """
+    stale = _cache_get(cache_dir, key, float("inf"))
+    meta = _cache_get(cache_dir, f"{key}:meta", float("inf")) if stale is not None else None
+    validators = {"etag": meta["etag"]} if isinstance(meta, dict) and meta.get("etag") else {}
+    result = fetch(validators)
+    if result is NOT_MODIFIED:
+        _cache_touch(cache_dir, key)
+        return stale, False
+    if result:
+        _cache_set(cache_dir, key, result)
+        if validators.get("etag"):
+            _cache_set(cache_dir, f"{key}:meta", validators)
+        return result, True
+    return None, False
+
+
 def _cache_set(cache_dir: str, key: str, value) -> None:
     if not isinstance(value, (dict, list)):
         return
     try:
-        _atomic_write_json(_cache_path(cache_dir, key), value)
+        atomic_write_json(_cache_path(cache_dir, key), value, prefix=".extensions.")
     except Exception as exc:  # noqa: BLE001 — cache is best-effort, but not silent
         logger.warning("extension cache write failed key=%s: %s", key, exc)
 
@@ -191,7 +162,8 @@ class _SharedStatus:
     def __init__(self, status_path: str, *, enabled: bool, running: bool):
         self.path = status_path
         self.lock = threading.Lock()
-        prior = _read_json(status_path)
+        prior = read_json(status_path, {})
+        prior = prior if isinstance(prior, dict) else {}
         self.enabled = enabled
         self.running = running
         self.last_tick_iso = prior.get("last_tick_iso")
@@ -214,7 +186,13 @@ class _SharedStatus:
             self._flush_locked()
 
     def _flush_locked(self):
-        _atomic_write_json(self.path, {
+        try:
+            self._write_locked()
+        except OSError as exc:  # e.g. read-only config: keep the loop alive, say so
+            logger.warning("extensions: status flush failed: %s", exc)
+
+    def _write_locked(self):
+        atomic_write_json(self.path, {
             "enabled": self.enabled,
             "running": self.running,
             "last_tick_iso": self.last_tick_iso,
@@ -225,7 +203,7 @@ class _SharedStatus:
             "sources": self.sources,
             "threat_feeds": self.threat_feeds,
             "coverage": self.coverage,
-        })
+        }, prefix=".extensions.")
 
 
 def _total_hosts(driver) -> int:
@@ -242,13 +220,44 @@ def _cache_age(cache_dir: str, key: str) -> float | None:
         return None
 
 
-# v12: Chrome listings carry the integer privacy_codes the scorer reads.
+# Bump a version when the cached shape changes; prune_cache() deletes the
+# files of every other version. v12: listings carry integer privacy_codes.
+LISTING_KEY_VERSION = "v12"
+MANIFEST_KEY_VERSION = "v11"
+
+
 def _listing_key(store: str, extension_id: str) -> str:
-    return f"v12:listing:{store}:{extension_id}"
+    return f"{LISTING_KEY_VERSION}:listing:{store}:{extension_id}"
 
 
 def _manifest_key(store: str, extension_id: str, version: str) -> str:
-    return f"v11:manifest:{store}:{extension_id}:{version}"
+    return f"{MANIFEST_KEY_VERSION}:manifest:{store}:{extension_id}:{version}"
+
+
+_VERSIONED_CACHE_RE = re.compile(r"v\d+_")
+
+
+def prune_cache(cache_dir: str) -> int:
+    """Delete listing/manifest files of retired key versions. Returns the count.
+
+    Only `v<N>_*` files are candidates, so feed and blocklist copies and any
+    unknown file are never touched.
+    """
+    live = (f"{LISTING_KEY_VERSION}_listing_", f"{MANIFEST_KEY_VERSION}_manifest_")
+    removed = 0
+    try:
+        names = os.listdir(cache_dir)
+    except OSError as exc:
+        logger.warning("extensions: cannot list cache %s: %s", cache_dir, exc)
+        return 0
+    for name in names:
+        if _VERSIONED_CACHE_RE.match(name) and not name.startswith(live):
+            try:
+                os.unlink(os.path.join(cache_dir, name))
+                removed += 1
+            except OSError as exc:
+                logger.warning("extensions: cannot prune %s: %s", name, exc)
+    return removed
 
 
 def _listing_ttl(store: str, extension_id: str) -> float:
@@ -654,10 +663,9 @@ def _load_feed_index(cache_dir: str) -> tuple[dict, list[dict]]:
         entries = _cache_get(cache_dir, key, BLOCKLIST_TTL_SEC)
         error = None
         if not isinstance(entries, dict):
-            entries = fetch_threat_feed(feed)
-            if entries is not None:
-                _cache_set(cache_dir, key, entries)
-            else:
+            entries, _ = _conditional_fetch(
+                cache_dir, key, lambda v, feed=feed: fetch_threat_feed(feed, validators=v))
+            if entries is None:
                 error = "fetch failed"
                 entries = _cache_get(cache_dir, key, float("inf"))
                 if isinstance(entries, dict):
@@ -700,9 +708,9 @@ def _load_blocklist(cache_dir: str) -> dict:
     blocklist = _cache_get(cache_dir, "mozilla:blocklist", BLOCKLIST_TTL_SEC)
     if isinstance(blocklist, dict):
         return blocklist
-    blocklist = fetch_mozilla_blocklist()
+    blocklist, _ = _conditional_fetch(cache_dir, "mozilla:blocklist",
+                                      lambda v: fetch_mozilla_blocklist(validators=v))
     if blocklist:
-        _cache_set(cache_dir, "mozilla:blocklist", blocklist)
         return blocklist
     # Fetch failed: an expired list beats none. Scoring with {} drops
     # known-bad extensions below their risk floor for a full refresh window.
@@ -831,13 +839,8 @@ def _loop(driver_provider, status: _SharedStatus, *, interval_sec: float,
         # Sleep in small slices so a manual trigger is picked up quickly while
         # still honouring the configured interval.
         remaining = max(1.0, interval_sec - (time.time() - tick_start))
-        deadline = time.time() + remaining
-        while not stop_event.is_set() and time.time() < deadline:
-            mtime = _trigger_mtime(trigger_path)
-            if mtime > last_trigger:
-                last_trigger = mtime
-                break
-            time.sleep(_TRIGGER_POLL_SEC)
+        last_trigger = sleep_until(time.time() + remaining, trigger_path=trigger_path,
+                                   last_trigger=last_trigger, stop_event=stop_event)
     status.update(running=False)
     logger.info("extensions: loop exited")
 
@@ -857,12 +860,15 @@ def start_worker(driver_provider, *, interval_sec: int = REFRESH_INTERVAL_SEC,
         logger.info("extensions: disabled via EXTENSION_WORKER_ENABLED=false")
         return status, stop_event
 
-    fd = _try_acquire_lock(lock_path)
+    fd = try_acquire_lock(lock_path, "extensions")
     if fd is None:
         logger.info("extensions: another worker holds %s; not starting loop", lock_path)
         return status, stop_event
 
     status.update(running=True)
+    pruned = prune_cache(cache_dir)
+    if pruned:
+        logger.info("extensions: pruned %d cache files of retired key versions", pruned)
     thread = threading.Thread(
         target=_loop,
         name="fleet-hound-extensions",
@@ -886,7 +892,8 @@ def start_worker(driver_provider, *, interval_sec: int = REFRESH_INTERVAL_SEC,
 
 
 def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
-    data = _read_json(status_path)
+    data = read_json(status_path, {})
+    data = data if isinstance(data, dict) else {}
     return {
         "enabled": bool(data.get("enabled", False)),
         "running": bool(data.get("running", False)),
@@ -903,21 +910,7 @@ def read_status(status_path: str = STATUS_PATH_DEFAULT) -> dict:
 
 def fire_trigger(trigger_path: str = TRIGGER_PATH_DEFAULT, *,
                  cooldown_sec: float = 30.0) -> tuple[bool, float]:
-    now = time.time()
-    last = _trigger_mtime(trigger_path)
-    if last > 0 and (now - last) < cooldown_sec:
-        return False, max(1.0, cooldown_sec - (now - last))
-    parent = os.path.dirname(trigger_path) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError:
-        pass
-    try:
-        Path(trigger_path).touch()
-    except OSError as exc:
-        logger.error("extensions: trigger touch failed: %s", exc)
-        return False, 0.0
-    return True, 0.0
+    return _fire_trigger(trigger_path, cooldown_sec=cooldown_sec, name="extensions")
 
 
 if __name__ == "__main__":
