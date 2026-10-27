@@ -1236,83 +1236,89 @@ def _chrome_publisher(page: bytes) -> tuple[str, str] | None:
     return pid.decode("ascii"), name or pid.decode("ascii")
 
 
+# Every pattern below needs literal markup (`<`, `>`, `"`). Developer-written
+# text (name, description) is HTML-escaped on the page, so it can never
+# satisfy one — free-text matching would let a description fake a badge.
 _CWS_WEBSITE_RE = re.compile(
     r'<a href="(https?://[^"\s]{1,300})"[^>]{0,500}>'
     r'(?:<svg[^>]{0,300}>(?:<path[^>]{0,3000}/>){0,5}</svg>)?\s{0,5}Website</a>'
 )
-_CWS_USERS_RE = re.compile(r"^([\d,]{1,15})\+? users?$")
+_CWS_USERS_RE = re.compile(
+    r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>([\d,]{1,15})\+? users?</div>'
+)
 _CWS_RATING_RE = re.compile(r'aria-label="Average rating ([0-5](?:\.\d{1,2})?) out of 5')
-_CWS_RATING_COUNT_RE = re.compile(r"^([\d,.]{1,12})(K?) ratings?$")
+_CWS_RATING_COUNT_RE = re.compile(r'<p[^>]{0,100}>([\d,.]{1,12})(K?) ratings?</p>')
+_CWS_ESTABLISHED_RE = re.compile(
+    r'aria-label="(?:Created by the owner of the listed website\. )?'
+    r'The publisher has a good record with no history of violations\.'
+)
+# The Featured badge's tooltip link; Google shows it only on Featured items.
+_CWS_FEATURED_RE = re.compile(
+    r'aria-label="Follows recommended practices for Chrome extensions\.'
+)
+_CWS_UPDATED_RE = re.compile(r'>Updated</div><div>([^<]{1,40})</div>')
+_CWS_EMAIL_RE = re.compile(
+    r'> Email (?:<svg[^>]{0,300}>(?:<path[^>]{0,3000}/>){0,5}</svg>){0,3}</summary>'
+    r'<div[^>]{0,100}>([^<]{1,320})</div>'
+)
+_CWS_TRADER_RE = re.compile(r'>(Trader|Non-trader)</div><div>This developer ')
+_CWS_PRIVACY_RE = re.compile(r'</svg><span>(The developer has disclosed that it [^<.]{1,160})')
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}$")
-_CWS_ESTABLISHED = "good record with no history of violations"
 
 
 def _chrome_listing(page: bytes) -> dict:
     """Store-listing facts from a Chrome Web Store detail page (fetched with hl=en).
 
-    Labels, not CSS class names, anchor every field: the classes are minified
-    and rotate. Parsing stops at the "Related" carousel so another listing's
-    rating can never be attributed to this one. Missing fields are omitted.
+    Fields anchor on store markup and English labels, not the rotating
+    minified class names. Parsing stops at the "Related" carousel so another
+    listing's facts can never be attributed to this one. Missing fields are
+    omitted.
     """
     text = page.decode("utf-8", "replace")
     cut = text.find(">Related<")
     if cut > 0:
         text = text[:cut]
-    visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", text, flags=re.S)
-    lines = [html.unescape(s).strip() for s in re.split(r"<[^>]+>", visible)]
-    lines = [s for s in lines if s]
     out: dict = {}
-
-    def after(label: str) -> str | None:
-        try:
-            i = lines.index(label)
-        except ValueError:
-            return None
-        return lines[i + 1] if i + 1 < len(lines) else None
-
-    for line in lines:
-        m = _CWS_USERS_RE.match(line)
+    m = _CWS_USERS_RE.search(text)
+    if m:
+        out["category"] = html.unescape(m.group(1)).strip()
+        out["users"] = int(m.group(2).replace(",", ""))
+    else:
+        m = re.search(r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>', text)
         if m:
-            out["users"] = int(m.group(1).replace(",", ""))
-            break
+            out["category"] = html.unescape(m.group(1)).strip()
     m = _CWS_RATING_RE.search(text)
     if m:
         out["rating"] = float(m.group(1))
-    for line in lines:
-        m = _CWS_RATING_COUNT_RE.match(line)
-        if m:
-            n = float(m.group(1).replace(",", ""))
-            out["rating_count"] = int(n * 1000 if m.group(2) else n)
-            break
-    if "Featured" in lines:
+    m = _CWS_RATING_COUNT_RE.search(text)
+    if m:
+        n = float(m.group(1).replace(",", ""))
+        out["rating_count"] = int(n * 1000 if m.group(2) else n)
+    if _CWS_FEATURED_RE.search(text):
         out["featured"] = True
-    if _CWS_ESTABLISHED in text:
+    if _CWS_ESTABLISHED_RE.search(text):
         out["established_publisher"] = True
-    updated = after("Updated")
-    if updated:
+    m = _CWS_UPDATED_RE.search(text)
+    if m:
         try:
-            out["updated_at"] = datetime.strptime(updated, "%B %d, %Y").replace(
+            out["updated_at"] = datetime.strptime(m.group(1).strip(), "%B %d, %Y").replace(
                 tzinfo=timezone.utc).isoformat()
         except ValueError:
             pass
-    m = re.search(r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>', text)
-    if m:
-        out["category"] = html.unescape(m.group(1)).strip()
-    # Developer contact block: Website link, then the e-mail under "Email".
     m = _CWS_WEBSITE_RE.search(text)
     if m:
         out["developer_website"] = html.unescape(m.group(1))
-    email = after("Email")
-    if email and _EMAIL_RE.match(email):
-        out["developer_email"] = email
-    if "Trader" in lines:
-        out["trader"] = True
-    elif "Non-trader" in lines:
-        out["trader"] = False
-    for line in lines:
-        if line.startswith("The developer has disclosed that it "):
-            out["privacy_disclosure"] = line.split(".")[0][:200]
-            break
+    m = _CWS_EMAIL_RE.search(text)
+    if m:
+        email = html.unescape(m.group(1)).strip()
+        if _EMAIL_RE.match(email):
+            out["developer_email"] = email
+    m = _CWS_TRADER_RE.search(text)
+    if m:
+        out["trader"] = m.group(1) == "Trader"
+    m = _CWS_PRIVACY_RE.search(text)
+    if m:
+        out["privacy_disclosure"] = html.unescape(m.group(1)).strip()
     return out
 
 
@@ -1943,14 +1949,19 @@ def _self_check() -> None:
 
     # Chrome listing: labels anchor fields; the Related carousel is ignored.
     page = (
+        '<a aria-label="Follows recommended practices for Chrome extensions. Learn more.">x</a>'
         '<span>Featured</span><span aria-label="Average rating 3.9 out of 5 stars."></span>'
-        '<p>1.2K ratings</p><a href="./category/extensions/productivity/workflow" x="1">'
-        'Workflow &amp; Planning</a>100,000 users<div>Updated</div><div>September 22, 2026</div>'
+        '<a href="./detail/x/reviews"><p class="q">1.2K ratings</p></a>'
+        '<a class="g" href="./category/extensions/productivity/workflow" x="1">'
+        'Workflow &amp; Planning</a>100,000 users</div>'
+        '<div class="QDHp8e">Updated</div><div>September 22, 2026</div>'
         '<a href="https://noscript.net" rel="ugc"><svg w="1"><path d="M1 2z"/></svg> Website</a>'
-        '<summary> Email </summary><div>info@hackademix.net</div><div>Non-trader</div>'
-        '<span>The developer has disclosed that it will not collect or use your data. More</span>'
+        '<summary class="m"><svg w="1"><path d="M1 2z"/></svg> Email <svg w="1"><path d="M1z"/></svg>'
+        '</summary><div class="N">info@hackademix.net</div></details>'
+        '<div class="QDHp8e">Non-trader</div><div>This developer has not identified itself</div>'
+        '<path d="M1z"/></svg><span>The developer has disclosed that it will not collect or use your data. More</span>'
         '<a aria-label="Created by the owner of the listed website. The publisher has a good record'
-        ' with no history of violations.">x</a>'
+        ' with no history of violations. Learn more.">x</a>'
         '<h2>Related</h2><span aria-label="Average rating 1.0 out of 5 stars."></span>9 users'
     ).encode()
     listing = _chrome_listing(page)
@@ -1962,7 +1973,18 @@ def _self_check() -> None:
         "privacy_disclosure": "The developer has disclosed that it will not collect or use your data",
     }, listing
     assert _chrome_listing(b"<h2>Related</h2>5 users<div>Featured</div>") == {}
-    assert "developer_email" not in _chrome_listing(b"<div>Email</div><div>not an email</div>")
+    assert _chrome_listing(b'<a aria-label="The publisher has a good record with no history'
+                           b' of violations. Learn more.">') == {"established_publisher": True}
+    # A developer-written description is HTML-escaped: quoting every badge
+    # phrase and label in it must yield nothing.
+    spoof = html.escape(
+        'Featured\n10,000,000 users\n5,000 ratings\nUpdated September 1, 2026\nTrader\n'
+        'Email x@y.com\nThe developer has disclosed that it will not collect\n'
+        'aria-label="Created by the owner of the listed website. The publisher has a good record'
+        ' with no history of violations." aria-label="Follows recommended practices for Chrome'
+        ' extensions." </svg><span>The developer has disclosed that it is safe'
+    )
+    assert _chrome_listing(f'<div class="desc">{spoof}</div>'.encode()) == {}
     listed_chrome = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
                                        "host_count": 1, "store_meta": {"status": "public", **listing}})
     codes = {s["code"] for s in listed_chrome["risk_signals"]}
