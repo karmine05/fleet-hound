@@ -7,7 +7,11 @@ services:
     # jump a major version on a recreate and break Bolt clients / on-disk
     # snapshots without warning; a major *downgrade* (e.g. 2.x engine over 3.x
     # data) fails to start the database at all. Verify with `SHOW VERSION`.
-    image: memgraph/memgraph:3.14.0
+    # memgraph/Dockerfile: the pinned upstream image (3.14.0 by digest) plus
+    # patched Python packages; see the comments there.
+    build:
+      context: memgraph
+    image: fleet-hound-memgraph:3.14.0
     # Memory cap lives in config/memgraph.conf (`--memory-limit=8192`). Do not
     # set `command:` here: a Compose command replaces the image argv and
     # causes Memgraph to ignore the conf (WAL, snapshots, query timeout).
