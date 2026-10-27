@@ -192,7 +192,9 @@ def is_browser_builtin(record: dict) -> bool:
             return True
         if store == "firefox" and ("\\browser\\features\\" in p or "/browser/features/" in p):
             return True
-        if store == "safari" and ("\\contents\\plugins\\" in p or "\\contents\\library\\" in p):
+        # Every App Store Safari extension lives in its app's Contents/PlugIns,
+        # so only extensions bundled with Safari itself or the OS are built-in.
+        if store == "safari" and ("\\safari.app\\" in p or p.startswith("\\system\\")):
             return True
     return False
 
@@ -271,10 +273,13 @@ def _edit_distance_at_most_one(a: str, b: str) -> bool:
 
 
 def name_anomaly_signals(name: str, display_name: str = "", *,
-                         store: str = "") -> tuple[list[dict], int]:
+                         store: str = "", vouched: bool = False) -> tuple[list[dict], int]:
     """Heuristic malformed/typosquat detection.
 
     Deliberately conservative: a hit is a review signal, not a verdict.
+    `vouched`: the store vouches for the publisher of a verified store
+    install, so a brand look-alike name ("Motion", "Rocket") is a real
+    product, not an impersonation; the brand checks are skipped.
     """
     display = (display_name or name or "").strip()
     signals: list[dict] = []
@@ -304,18 +309,23 @@ def name_anomaly_signals(name: str, display_name: str = "", *,
     # The exact brand spelling ("1Password") is the brand itself, not a
     # typosquat; only look-alikes ("1Passw0rd", "adgaurd") are flagged.
     exact = re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKC", display).casefold())
+    hit = None
     if len(compact) >= 5 and exact not in _BRANDS:
         for brand in _NORMALISED_BRANDS:
             if _edit_distance_at_most_one(compact, brand):
-                add("typosquat-brand", 18,
-                    f"name is one edit away from the '{brand}' brand")
+                hit = ("typosquat-brand", 18, f"name is one edit away from the '{brand}' brand")
                 break
             if compact.startswith(brand) and len(compact) - len(brand) <= 2:
                 suffix = compact[len(brand):]
                 if suffix in {"x", "pro", "plus", "app", "ex", "official"}:
-                    add("brand-affix", 8,
-                        f"name appends '{suffix}' to the '{brand}' brand")
+                    hit = ("brand-affix", 8, f"name appends '{suffix}' to the '{brand}' brand")
                     break
+    if hit and vouched:
+        signals.append({"code": "brand-lookalike-vouched", "weight": 0,
+                        "detail": hit[2] + ", but the store vouches for this publisher; "
+                                  "not penalised"})
+    elif hit:
+        add(*hit)
 
     return signals, min(penalty, 35)
 
@@ -553,6 +563,12 @@ _PERMISSION_WEIGHTS = {
     "sidePanel": 1,
 }
 
+# Chrome Web Store data-collection disclosure codes (see _CWS_PRIVACY_LABELS)
+# that matter for exfiltration risk. Capped in total: a disclosure is honest
+# self-reporting, a review signal rather than a verdict.
+_PRIVACY_WEIGHTS = {4: 4, 3: 3, 5: 3, 1: 2, 7: 2}
+_PRIVACY_CAP = 8
+
 _ALL_URLS = {"<all_urls>", "*://*/*", "http://*/*", "https://*/*"}
 _HOST_PATTERN_RE = re.compile(r"^(<all_urls>|\*://|[a-z]+://)", re.IGNORECASE)
 
@@ -583,7 +599,8 @@ def _permission_sets(meta: dict, record: dict) -> tuple[set[str], set[str], set[
 
 
 def _capability(perms: set[str], hosts: set[str], matches: set[str],
-                optional: set[str] = frozenset()) -> tuple[int, list[dict]]:
+                optional: set[str] = frozenset(),
+                privacy_codes=()) -> tuple[int, list[dict]]:
     score = 0
     signals: list[dict] = []
     for perm in sorted(perms):
@@ -636,6 +653,16 @@ def _capability(perms: set[str], hosts: set[str], matches: set[str],
             "code": "content-script",
             "weight": 5,
             "detail": f"injects a content script into {len(matches)} pattern(s)",
+        })
+    declared = sorted({c for c in privacy_codes or () if type(c) is int and c in _PRIVACY_WEIGHTS})
+    if declared:
+        weight = min(_PRIVACY_CAP, sum(_PRIVACY_WEIGHTS[c] for c in declared))
+        score += weight
+        signals.append({
+            "code": "declared-data-collection",
+            "weight": weight,
+            "detail": "developer declares it collects: "
+                      + ", ".join(_CWS_PRIVACY_LABELS[c] for c in declared),
         })
     # Content scripts reach page content too, so only discount when neither exists.
     if not hosts and not matches:
@@ -695,67 +722,66 @@ def _trust_score(meta: dict, record: dict, *, reputable: bool) -> tuple[int, lis
 
     if status == "public":
         score += 25
-        signals.append({"code": "store-listed", "weight": 0,
+        signals.append({"code": "store-listed", "weight": -25,
                         "detail": "listed in a public extension store"})
     elif status == "unlisted":
         score += 5
-        signals.append({"code": "store-unlisted", "weight": 0,
-                        "detail": "unlisted or self-distributed"})
+        signals.append({"code": "store-unlisted", "weight": -5,
+                        "detail": "unlisted or self-distributed, but the store still serves it"})
     elif status == "unknown":
         score += 8
-        signals.append({"code": "store-status-unknown", "weight": 0,
+        signals.append({"code": "store-status-unknown", "weight": -8,
                         "detail": "store metadata unavailable"})
     # not_found/removed deliberately score 0.
 
     if reputable:
         score += 20
-        signals.append({"code": "reputable-publisher", "weight": 0,
+        signals.append({"code": "reputable-publisher", "weight": -20,
                         "detail": "publisher matches a known vendor"})
     if meta.get("developer_verified") is True:
         score += 10
-        signals.append({"code": "verified-developer", "weight": 0,
+        signals.append({"code": "verified-developer", "weight": -10,
                         "detail": "store marks the developer as verified"})
     elif meta.get("established_publisher") is True:
         score += 10
-        signals.append({"code": "established-publisher", "weight": 0,
+        signals.append({"code": "established-publisher", "weight": -10,
                         "detail": "store: verified website owner with no history of violations"})
     if meta.get("featured") is True:
         score += 5
-        signals.append({"code": "store-featured", "weight": 0,
+        signals.append({"code": "store-featured", "weight": -5,
                         "detail": "featured / recommended by the store"})
 
     mv = _as_int(meta.get("manifest_version"))
     if mv == 3:
         score += 8
-        signals.append({"code": "manifest-v3", "weight": 0,
+        signals.append({"code": "manifest-v3", "weight": -8,
                         "detail": "uses Manifest V3"})
 
     updated = _parse_iso(meta.get("updated_at"))
     if updated:
         age_days = (datetime.now(timezone.utc) - updated).days
-        if age_days <= 365:
-            score += 10
-        elif age_days <= 730:
-            score += 4
-        signals.append({"code": "store-updated", "weight": 0,
+        points = 10 if age_days <= 365 else 4 if age_days <= 730 else 0
+        score += points
+        signals.append({"code": "store-updated", "weight": -points,
                         "detail": f"last store update {max(age_days, 0)} days ago"})
 
     users = _as_int(meta.get("users"))
     if users and users > 0:
-        score += min(12, int(4 * math.log10(users + 1)))
-        signals.append({"code": "install-popularity", "weight": 0,
+        points = min(12, int(4 * math.log10(users + 1)))
+        score += points
+        signals.append({"code": "install-popularity", "weight": -points,
                         "detail": f"{users:,} store installs"})
 
     rating = _as_float(meta.get("rating"))
     rating_count = _as_int(meta.get("rating_count"))
     if rating is not None and rating >= 4.0 and (rating_count or 0) >= 100:
         score += 5
-        signals.append({"code": "store-rating", "weight": 0,
+        signals.append({"code": "store-rating", "weight": -5,
                         "detail": f"rated {rating:.1f} from {rating_count:,} ratings"})
 
     if meta.get("crx_hash_verified") is True:
         score += 5
-        signals.append({"code": "crx-hash-verified", "weight": 0,
+        signals.append({"code": "crx-hash-verified", "weight": -5,
                         "detail": "package SHA-256 matches the store's published hash"})
 
     return min(100, score), signals
@@ -838,7 +864,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 2
+SCORER_VERSION = 5
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -866,7 +892,11 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         "installed_paths": installed_paths,
     })
 
-    if builtin:
+    # A blocklist or threat-feed hit always gets scored, even for a built-in
+    # ID or path (an ID suffix or vendor-looking path is host-reported).
+    # shortcut: built-in path rules are substring matches, not anchored install
+    # roots; anchor them if host-reported paths become an attack surface.
+    if builtin and not blocklist_entry and not feed_hits:
         return {
             "risk_score": 0,
             "risk_band": "low",
@@ -900,7 +930,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         }
 
     perms, hosts, matches, optional = _permission_sets(meta, record)
-    capability, cap_signals = _capability(perms, hosts, matches, optional)
+    capability, cap_signals = _capability(perms, hosts, matches, optional,
+                                          meta.get("privacy_codes") or ())
     signals = list(cap_signals)
 
     publisher = _clean_str(
@@ -943,8 +974,16 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     versions = record.get("versions") or []
     exposure = _exposure_score(host_count, len(versions) if isinstance(versions, list) else 0)
 
+    # Vouched: a known publisher ID (reputable already requires a verified
+    # store install), or a store badge on a listing with >= 100k users. A badge
+    # alone proves a clean record, not brand identity, so a small badged
+    # publisher naming itself "Bitwardn" keeps the typosquat penalty.
+    vouched = reputable or (
+        (meta.get("developer_verified") is True or meta.get("established_publisher") is True)
+        and (_as_int(meta.get("users")) or 0) >= 100_000
+        and store_install_verified(store, extension_id, record.get("installs")))
     name_signals, name_penalty = name_anomaly_signals(
-        name, display_name, store=store
+        name, display_name, store=store, vouched=vouched
     )
     signals.extend(name_signals)
 
@@ -1031,7 +1070,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         "exposure_score": exposure,
         "risk_signals": signals,
         "store_status": status,
-        "is_builtin": False,
+        # Stays True for a threat-listed built-in, so the flag matches ingestion.
+        "is_builtin": builtin,
         "publisher_reputable": reputable,
         "known_bad": known_bad,
         "install_users": users,
@@ -1387,6 +1427,7 @@ def _cws_listing(extension_id: str, payload: str) -> dict:
     if codes is None:
         out["privacy_disclosure"] = "The developer has disclosed that it will not collect or use your data"
     elif isinstance(codes, list) and all(type(c) is int for c in codes):
+        out["privacy_codes"] = codes
         out["privacy_disclosure"] = "The developer has disclosed that it collects or uses: " + ", ".join(
             _CWS_PRIVACY_LABELS.get(c, f"data category {c}") for c in codes)
     privacy_url = _http_url(_at(data, 33))
@@ -2348,7 +2389,7 @@ def _self_check() -> None:
         "content_script_matches": ["<all_urls>"], "users": 100_000, "rating": 4.3, "rating_count": 1234,
         "category": "Workflow & Planning", "featured": True, "updated_at": "2026-09-21T14:13:20+00:00",
         "developer_website": "https://example.org", "developer_email": "dev@example.org", "trader": True,
-        "privacy_disclosure": "The developer has disclosed that it collects or uses: "
+        "privacy_codes": [1, 6], "privacy_disclosure": "The developer has disclosed that it collects or uses: "
                               "personally identifiable information, location",
         "privacy_policy_url": "https://example.org/privacy", "publisher_id": "u" + "1" * 32,
         "publisher": "Example", "established_publisher": True,
@@ -2536,6 +2577,55 @@ def _self_check() -> None:
                                 "store_meta": {"status": "public", "rating": 1.8, "rating_count": 400}})
     assert any(s["code"] == "poor-public-reputation" for s in panned["risk_signals"]), panned
     assert panned["threat_score"] >= 15
+
+    # Built-in ID/path never hides a blocklist or feed hit; the flag survives.
+    fx_builtin = {"store": "firefox", "extension_id": "evil@mozilla.org", "name": "x",
+                  "host_count": 3, "versions": ["1.0"]}
+    assert analyze_extension(fx_builtin)["risk_score"] == 0
+    flagged = analyze_extension(fx_builtin, blocklist_entry={"guid": "evil@mozilla.org"})
+    assert flagged["risk_score"] >= 85 and flagged["known_bad"] and flagged["is_builtin"], flagged
+    fed = analyze_extension(fx_builtin, feed_hits=[{"feed": "f", "reason": "adware", "severity": "unwanted",
+                                                    "threat": 70}])
+    assert fed["risk_score"] >= 70 and not fed["known_bad"], fed
+    # Safari: only Safari.app / system extensions are built-in, not App Store app extensions.
+    assert not is_browser_builtin({"store": "safari", "extension_id": "com.x.ext", "installed_paths":
+                                   ["/Applications/X.app/Contents/PlugIns/X Extension.appex"]})
+    assert is_browser_builtin({"store": "safari", "extension_id": "com.apple.y", "installed_paths":
+                               ["/Applications/Safari.app/Contents/PlugIns/Y.appex"]})
+
+    # Typosquat: a store-vouched publisher's look-alike name is not penalised.
+    assert name_anomaly_signals("Motion")[1] == 18
+    sig, pen = name_anomaly_signals("Motion", vouched=True)
+    assert pen == 0 and sig[0]["code"] == "brand-lookalike-vouched", sig
+    assert name_anomaly_signals("Bitwardn", vouched=False)[1] == 18
+    home = "/Users/a/Library/Application Support/Google/Chrome/Default/Extensions/"
+    badge = {"status": "public", "established_publisher": True, "users": 500_000}
+    ok_installs = [{"path": home + "e" * 32 + "/1.0_0", "platform": "darwin"}]
+    ok = analyze_extension({"store": "chrome", "extension_id": "e" * 32, "name": "Motion", "host_count": 2,
+                            "installs": ok_installs,
+                            "store_meta": badge})
+    assert not any(s["code"] == "typosquat-brand" for s in ok["risk_signals"]), ok
+    unpacked = analyze_extension({"store": "chrome", "extension_id": "e" * 32, "name": "Motion",
+                                  "host_count": 2, "installs": [{"path": "/tmp/x", "platform": "darwin"}],
+                                  "store_meta": badge})
+    assert any(s["code"] == "typosquat-brand" for s in unpacked["risk_signals"]), unpacked
+    small = analyze_extension({"store": "chrome", "extension_id": "e" * 32, "name": "Bitwardn",
+                               "host_count": 2, "installs": ok_installs,
+                               "store_meta": {**badge, "users": 5_000}})
+    assert any(s["code"] == "typosquat-brand" for s in small["risk_signals"]), small
+
+    # Declared data collection adds capability (capped), only for weighted codes.
+    cap0, _ = _capability(set(), {"https://a.com/*"}, set())
+    cap1, sig1 = _capability(set(), {"https://a.com/*"}, set(), privacy_codes=[4, 3, 5, 6])
+    assert cap1 - cap0 == _PRIVACY_CAP and sig1[-1]["code"] == "declared-data-collection", sig1
+    assert _capability(set(), set(), set(), privacy_codes=[6, 9])[0] == 0
+
+    # Trust signals carry negative weights equal to the trust points they add.
+    trust, tsig = _trust_score({"status": "public", "manifest_version": 3, "featured": True}, {},
+                               reputable=False)
+    assert trust == -sum(s["weight"] for s in tsig) == 38, (trust, tsig)
+    utrust, usig = _trust_score({"status": "unlisted"}, {}, reputable=False)
+    assert utrust == -sum(s["weight"] for s in usig) == 5, (utrust, usig)
     print("extension_intel self-check: OK")
 
 

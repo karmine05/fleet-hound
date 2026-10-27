@@ -8,7 +8,7 @@ uses an fcntl flock identical to the enricher's pattern.
 Cycle phases (each one writes a row in the cycle history JSONL):
 
   Observe  — pull host/user delta from Fleet via src.etl.run_etl()
-  Orient   — kick the Wikidata enricher (touch its trigger file)
+  Orient   — kick the Wikidata enricher and the extension worker (touch their trigger files)
   Decide   — compute Shadow IT outliers + recent diff, persist findings
   Act      — append audit-log entry summarizing the cycle and any
              auto-actions. Auto-mutating actions (whitelist, quarantine)
@@ -432,7 +432,8 @@ def _loop(driver_provider: Callable, status: _SharedStatus, *,
           cycles_path: str,
           findings_path: str,
           enricher_trigger_path: str,
-          audit_log_path: str) -> None:
+          audit_log_path: str,
+          extension_trigger_path: str | None = None) -> None:
     last_trigger_seen = _trigger_mtime(trigger_path)
     # Restore cadence state from disk so restarts continue counting from the
     # prior value instead of resetting to 0 (260519-k2n fix).
@@ -519,18 +520,26 @@ def _loop(driver_provider: Callable, status: _SharedStatus, *,
         # Phase 2 — Orient: kick the enricher (best-effort).
         status.update(last_phase="orient")
         phase_started = time.time()
-        orient_err = None
-        try:
-            Path(enricher_trigger_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(enricher_trigger_path).touch()
-        except OSError as exc:
-            orient_err = f"enricher trigger failed: {exc}"
-            logger.warning("ooda: %s", orient_err)
+        orient_errs = []
+        # The extension worker sleeps 6 h between cycles; waking it here scores
+        # extensions the ingest just added within one OODA interval.
+        for label, path in (("enricher", enricher_trigger_path),
+                            ("extension", extension_trigger_path)):
+            if not path:
+                continue
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).touch()
+            except OSError as exc:
+                orient_errs.append(f"{label} trigger failed: {exc}")
+                logger.warning("ooda: %s", orient_errs[-1])
+        orient_err = "; ".join(orient_errs) or None
         phases.append(asdict(PhaseResult(
             name="orient",
             ok=orient_err is None,
             duration_sec=time.time() - phase_started,
-            summary={"enricher_trigger_path": enricher_trigger_path},
+            summary={"enricher_trigger_path": enricher_trigger_path,
+                     "extension_trigger_path": extension_trigger_path},
             error=orient_err,
         )))
 
@@ -632,6 +641,7 @@ def start_worker(driver_provider: Callable, *,
                  findings_path: str = FINDINGS_PATH_DEFAULT,
                  enricher_trigger_path: str = "/tmp/fleet-hound-enricher.trigger",
                  audit_log_path: str = "/app/config/audit.log",
+                 extension_trigger_path: str | None = "/tmp/fleet-hound-extensions.trigger",
                  enabled: bool = True) -> tuple[_SharedStatus, threading.Event]:
     """Boot the OODA supervisor.
 
@@ -670,6 +680,7 @@ def start_worker(driver_provider: Callable, *,
             findings_path=findings_path,
             enricher_trigger_path=enricher_trigger_path,
             audit_log_path=audit_log_path,
+            extension_trigger_path=extension_trigger_path,
         ),
         daemon=True,
     )

@@ -46,6 +46,8 @@ def _shadow_it_users_by_software(session, software_names, scope_clause="", scope
 # graph changes from an ETL cycle show up within the TTL.
 SHADOW_CACHE_TTL_SEC = 30
 _SHADOW_CACHE_MAX = 64
+# Extension worker bands -> Shadow IT levels (the Shadow IT UI has no "critical").
+_EXT_BAND_TO_LEVEL = {"critical": "high", "high": "high", "medium": "medium", "low": "low"}
 _shadow_cache: dict = {}
 _shadow_cache_lock = threading.Lock()
 
@@ -279,12 +281,13 @@ def _get_shadow_it_uncached():
                      s.last_version AS version,
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
+                     s.risk_band AS ext_band, s.risk_score AS ext_score,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts,
                      COLLECT(DISTINCT h.platform) AS platforms
                 WHERE host_count <= $outlier_threshold
                 RETURN software_name, display_name, version, host_count, hosts, platforms,
-                       db_category, db_desc, db_sources
+                       db_category, db_desc, db_sources, ext_band, ext_score
                 ORDER BY host_count ASC, display_name ASC
             """
             
@@ -312,8 +315,18 @@ def _get_shadow_it_uncached():
 
                 users = outlier_users_by_name.get(record['software_name'], [])
 
-                # Risk level based on install count
+                # Risk level based on install count, unless the extension
+                # worker already scored this node: its band wins, so the
+                # Shadow IT and Extensions views agree on the same software.
                 risk_level = "high" if record['host_count'] == 1 else "medium"
+                risk_reason = (f"Risk is {risk_level.upper()} because this software is installed on only "
+                               f"{record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).")
+                ext_band = record.get('ext_band')
+                if ext_band in _EXT_BAND_TO_LEVEL:
+                    risk_level = _EXT_BAND_TO_LEVEL[ext_band]
+                    risk_reason = (f"Risk is {risk_level.upper()} from the browser-extension risk score "
+                                   f"({record.get('ext_score')}/100, band {ext_band}). Installed on "
+                                   f"{record['host_count']} host(s).")
                 
                 # Apply host count filter
                 if host_count_filter != 'all':
@@ -354,7 +367,7 @@ def _get_shadow_it_uncached():
                         "version": record['version'] or "Unknown",
                         "recommendation": f"Verify if this software is authorized. Found on only {record['host_count']} host(s). Consider removing if unauthorized.",
                         "details": f"Installed on {record['host_count']} host(s) only - unusual for enterprise software",
-                        "risk_reason": f"Risk is {risk_level.upper()} because this software is installed on only {record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).",
+                        "risk_reason": risk_reason,
                     })
                     detection_id_counter += 1
         
