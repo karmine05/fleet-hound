@@ -194,7 +194,7 @@ def is_browser_builtin(record: dict) -> bool:
             return True
         # Every App Store Safari extension lives in its app's Contents/PlugIns,
         # so only extensions bundled with Safari itself or the OS are built-in.
-        if store == "safari" and ("\\safari.app\\" in p or p.startswith("\\system\\")):
+        if store == "safari" and p.startswith(("\\applications\\safari.app\\", "\\system\\")):
             return True
     return False
 
@@ -864,7 +864,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 5
+SCORER_VERSION = 6
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -2592,6 +2592,8 @@ def _self_check() -> None:
                                    ["/Applications/X.app/Contents/PlugIns/X Extension.appex"]})
     assert is_browser_builtin({"store": "safari", "extension_id": "com.apple.y", "installed_paths":
                                ["/Applications/Safari.app/Contents/PlugIns/Y.appex"]})
+    assert not is_browser_builtin({"store": "safari", "extension_id": "com.x.z", "installed_paths":
+                                   ["/Users/a/Downloads/Safari.app/Contents/PlugIns/Z.appex"]})
 
     # Typosquat: a store-vouched publisher's look-alike name is not penalised.
     assert name_anomaly_signals("Motion")[1] == 18
