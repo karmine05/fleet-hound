@@ -42,6 +42,7 @@ try:  # Docker layout: /app/webviz + /app/src on sys.path
         fetch_mozilla_blocklist,
         fetch_store_metadata,
         fetch_threat_feed,
+        is_browser_builtin,
         load_threat_feeds,
         match_blocklist,
         match_threat_feeds,
@@ -61,6 +62,7 @@ except ImportError:  # repo layout: `python3 webviz/extension_worker.py`
         fetch_mozilla_blocklist,
         fetch_store_metadata,
         fetch_threat_feed,
+        is_browser_builtin,
         load_threat_feeds,
         match_blocklist,
         match_threat_feeds,
@@ -323,6 +325,8 @@ def _record_for(group: dict) -> dict:
     # the canonical key so the right adapter is still chosen.
     if not record.get("store") and str(group["key"]).startswith("ext:"):
         record["store"] = str(group["key"]).split(":")[1]
+    # Current rules, not the flag ingestion stored at the host's last ingest.
+    record["is_builtin"] = is_browser_builtin(record)
     return record
 
 
