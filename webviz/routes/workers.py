@@ -323,11 +323,12 @@ def get_extensions():
 
 def _extension_status_snapshot() -> dict:
     try:
-        from extension_worker import read_status, queue_remaining as _qr
+        from extension_worker import read_status
+        # queue_remaining comes from the worker's status file: due-ness needs
+        # fingerprints and cache ages, so no per-request query can compute it.
         snap = read_status(EXTENSION_WORKER_STATUS_PATH)
         snap["enabled"] = EXTENSION_WORKER_ENABLED
         snap["interval_sec"] = EXTENSION_WORKER_INTERVAL_SEC
-        snap["queue_remaining"] = _qr(_get_driver)
         return snap
     except Exception as exc:
         logger.error("extension status failed: %s", exc)

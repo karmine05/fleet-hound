@@ -3,7 +3,11 @@
 Pure stdlib. No Flask, no Neo4j, no paid/account sources.
 
 Sources used (all verified anonymous):
-  * Chrome update2 + CRX manifest   (clients2.google.com / storage.googleapis.com)
+  * Chrome Web Store listing RPC     (chromewebstore.google.com batchexecute "xY2Ddd";
+                                     undocumented internal RPC, Google has no public
+                                     read API: the Chrome Web Store API is publisher-only)
+  * Chrome update2 + CRX manifest   (clients2.google.com / storage.googleapis.com),
+                                     only for items the listing RPC does not serve
   * Edge product-details JSON       (microsoftedge.microsoft.com)
   * Firefox AMO add-on API          (addons.mozilla.org)
   * Mozilla add-on blocklist        (firefox.settings.services.mozilla.com)
@@ -17,7 +21,6 @@ from __future__ import annotations
 import csv
 import functools
 import hashlib
-import html
 import io
 import json
 import logging
@@ -833,6 +836,11 @@ def _exposure_score(host_count: int, version_count: int) -> int:
     return min(100, score)
 
 
+# Bump on any change to analyze_extension() output: the worker fingerprints
+# its inputs with this, and a new value re-scores every extension once.
+SCORER_VERSION = 2
+
+
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
                       feed_hits: list[dict] | None = None,
                       fleet_host_count: int | None = None) -> dict:
@@ -881,6 +889,7 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
             "host_permissions": [],
             "content_script_matches": [],
             "latest_version": None,
+            "store_name": None,
             "store_url": None,
             "publisher": None,
             "category": None,
@@ -1031,6 +1040,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         "host_permissions": sorted(hosts),
         "content_script_matches": sorted(matches),
         "latest_version": _clean_str(meta.get("version")) or None,
+        "store_name": None if _clean_str(meta.get("name")).startswith("__MSG_")
+        else _clean_str(meta.get("name")) or None,
         "store_url": _clean_str(meta.get("url")) or None,
         "publisher": publisher or None,
         "category": _clean_str(meta.get("category")) or None,
@@ -1061,7 +1072,7 @@ _CHROME_HOSTS = frozenset({
     "clients2.googleusercontent.com",  # CRX CDN (codebase target)
     "redirector.gvt1.com",          # CRX CDN redirector
     "edgedl.me.gvt1.com",           # CRX CDN edge download host
-    "chromewebstore.google.com",    # detail page (publisher name)
+    "chromewebstore.google.com",    # listing RPC (batchexecute)
 })
 _EDGE_HOSTS = frozenset({"microsoftedge.microsoft.com"})
 _AMO_HOSTS = frozenset({"addons.mozilla.org"})
@@ -1087,14 +1098,21 @@ class HttpClient:
         self.timeout = timeout
 
     def get(self, url: str, *, allowed_hosts, max_bytes: int = _MAX_HTTP_BYTES):
+        return self._request(url, None, allowed_hosts, max_bytes)
+
+    def post(self, url: str, form: dict, *, allowed_hosts, max_bytes: int = _MAX_HTTP_BYTES):
+        """POST `form` url-encoded; same allowlist, redirect guard, cap and return shape as get()."""
+        return self._request(url, urllib.parse.urlencode(form).encode(), allowed_hosts, max_bytes)
+
+    def _request(self, url: str, data: bytes | None, allowed_hosts, max_bytes: int):
         host = (urllib.parse.urlparse(url).hostname or "").lower()
         if host not in allowed_hosts:
             return 0, {}, b"", f"host not allowlisted: {host}"
         opener = urllib.request.build_opener(_SafeRedirectHandler(allowed_hosts))
-        req = urllib.request.Request(url, headers={
-            "User-Agent": _USER_AGENT,
-            "Accept": "*/*",
-        })
+        headers = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
+        if data is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
+        req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with opener.open(req, timeout=self.timeout) as resp:
                 final_host = (urllib.parse.urlparse(resp.geturl()).hostname or "").lower()
@@ -1245,123 +1263,228 @@ def _parse_crx(data: bytes) -> dict:
         return manifest
 
 
-# Publisher link on a Chrome Web Store detail page:
-#   <a ... data-publisher-id="u<32 hex>" ...>AgileBits Inc</a>
-# Bounded quantifiers keep this linear on the ~1 MB untrusted page.
-_CWS_PUBLISHER_RE = re.compile(
-    rb'data-publisher-id="(u[0-9a-f]{32})"[^>]{0,400}>([^<]{1,150})</a>'
-)
 _CHROME_EXTENSION_ID_RE = re.compile(r"[a-p]{32}")
-
-
-def _chrome_publisher(page: bytes) -> tuple[str, str] | None:
-    """(publisher_id, display name), or None unless exactly one publisher ID appears.
-
-    A listing has one publisher link; more than one distinct ID means the
-    markup changed or the page embeds another publisher, so trust nothing.
-    """
-    matches = _CWS_PUBLISHER_RE.findall(page)
-    if len({pid for pid, _ in matches}) != 1:
-        return None
-    pid, raw = matches[0]
-    name = html.unescape(raw.decode("utf-8", "replace")).strip()
-    return pid.decode("ascii"), name or pid.decode("ascii")
-
-
-# Every pattern below needs literal markup (`<`, `>`, `"`). Developer-written
-# text (name, description) is HTML-escaped on the page, so it can never
-# satisfy one — free-text matching would let a description fake a badge.
-_CWS_WEBSITE_RE = re.compile(
-    r'<a href="(https?://[^"\s]{1,300})"[^>]{0,500}>'
-    r'(?:<svg[^>]{0,300}>(?:<path[^>]{0,3000}/>){0,5}</svg>)?\s{0,5}Website</a>'
-)
-_CWS_USERS_RE = re.compile(
-    r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>([\d,]{1,15})\+? users?</div>'
-)
-_CWS_RATING_RE = re.compile(r'aria-label="Average rating ([0-5](?:\.\d{1,2})?) out of 5')
-_CWS_RATING_COUNT_RE = re.compile(r'<p[^>]{0,100}>([\d,.]{1,12})(K?) ratings?</p>')
-_CWS_ESTABLISHED_RE = re.compile(
-    r'aria-label="(?:Created by the owner of the listed website\. )?'
-    r'The publisher has a good record with no history of violations\.'
-)
-# The Featured badge's tooltip link; Google shows it only on Featured items.
-_CWS_FEATURED_RE = re.compile(
-    r'aria-label="Follows recommended practices for Chrome extensions\.'
-)
-_CWS_UPDATED_RE = re.compile(r'>Updated</div><div>([^<]{1,40})</div>')
-_CWS_EMAIL_RE = re.compile(
-    r'> Email (?:<svg[^>]{0,300}>(?:<path[^>]{0,3000}/>){0,5}</svg>){0,3}</summary>'
-    r'<div[^>]{0,100}>([^<]{1,320})</div>'
-)
-_CWS_TRADER_RE = re.compile(r'>(Trader|Non-trader)</div><div>This developer ')
-_CWS_PRIVACY_RE = re.compile(r'</svg><span>(The developer has disclosed that it [^<.]{1,160})')
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}$")
 
+# Chrome Web Store listing facts come from the store front end's own
+# batchexecute RPC. It is undocumented and internal: Google offers no public
+# read API (the Chrome Web Store API is publisher-only). Payload indices were
+# mapped against rendered detail pages on 2026-10-27; a payload whose shape or
+# ID does not match is rejected whole rather than half-read.
+_CWS_RPC_ID = "xY2Ddd"
+_CWS_RPC_URL = ("https://chromewebstore.google.com/_/ChromeWebStoreConsumerFeUi/data/"
+                f"batchexecute?rpcids={_CWS_RPC_ID}&hl=en&rt=c")
+# About 50 KB of response per listing: 40 keeps one POST far below the 8 MB cap.
+_CWS_RPC_BATCH = 40
+# shortcut: the payload carries only the category slug; these labels were
+# verified on live pages. Other slugs are shown raw; add pairs once confirmed.
+_CWS_CATEGORY_LABELS = {
+    "make_chrome_yours/accessibility": "Accessibility",
+    "make_chrome_yours/privacy": "Privacy & Security",
+    "productivity/communication": "Communication",
+    "productivity/developer": "Developer Tools",
+    "productivity/education": "Education",
+    "productivity/tools": "Tools",
+    "productivity/workflow": "Workflow & Planning",
+}
+_CWS_PRIVACY_LABELS = {
+    1: "personally identifiable information", 3: "financial and payment information",
+    4: "authentication information", 5: "personal communications", 6: "location",
+    7: "web history", 8: "user activity", 9: "website content",
+}
 
-def _chrome_listing(page: bytes) -> dict:
-    """Store-listing facts from a Chrome Web Store detail page (fetched with hl=en).
 
-    Fields anchor on store markup and English labels, not the rotating
-    minified class names. Parsing stops at the "Related" carousel so another
-    listing's facts can never be attributed to this one. Missing fields are
-    omitted.
+def _at(value, *path):
+    for index in path:
+        if not isinstance(value, list) or index >= len(value):
+            return None
+        value = value[index]
+    return value
+
+
+def _http_url(value) -> str | None:
+    value = _clean_str(value)
+    parsed = urllib.parse.urlparse(value)
+    return value if parsed.scheme in ("http", "https") and parsed.hostname else None
+
+
+def _parse_cws_rpc(body: bytes) -> dict:
+    """{tag: (payload JSON string or None, error code or None)} from a
+    batchexecute response.
+
+    Chunks are length-prefixed lines; only lines that parse as a JSON list
+    hold envelopes. Envelopes arrive in any order, so map them by tag. A null
+    payload carries a gRPC-style code in env[5]: 5 for an ID the store never
+    had, 7 for a removed item, others for bad input or transient failures.
     """
-    text = page.decode("utf-8", "replace")
-    cut = text.find(">Related<")
-    if cut > 0:
-        text = text[:cut]
-    out: dict = {}
-    m = _CWS_USERS_RE.search(text)
-    if m:
-        out["category"] = html.unescape(m.group(1)).strip()
-        out["users"] = int(m.group(2).replace(",", ""))
-    else:
-        m = re.search(r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>', text)
-        if m:
-            out["category"] = html.unescape(m.group(1)).strip()
-    m = _CWS_RATING_RE.search(text)
-    if m:
-        out["rating"] = float(m.group(1))
-    m = _CWS_RATING_COUNT_RE.search(text)
-    if m:
-        n = float(m.group(1).replace(",", ""))
-        out["rating_count"] = int(n * 1000 if m.group(2) else n)
-    if _CWS_FEATURED_RE.search(text):
-        out["featured"] = True
-    if _CWS_ESTABLISHED_RE.search(text):
-        out["established_publisher"] = True
-    m = _CWS_UPDATED_RE.search(text)
-    if m:
+    text = body.decode("utf-8", "replace")
+    if not text.startswith(")]}'"):
+        raise ValueError("listing RPC response lacks the )]}' prefix")
+    out = {}
+    for line in text[4:].splitlines():
         try:
-            out["updated_at"] = datetime.strptime(m.group(1).strip(), "%B %d, %Y").replace(
-                tzinfo=timezone.utc).isoformat()
-        except ValueError:
-            pass
-    m = _CWS_WEBSITE_RE.search(text)
-    if m:
-        out["developer_website"] = html.unescape(m.group(1))
-    m = _CWS_EMAIL_RE.search(text)
-    if m:
-        email = html.unescape(m.group(1)).strip()
-        if _EMAIL_RE.match(email):
-            out["developer_email"] = email
-    m = _CWS_TRADER_RE.search(text)
-    if m:
-        out["trader"] = m.group(1) == "Trader"
-    m = _CWS_PRIVACY_RE.search(text)
-    if m:
-        out["privacy_disclosure"] = html.unescape(m.group(1)).strip()
+            chunk = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        for env in chunk if isinstance(chunk, list) else ():
+            if (isinstance(env, list) and len(env) > 6 and env[0] == "wrb.fr"
+                    and env[1] == _CWS_RPC_ID and isinstance(env[6], str)):
+                code = _at(env, 5, 0)
+                out[env[6]] = (env[2], code if type(code) is int else None)
     return out
 
 
-def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None) -> dict:
+def _cws_listing(extension_id: str, payload: str) -> dict:
+    """Listing and manifest fields from one RPC payload. Raises ValueError on schema drift."""
+    data = json.loads(payload)
+    item, dev = _at(data, 0), _at(data, 10)
+    if _at(item, 0) != extension_id or not isinstance(dev, list):
+        raise ValueError("payload id or shape does not match the request")
+    manifest = _at(item, 18)
+    manifest = json.loads(manifest) if isinstance(manifest, str) else None
+    if not isinstance(manifest, dict):
+        raise ValueError("payload has no manifest object")
+
+    out: dict = {"status": "public"}
+    for key, value in _manifest_fields({"manifest": manifest}).items():
+        if value not in (None, [], ""):
+            out[key] = value
+    # Store display name; the manifest name is often an unresolved __MSG_ key.
+    if _clean_str(_at(item, 2)):
+        out["name"] = _clean_str(item[2])
+    if isinstance(_at(data, 13), str) and data[13]:
+        out["version"] = data[13]
+    users, rating, rating_count = _at(item, 14), _at(item, 3), _at(item, 4)
+    if type(users) is int and users >= 0:
+        out["users"] = users
+    if type(rating) in (int, float) and 0 <= rating <= 5:
+        out["rating"] = round(float(rating), 1)
+    if type(rating_count) is int and rating_count >= 0:
+        out["rating_count"] = rating_count
+    slug = _at(item, 11, 0)
+    if isinstance(slug, str) and slug:
+        out["category"] = _CWS_CATEGORY_LABELS.get(slug, slug)
+    out["featured"] = _at(item, 9) is True
+    # [0][8] and [0][15] tracked the "good record" badge on every listing probed
+    # (2026-10-27); Google's own items show "developed by Google" instead.
+    if _at(item, 8) is True and _at(item, 15) is True:
+        out["established_publisher"] = True
+    updated = _at(data, 14, 0)
+    if type(updated) in (int, float) and 0 < updated < 32_503_680_000:  # before year 3000
+        out["updated_at"] = datetime.fromtimestamp(updated, timezone.utc).isoformat()
+    website = _clean_str(_at(item, 7))
+    if website and "://" not in website:
+        website = "https://" + website  # the store renders bare hosts as https links
+    website = _http_url(website)
+    if website:
+        out["developer_website"] = website
+    email = _clean_str(_at(dev, 0))
+    if _EMAIL_RE.match(email):
+        out["developer_email"] = email
+    # Trader is a boolean here but 1 in the page's own blob: test truthiness.
+    out["trader"] = bool(_at(dev, 3))
+    codes = _at(data, 7)
+    if codes is None:
+        out["privacy_disclosure"] = "The developer has disclosed that it will not collect or use your data"
+    elif isinstance(codes, list) and all(type(c) is int for c in codes):
+        out["privacy_disclosure"] = "The developer has disclosed that it collects or uses: " + ", ".join(
+            _CWS_PRIVACY_LABELS.get(c, f"data category {c}") for c in codes)
+    privacy_url = _http_url(_at(data, 33))
+    if privacy_url:
+        out["privacy_policy_url"] = privacy_url
+    publisher_id = _at(dev, 10)
+    if isinstance(publisher_id, str) and _CWS_PUBLISHER_ID_RE.fullmatch(publisher_id):
+        out["publisher_id"] = publisher_id
+    # [10][5] is the name the store shows; [10][7] is the trader's legal
+    # name, null for non-traders.
+    publisher = _clean_str(_at(dev, 5)) or _clean_str(_at(dev, 7))
+    if publisher:
+        out["publisher"] = publisher
+    return out
+
+
+def _chrome_detail_url(extension_id: str) -> str:
+    return "https://chromewebstore.google.com/detail/" + urllib.parse.quote(extension_id, safe="")
+
+
+def fetch_chrome_listings(extension_ids, *, client: HttpClient | None = None) -> dict[str, dict]:
+    """{id: listing meta} from the Chrome Web Store listing RPC. Never raises.
+
+    Invalid IDs are dropped before any request. A listed item gets status
+    "public" with listing and manifest fields. A removed item (code 7) gets
+    "removed". An ID the RPC does not know (code 5) gets status "unlisted"
+    plus `listing_missing`, and update2 tells unlisted from never published.
+    Any other per-envelope error is an error, never a missing listing.
+    """
     client = client or HttpClient()
-    # Host-reported ID: only a real Chrome ID may reach a store URL path.
+    ids = list(dict.fromkeys(
+        i for i in extension_ids if isinstance(i, str) and _CHROME_EXTENSION_ID_RE.fullmatch(i)
+    ))
+    out: dict[str, dict] = {}
+    limited: dict = {"store": "chrome"}
+    for start in range(0, len(ids), _CWS_RPC_BATCH):
+        chunk = ids[start:start + _CWS_RPC_BATCH]
+        payloads = None
+        if limited.get("rate_limited"):
+            # Rate limited on an earlier chunk: mark the rest without asking again.
+            for eid in chunk:
+                out[eid] = {"store": "chrome", "status": "unknown",
+                            "url": _chrome_detail_url(eid), **limited}
+            continue
+        freq = json.dumps([[[_CWS_RPC_ID, json.dumps([eid]), None, str(n)]
+                            for n, eid in enumerate(chunk, 1)]], separators=(",", ":"))
+        status, headers, body, error = client.post(_CWS_RPC_URL, {"f.req": freq},
+                                                   allowed_hosts=_CHROME_HOSTS)
+        limited = {"store": "chrome"}
+        _mark_rate_limited(limited, status, headers)
+        if not limited.get("rate_limited"):
+            try:
+                if status != 200 or error:
+                    raise ValueError(error or f"listing RPC HTTP {status}")
+                payloads = _parse_cws_rpc(body)
+            except (ValueError, RecursionError) as exc:
+                limited["error"] = str(exc)
+        for n, eid in enumerate(chunk, 1):
+            meta = {"store": "chrome", "status": "unknown", "url": _chrome_detail_url(eid)}
+            tag = str(n)
+            if payloads is None:
+                meta.update(limited)
+            elif tag not in payloads:
+                meta["error"] = "listing RPC returned no envelope for this id"
+            elif payloads[tag][0] is not None:
+                try:
+                    meta.update(_cws_listing(eid, payloads[tag][0]))
+                except Exception as exc:  # noqa: BLE001 — one odd payload must not fail the batch
+                    meta["error"] = f"listing RPC schema drift: {exc}"
+            elif payloads[tag][1] == 5:
+                meta.update(status="unlisted", listing_missing=True)
+            elif payloads[tag][1] == 7:
+                meta["status"] = "removed"
+            elif payloads[tag][1] == 8:
+                meta.update(rate_limited=True, error="listing RPC code 8 (resource exhausted)")
+            else:
+                meta["error"] = f"listing RPC error code {payloads[tag][1]}"
+            out[eid] = meta
+    return out
+
+
+def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None,
+                          listing: dict | None = None, manifest_for=None) -> dict:
+    """`listing`: this ID's fetch_chrome_listings() result when the caller
+    already batched it. `manifest_for(version)`: cached manifest fields for an
+    immutable version, which skip the CRX download."""
+    client = client or HttpClient()
+    # Host-reported ID: only a real Chrome ID may reach a store URL or body.
     if not _CHROME_EXTENSION_ID_RE.fullmatch(extension_id or ""):
         return {"store": "chrome", "status": "unknown", "error": "invalid chrome extension id"}
-    meta = {"store": "chrome", "status": "unknown", "url": (
-        "https://chromewebstore.google.com/detail/" + urllib.parse.quote(extension_id, safe="")
-    )}
+    meta = dict(listing) if listing is not None else \
+        fetch_chrome_listings([extension_id], client=client)[extension_id]
+    if not meta.pop("listing_missing", False):
+        return meta  # listed (manifest came with it), rate limited, or failed
+    # The listing RPC serves only listed items. update2 still answers for
+    # unlisted ones, which install by direct link and are a real malware
+    # vector, so their package is fetched and inspected.
+    meta["status"] = "unknown"
     query = urllib.parse.quote(f"id={extension_id}&uc", safe="")
     # Far-future Chrome version: update2 answers "noupdate" (no codebase) when
     # the item's minimum_chrome_version exceeds prodversion, and a pinned real
@@ -1398,23 +1521,13 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
             meta["error"] = check_status
             return meta
         meta.update({
-            "status": "public",
+            "status": "unlisted",
             "version": updatecheck.get("version"),
-            "url": meta["url"],
         })
-        # update2 carries no developer field; the detail page does. Without it
-        # no Chrome-family extension can ever count as a reputable publisher.
-        # hl=en: the listing parser anchors on English labels.
-        dstatus, dheaders, dbody, _ = client.get(
-            meta["url"] + "?hl=en", allowed_hosts=_CHROME_HOSTS, max_bytes=2 * 1024 * 1024
-        )
-        if _mark_rate_limited(meta, dstatus, dheaders):
+        cached = manifest_for(meta["version"]) if manifest_for and meta["version"] else None
+        if cached:
+            meta.update(cached)
             return meta
-        if dstatus == 200 and dbody:
-            publisher = _chrome_publisher(dbody)
-            if publisher:
-                meta["publisher_id"], meta["publisher"] = publisher
-            meta.update(_chrome_listing(dbody))
         codebase = updatecheck.get("codebase") or ""
         expected_hash = (updatecheck.get("hash_sha256") or "").lower()
         if not codebase:
@@ -1506,7 +1619,8 @@ def fetch_edge_metadata(extension_id: str, *, client: HttpClient | None = None) 
     return meta
 
 
-def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
+def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None,
+                       manifest_for=None) -> dict:
     client = client or HttpClient()
     meta = {"store": "firefox", "status": "unknown", "url": (
         f"https://addons.mozilla.org/firefox/addon/{urllib.parse.quote(guid, safe='')}/"
@@ -1594,6 +1708,13 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         "privacy_policy_url": (meta["url"] + "privacy/") if data.get("has_privacy_policy") else None,
         "created_at": _clean_str(data.get("created")) or None,
     })
+    cached = manifest_for(meta["version"]) if manifest_for and meta["version"] else None
+    if cached:
+        # A version's package never changes: reuse its parsed manifest, skip the XPI.
+        for key, value in cached.items():
+            if value not in (None, [], "") and not meta.get(key):
+                meta[key] = value
+        return meta
     _amo_package_manifest(meta, file_info, client)
     return meta
 
@@ -1632,27 +1753,33 @@ def _amo_package_manifest(meta: dict, file_info: dict, client: HttpClient) -> No
 
 
 def fetch_store_metadata(store: str, extension_id: str, *,
-                         client: HttpClient | None = None) -> dict:
-    """Dispatch to the anonymous adapter for `store`. Never raises."""
+                         client: HttpClient | None = None, manifest_for=None) -> dict:
+    """Dispatch to the anonymous adapter for `store`. Never raises.
+
+    `manifest_for(version)` returns cached manifest fields for that version or
+    None; a hit skips the package download (CRX or XPI)."""
     store = _clean_str(store).lower()
     extension_id = _clean_str(extension_id)
     if not extension_id:
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     try:
         if store in ("chrome", "brave", "opera", "vivaldi", "chromium"):
-            return fetch_chrome_metadata(extension_id, client=client)
+            return fetch_chrome_metadata(extension_id, client=client, manifest_for=manifest_for)
         if store == "edge":
             meta = fetch_edge_metadata(extension_id, client=client)
             # Edge installs from the Chrome Web Store too; an ID Edge's store
             # does not know is usually a CWS item, not an unknown sideload.
             if meta.get("status") == "not_found" and _CHROME_EXTENSION_ID_RE.fullmatch(extension_id):
-                chrome = fetch_chrome_metadata(extension_id, client=client)
-                if chrome.get("status") == "public" or chrome.get("rate_limited"):
+                chrome = fetch_chrome_metadata(extension_id, client=client,
+                                               manifest_for=manifest_for)
+                # Only update2's own "unknown application" confirms Edge's miss;
+                # an unlisted, removed or failed Chrome answer must not cache as not_found.
+                if chrome.get("status") != "not_found":
                     chrome["resolved_from"] = "edge"
                     return chrome
             return meta
         if store == "firefox":
-            return fetch_amo_metadata(extension_id, client=client)
+            return fetch_amo_metadata(extension_id, client=client, manifest_for=manifest_for)
         return {"store": store, "status": "unknown",
                 "error": f"no anonymous metadata adapter for store '{store}'"}
     except Exception as exc:
@@ -2120,6 +2247,9 @@ def _self_check() -> None:
         def get(self, url, **_):
             return self.responses.pop(0)
 
+        def post(self, url, form, **_):
+            return self.responses.pop(0)
+
     edge_404 = fetch_edge_metadata("x" * 32, client=_Fake((404, {}, b'{"name":"x"}', None)))
     assert edge_404["status"] == "not_found", edge_404
     edge_ok = fetch_edge_metadata("x" * 32, client=_Fake((200, {}, b'{"name":"x"}', None)))
@@ -2145,11 +2275,6 @@ def _self_check() -> None:
     assert publisher_is_reputable("1Password Devs"), "AMO author suffix"
     assert publisher_is_reputable("AgileBits Inc") and publisher_is_reputable("Duck Duck Go, Inc.")
     assert publisher_is_reputable("Google Ireland, Ltd.") and not publisher_is_reputable("eyeo GmbH")
-    page = (b'<a class="x" href="./publisher/agilebits-inc/u1" data-publisher-id='
-            b'"udb847e9815e2e1626d9ddb346d722811" jslog="1">AgileBits &amp; Co</a>')
-    assert _chrome_publisher(page) == ("udb847e9815e2e1626d9ddb346d722811", "AgileBits & Co")
-    two = page + page.replace(b"udb847e9815e2e1626d9ddb346d722811", b"u" + b"0" * 32)
-    assert _chrome_publisher(two) is None, "two distinct publisher IDs -> trust nothing"
     # Chrome trust is by ID: a lookalike name with another ID is not reputable.
     assert chrome_publisher_is_reputable("udb847e9815e2e1626d9ddb346d722811")
     assert not chrome_publisher_is_reputable("u" + "0" * 32) and not chrome_publisher_is_reputable(None)
@@ -2162,6 +2287,7 @@ def _self_check() -> None:
     class _NoNet:
         def get(self, *a, **k):
             raise AssertionError("network call for invalid id")
+        post = get
     assert fetch_chrome_metadata("../publisher/x", client=_NoNet())["error"] == "invalid chrome extension id"
     # Edits to the file are picked up without a restart (mtime change).
     fixture["publishers"].append({"name": "Late Addition", "match_names": ["Late Addition"], "added_at": "2026-10-27T00:00:00Z"})
@@ -2169,38 +2295,118 @@ def _self_check() -> None:
         json.dump(fixture, fh)
     os.utime(tmp.name, (os.path.getmtime(tmp.name) + 5,) * 2)
     assert publisher_is_reputable("Late Addition Inc")
-    assert _chrome_publisher(b"<html>no publisher link</html>") is None
     assert not publisher_is_reputable("Totally Not 1Password Devs")
     os.unlink(tmp.name)
 
-    # Chrome listing: labels anchor fields; the Related carousel is ignored.
-    page = (
-        '<a aria-label="Follows recommended practices for Chrome extensions. Learn more.">x</a>'
-        '<span>Featured</span><span aria-label="Average rating 3.9 out of 5 stars."></span>'
-        '<a href="./detail/x/reviews"><p class="q">1.2K ratings</p></a>'
-        '<a class="g" href="./category/extensions/productivity/workflow" x="1">'
-        'Workflow &amp; Planning</a>100,000 users</div>'
-        '<div class="QDHp8e">Updated</div><div>September 22, 2026</div>'
-        '<a href="https://noscript.net" rel="ugc"><svg w="1"><path d="M1 2z"/></svg> Website</a>'
-        '<summary class="m"><svg w="1"><path d="M1 2z"/></svg> Email <svg w="1"><path d="M1z"/></svg>'
-        '</summary><div class="N">info@hackademix.net</div></details>'
-        '<div class="QDHp8e">Non-trader</div><div>This developer has not identified itself</div>'
-        '<path d="M1z"/></svg><span>The developer has disclosed that it will not collect or use your data. More</span>'
-        '<a aria-label="Created by the owner of the listed website. The publisher has a good record'
-        ' with no history of violations. Learn more.">x</a>'
-        '<h2>Related</h2><span aria-label="Average rating 1.0 out of 5 stars."></span>9 users'
-    ).encode()
-    listing = _chrome_listing(page)
-    assert listing == {
-        "users": 100_000, "rating": 3.9, "rating_count": 1200, "featured": True,
-        "established_publisher": True, "updated_at": "2026-09-22T00:00:00+00:00",
-        "category": "Workflow & Planning", "developer_website": "https://noscript.net",
-        "developer_email": "info@hackademix.net", "trader": False,
-        "privacy_disclosure": "The developer has disclosed that it will not collect or use your data",
-    }, listing
+    # Chrome listing RPC: envelopes map by tag, null payload = not served,
+    # a payload for another ID is drift (no partial data), bad IDs never sent.
+    def _cws_payload(eid, email="dev@example.org"):
+        item = [None] * 20
+        item[0], item[2], item[3], item[4], item[7], item[9] = eid, "Ex", 4.26, 1234, "example.org", True
+        item[8] = item[15] = True
+        item[11], item[14] = ["productivity/workflow", None, 4], 100_000
+        item[18] = json.dumps({"manifest_version": 3, "name": "__MSG_extName__", "version": "2.1",
+                               "permissions": ["tabs"], "content_scripts": [{"matches": ["<all_urls>"]}]})
+        dev = [None] * 11
+        dev[0], dev[3], dev[5], dev[7], dev[10] = email, 1, "Example", "Example Ltd", "u" + "1" * 32
+        payload = [None] * 34
+        payload[0], payload[7], payload[10], payload[13] = item, [1, 6], dev, "2.1"
+        payload[14], payload[33] = [1_790_000_000, 0], "https://example.org/privacy"
+        return payload
+
+    def _rpc_body(*envelopes):
+        lines = [")]}'", ""]
+        for tag, payload, *code in envelopes:
+            chunk = json.dumps([["wrb.fr", _CWS_RPC_ID, payload if payload is None else json.dumps(payload),
+                                 None, None, code or [5], tag]])
+            lines += [str(len(chunk)), chunk]
+        return "\n".join(lines).encode()
+
+    class _Rpc:
+        def __init__(self, *responses):
+            self.responses, self.forms, self.urls = list(responses), [], []
+
+        def post(self, url, form, *, allowed_hosts, **_):
+            assert allowed_hosts == _CHROME_HOSTS and url == _CWS_RPC_URL
+            self.forms.append(form["f.req"])
+            return self.responses.pop(0)
+
+        def get(self, url, **_):
+            self.urls.append(url)
+            return self.responses.pop(0)
+
+    a_id, b_id, c_id = "a" * 32, "b" * 32, "c" * 32
+    rpc = _Rpc((200, {}, _rpc_body(("3", _cws_payload("d" * 32)), ("1", _cws_payload(a_id)),
+                                   ("2", None)), None))
+    listings = fetch_chrome_listings([a_id, "../x", b_id, a_id, c_id], client=rpc)
+    assert len(rpc.forms) == 1 and "../x" not in rpc.forms[0] and rpc.forms[0].count(a_id) == 1, rpc.forms
+    assert set(listings) == {a_id, b_id, c_id}, listings
+    hit = listings[a_id]
+    assert hit == {
+        "store": "chrome", "status": "public", "url": "https://chromewebstore.google.com/detail/" + a_id,
+        "name": "Ex", "version": "2.1", "manifest_version": 3, "permissions": ["tabs"],
+        "content_script_matches": ["<all_urls>"], "users": 100_000, "rating": 4.3, "rating_count": 1234,
+        "category": "Workflow & Planning", "featured": True, "updated_at": "2026-09-21T14:13:20+00:00",
+        "developer_website": "https://example.org", "developer_email": "dev@example.org", "trader": True,
+        "privacy_disclosure": "The developer has disclosed that it collects or uses: "
+                              "personally identifiable information, location",
+        "privacy_policy_url": "https://example.org/privacy", "publisher_id": "u" + "1" * 32,
+        "publisher": "Example", "established_publisher": True,
+    }, hit
+    assert listings[b_id]["status"] == "unlisted" and listings[b_id]["listing_missing"], listings[b_id]
+    drift = listings[c_id]
+    assert drift["status"] == "unknown" and "schema drift" in drift["error"] and "users" not in drift, drift
+    # Null payloads: removed (7) is a takedown, transient codes are errors, not "unlisted".
+    odd = _cws_payload(c_id)
+    odd[14] = [1e20]
+    odd[0][14] = 2 ** 70
+    nontrader = _cws_payload("d" * 32)
+    nontrader[10][5], nontrader[10][7], nontrader[0][8] = "Solo Dev", None, None
+    coded = fetch_chrome_listings([a_id, b_id, c_id, "d" * 32, "e" * 32], client=_Rpc((200, {}, _rpc_body(
+        ("1", None, 7), ("2", None, 14), ("3", odd), ("4", nontrader), ("5", None, 8)), None)))
+    assert coded[a_id]["status"] == "removed" and "listing_missing" not in coded[a_id], coded[a_id]
+    assert coded[b_id]["status"] == "unknown" and "code 14" in coded[b_id]["error"], coded[b_id]
+    assert coded[c_id]["status"] == "public" and "updated_at" not in coded[c_id], coded[c_id]
+    assert coded["d" * 32]["publisher"] == "Solo Dev" and "established_publisher" not in coded["d" * 32]
+    assert coded["e" * 32]["rate_limited"], coded["e" * 32]
+    deep = b")]}'\n" + b"[" * 100_000
+    assert fetch_chrome_listings([a_id], client=_Rpc((200, {}, deep, None)))[a_id]["error"]
+    bad_mail = fetch_chrome_listings([a_id], client=_Rpc(
+        (200, {}, _rpc_body(("1", _cws_payload(a_id, email="x@y"))), None)))[a_id]
+    assert "developer_email" not in bad_mail and bad_mail["status"] == "public", bad_mail
+    limited = fetch_chrome_listings([a_id, b_id], client=_Rpc((429, {}, b"", None)))
+    assert all(m["rate_limited"] and m["error"] for m in limited.values()), limited
+    # After a 429 the later chunks are marked, not posted (_Rpc has one response).
+    many = ["".join("abcdefghijklmnop"[(n >> (4 * k)) & 15] for k in range(32))
+            for n in range(_CWS_RPC_BATCH + 1)]
+    rpc = _Rpc((429, {}, b"", None))
+    limited = fetch_chrome_listings(many, client=rpc)
+    assert len(rpc.forms) == 1 and len(limited) == len(many), (len(rpc.forms), len(limited))
+    assert all(m["rate_limited"] for m in limited.values())
+    assert fetch_chrome_listings(["nope"], client=_NoNet()) == {}
+    # A cached manifest for the update2 version skips the CRX download.
+    rpc = _Rpc((200, {}, b'<gupdate><app><updatecheck status="ok" version="1.2" '
+                          b'codebase="https://clients2.googleusercontent.com/x.crx"/></app></gupdate>',
+                None))
+    cached_mv = fetch_chrome_metadata(b_id, client=rpc, listing={
+        "store": "chrome", "status": "unlisted", "listing_missing": True},
+        manifest_for=lambda v: {"manifest_version": 3, "crx_hash_verified": True} if v == "1.2" else None)
+    assert cached_mv["manifest_version"] == 3 and cached_mv["status"] == "unlisted", cached_mv
+    assert rpc.forms == [] and len(rpc.urls) == 1 and "update2" in rpc.urls[0], rpc.urls
+    # Listed: the manifest came with the listing, so no update2 and no CRX.
+    rpc = _Rpc((200, {}, _rpc_body(("1", _cws_payload(a_id))), None))
+    assert fetch_chrome_metadata(a_id, client=rpc)["status"] == "public" and rpc.urls == []
+    gone = fetch_chrome_metadata(b_id, client=_Rpc((200, {}, _rpc_body(("1", None)), None), (
+        200, {}, b'<gupdate><app><updatecheck status="error-unknownApplication"/></app></gupdate>', None)))
+    assert gone["status"] == "not_found" and "listing_missing" not in gone, gone
+    listing = hit
+
     class _NoUpdate:
         def __init__(self):
             self.urls = []
+
+        def post(self, url, form, **_):
+            return 200, {}, _rpc_body(("1", None)), None
 
         def get(self, url, **_):
             self.urls.append(url)
@@ -2277,8 +2483,17 @@ def _self_check() -> None:
             if "microsoftedge" in url:
                 return 404, {}, b"", None
             return super().get(url)
+
+        def post(self, url, form, **_):
+            return 200, {}, _rpc_body(("1", _cws_payload("d" * 32))), None
     via = fetch_store_metadata("edge", "d" * 32, client=_EdgeMiss())
     assert via["store"] == "chrome" and via["resolved_from"] == "edge", via
+
+    class _EdgeMissRpcDown(_EdgeMiss):
+        def post(self, url, form, **_):
+            return 500, {}, b"", None
+    down = fetch_store_metadata("edge", "d" * 32, client=_EdgeMissRpcDown())
+    assert down["status"] == "unknown" and down["error"], down  # not a cacheable not_found
 
     # AMO: manifest_version and content scripts come from the signed XPI.
     xpi = _zip({"manifest.json": json.dumps({"manifest_version": 2, "content_scripts": [
@@ -2304,7 +2519,7 @@ def _self_check() -> None:
     nu = _NoUpdate()
     served_none = fetch_chrome_metadata("c" * 32, client=nu)
     assert "prodversion=999.0" in nu.urls[0], nu.urls
-    assert served_none["status"] == "public" and "manifest_error" not in served_none, served_none
+    assert served_none["status"] == "unlisted" and "manifest_error" not in served_none, served_none
     nu_result = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
                                    "host_count": 1, "store_meta": served_none})
     assert not any(s["code"] == "manifest-unparseable" for s in nu_result["risk_signals"]), nu_result
@@ -2312,24 +2527,11 @@ def _self_check() -> None:
     assert any(s["code"] == "manifest-uninspected" for s in nu_result["risk_signals"]), nu_result
     assert nu_result["threat_score"] >= 15 and huge.get("crx_hash_verified") is None
 
-    assert _chrome_listing(b"<h2>Related</h2>5 users<div>Featured</div>") == {}
-    assert _chrome_listing(b'<a aria-label="The publisher has a good record with no history'
-                           b' of violations. Learn more.">') == {"established_publisher": True}
-    # A developer-written description is HTML-escaped: quoting every badge
-    # phrase and label in it must yield nothing.
-    spoof = html.escape(
-        'Featured\n10,000,000 users\n5,000 ratings\nUpdated September 1, 2026\nTrader\n'
-        'Email x@y.com\nThe developer has disclosed that it will not collect\n'
-        'aria-label="Created by the owner of the listed website. The publisher has a good record'
-        ' with no history of violations." aria-label="Follows recommended practices for Chrome'
-        ' extensions." </svg><span>The developer has disclosed that it is safe'
-    )
-    assert _chrome_listing(f'<div class="desc">{spoof}</div>'.encode()) == {}
     listed_chrome = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
                                        "host_count": 1, "store_meta": {"status": "public", **listing}})
     codes = {s["code"] for s in listed_chrome["risk_signals"]}
-    assert {"store-featured", "established-publisher", "install-popularity"} <= codes, codes
-    assert listed_chrome["developer_email"] == "info@hackademix.net" and listed_chrome["featured"] is True
+    assert {"store-featured", "install-popularity", "manifest-v3"} <= codes, codes
+    assert listed_chrome["developer_email"] == "dev@example.org" and listed_chrome["featured"] is True
     panned = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x", "host_count": 1,
                                 "store_meta": {"status": "public", "rating": 1.8, "rating_count": 400}})
     assert any(s["code"] == "poor-public-reputation" for s in panned["risk_signals"]), panned
