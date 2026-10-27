@@ -781,6 +781,7 @@ def _ensure_ooda_started():
                 findings_path=OODA_FINDINGS_PATH,
                 enricher_trigger_path=ENRICHER_TRIGGER_PATH,
                 audit_log_path=AUDIT_FILE,
+                extension_trigger_path=EXTENSION_WORKER_TRIGGER_PATH if EXTENSION_WORKER_ENABLED else None,
                 enabled=OODA_ENABLED,
             )
             _OODA_STOP = stop_evt

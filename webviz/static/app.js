@@ -4685,6 +4685,7 @@ function _extSignalClass(signal) {
     const weight = Number(signal.weight) || 0;
     if (weight >= 25) return 'bad';
     if (weight > 0) return 'warn';
+    if (weight < 0) return 'good';
     return '';
 }
 
@@ -4858,8 +4859,11 @@ function _renderExtensionsTable(extensions) {
     extensions.forEach(ext => {
         const row = document.createElement('tr');
         row.onclick = () => showExtensionDetail(ext.extension_key);
-        const signals = (ext.risk_signals || []).slice(0, 4).map(s =>
-            `<span class="extension-signal ${_extSignalClass(s)}">${escapeHtml(s.code)}${s.weight ? ` +${s.weight}` : ''}</span>`
+        // Risk drivers first; trust signals (negative weights) fill the rest.
+        const all = ext.risk_signals || [];
+        const ordered = [...all.filter(s => Number(s.weight) > 0), ...all.filter(s => !(Number(s.weight) > 0))];
+        const signals = ordered.slice(0, 4).map(s =>
+            `<span class="extension-signal ${_extSignalClass(s)}">${escapeHtml(s.code)}${s.weight ? ` ${s.weight > 0 ? '+' : ''}${Number(s.weight)}` : ''}</span>`
         ).join(' ');
         const installs = ext.install_users == null ? '—' : Number(ext.install_users).toLocaleString();
         const publisher = ext.publisher || ext.vendor || '—';

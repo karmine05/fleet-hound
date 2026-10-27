@@ -240,8 +240,9 @@ def _cache_age(cache_dir: str, key: str) -> float | None:
         return None
 
 
+# v12: Chrome listings carry the integer privacy_codes the scorer reads.
 def _listing_key(store: str, extension_id: str) -> str:
-    return f"v11:listing:{store}:{extension_id}"
+    return f"v12:listing:{store}:{extension_id}"
 
 
 def _manifest_key(store: str, extension_id: str, version: str) -> str:
@@ -670,7 +671,8 @@ def _coverage(driver) -> list[dict]:
     on its own instead of being noticed one extension at a time."""
     with driver.session() as session:
         rows = session.run(f"""
-            MATCH (s:Software) WHERE {_EXT_WHERE} AND NOT coalesce(s.is_builtin, false)
+            MATCH (s:Software) WHERE {_EXT_WHERE}
+              AND (NOT coalesce(s.is_builtin, false) OR coalesce(s.risk_score, 0) > 0)
             WITH coalesce(s.store, 'unknown') AS store, s
             RETURN store,
                    count(s) AS total,

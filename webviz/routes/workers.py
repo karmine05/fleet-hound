@@ -149,7 +149,9 @@ def _extension_filter_clause(args) -> tuple[str, dict]:
         clauses.append("coalesce(s.known_bad, false) = true")
 
     if not _ext_bool_arg(args.get("include_builtin")):
-        clauses.append("coalesce(s.is_builtin, false) = false")
+        # A built-in that a blocklist or threat feed hit is scored above 0:
+        # never hide it behind the built-in filter.
+        clauses.append("(coalesce(s.is_builtin, false) = false OR coalesce(s.risk_score, 0) > 0)")
 
     search = (args.get("search") or "").strip()
     if search:
