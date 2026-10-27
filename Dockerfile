@@ -1,10 +1,17 @@
-FROM python:3.11.13-slim-bookworm
+# Pinned by digest so a rebuild is reproducible; bump tag + digest together
+# (`docker pull python:<tag>` then `docker image inspect --format '{{index .RepoDigests 0}}'`).
+# Debian 13 (trixie): 19 fewer HIGH/CRITICAL OS findings than bookworm at 3.11.17.
+FROM python:3.11.18-slim-trixie@sha256:82209229d3fda30d71e603ec95bb4bea0476635ba6df3df2e32284e036654f51
 
 WORKDIR /app
 
 # Install dependencies first (for better caching).
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+# pip, setuptools and wheel are build tools: removing them after the install
+# drops their CVEs (setuptools' vendored jaraco.context, wheel) from the runtime.
+RUN pip install --no-cache-dir --no-compile -r requirements.txt \
+ && pip uninstall -y setuptools wheel \
+ && python -m pip uninstall -y pip \
  && useradd --uid 10001 --create-home --home-dir /home/webviz --shell /sbin/nologin webviz
 
 # Copy application code.

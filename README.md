@@ -166,10 +166,26 @@ docker compose exec -T webviz python categorize_software.py --limit 0
 docker compose exec -T webviz python clear_db.py --yes
 docker compose exec -T webviz python main.py --full-scan
 
-# Stop (keep volumes) / stop and drop volumes
+# Stop (keep volumes) / stop and drop volumes (asks to type PURGE; --yes skips)
 ./stop.sh
 ./stop.sh --purge
 ```
+
+### Backup and restore
+
+`config/` holds the only copies of operator data: `whitelist.json`, `audit.log`, `known_publishers.json` edits and `snapshots/`. Back it up before every upgrade or host move:
+
+```bash
+tar czf "config-$(date +%F).tgz" config/
+```
+
+Restore by extracting the archive into the repository root before `./start.sh`. The Memgraph volume holds only derived data: after a Memgraph tag change or volume loss, rebuild it with `docker compose exec -T webviz python main.py --full-scan`.
+
+### Upgrade and rollback
+
+1. Back up `config/` (see above).
+2. `git pull`, then `./start.sh`. It rebuilds the image from the pinned base digest and pinned dependencies.
+3. To roll back, `git checkout <previous commit>` and run `./start.sh` again. State in `config/` is compatible in both directions; the extension worker re-scores on a scorer version change.
 
 `./start.sh --full-scan` boots the stack and runs one full pass in the same command.
 
@@ -202,7 +218,7 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 | `FLEET_URL` | yes | Base URL of your Fleet server. |
 | `FLEET_API_TOKEN` | yes | Bearer token. Alternative: `FLEET_EMAIL` + `FLEET_PASSWORD`. |
 | `WEBVIZ_API_TOKEN` | yes in Docker | Every `/api/*` call must send it. The image sets `WEBVIZ_REQUIRE_AUTH=true` and refuses to start without one. |
-| `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | recommended | Bolt auth; `MEMGRAPH_PASSWORD_FILE` for mounted secrets. |
+| `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | recommended | Bolt auth, in `.env` (chmod 600). The first user becomes the Memgraph superuser; `start.sh` refuses the `change-me` placeholder. |
 | `MEMGRAPH_URI` | no | Compose pins `bolt://memgraph:7687`. |
 | `PORT` | no | Dashboard listen port inside the container. Default `8080`. |
 | `STATE_FILE` | no | Compose pins `/app/config/.state.json` (the writable mount) because the rootfs is read-only. |
