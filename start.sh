@@ -56,6 +56,8 @@ read_env() {
     awk -F= -v k="$1" '$0 !~ /^[[:space:]]*#/ && $1==k {sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); v=$0} END {print v}' .env
 }
 WEBVIZ_API_TOKEN_VAL="$(read_env WEBVIZ_API_TOKEN || true)"
+WEBVIZ_API_TOKEN_FILE_VAL="$(read_env WEBVIZ_API_TOKEN_FILE || true)"
+WEBVIZ_REQUIRE_AUTH_VAL="$(read_env WEBVIZ_REQUIRE_AUTH || true)"
 OODA_ENABLED_VAL="$(read_env OODA_ENABLED || true)"
 # docker-compose.yml pins the published port to 8080 on loopback.
 BASE_URL="http://127.0.0.1:8080"
@@ -64,22 +66,47 @@ MEMGRAPH_PASSWORD_VAL="$(read_env MEMGRAPH_PASSWORD || true)"
 
 mg_ready() {
     if [[ -n "${MEMGRAPH_USER_VAL}" && -n "${MEMGRAPH_PASSWORD_VAL}" ]]; then
-        echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole \
+        # Password via FLAGS_password (mgconsole --fromenv), never in an argv.
+        echo "RETURN 1;" | FLAGS_password="${MEMGRAPH_PASSWORD_VAL}" \
+            docker exec -i -e FLAGS_password fleet-memgraph mgconsole \
             --host 127.0.0.1 --port 7687 --use-ssl=false \
-            --username="${MEMGRAPH_USER_VAL}" --password="${MEMGRAPH_PASSWORD_VAL}" \
+            --username="${MEMGRAPH_USER_VAL}" --fromenv=password \
             &>/dev/null && return 0
     fi
     echo "RETURN 1;" | docker exec -i fleet-memgraph mgconsole \
         --host 127.0.0.1 --port 7687 --use-ssl=false &>/dev/null
 }
 
-if [[ -z "${WEBVIZ_API_TOKEN_VAL}" ]]; then
-    warn "WEBVIZ_API_TOKEN is empty — /api/* GETs will be loopback-only and OODA status check will be skipped."
+# The image is fail-closed (WEBVIZ_REQUIRE_AUTH=true): with no token, webviz
+# exits at boot and restarts forever. Stop here with the real reason.
+if [[ -z "${WEBVIZ_API_TOKEN_VAL}" && -z "${WEBVIZ_API_TOKEN_FILE_VAL}" \
+      && "$(printf '%s' "${WEBVIZ_REQUIRE_AUTH_VAL}" | tr '[:upper:]' '[:lower:]')" != "false" ]]; then
+    fail "WEBVIZ_API_TOKEN is required (the image sets WEBVIZ_REQUIRE_AUTH=true). Generate one with: openssl rand -hex 32"
+    exit 1
+fi
+# The first Memgraph user becomes the superuser: never bootstrap it with the
+# example value.
+if [[ "${MEMGRAPH_PASSWORD_VAL}" == "change-me" ]]; then
+    fail "MEMGRAPH_PASSWORD is the .env.example placeholder. Set one with: openssl rand -hex 24"
+    exit 1
 fi
 
 # --- Boot the stack ---------------------------------------------------------
-info "Building + starting containers..."
-"${DOCKER_COMPOSE[@]}" up -d --build
+info "Building images..."
+"${DOCKER_COMPOSE[@]}" build
+
+# ./config is bind-mounted over /app/config, hiding the image's chown. Docker
+# Desktop (macOS) remaps ownership; a Linux host does not, so give the mount
+# to the container user (uid 10001). Plain `docker run`, because compose's
+# cap_drop: ALL removes CAP_CHOWN.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    info "Giving ./config to the container user (uid 10001)..."
+    docker run --rm --user 0 --entrypoint chown -v "$PWD/config:/app/config" \
+        fleet-hound-webviz -R 10001:10001 /app/config
+fi
+
+info "Starting containers..."
+"${DOCKER_COMPOSE[@]}" up -d
 
 # --- Wait for Memgraph -----------------------------------------------------
 info "Waiting for Memgraph (Bolt 7687)..."
@@ -104,9 +131,9 @@ for i in $(seq 1 30); do
     code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/health" 2>/dev/null || echo 000)"
     case "$code" in
         200) ok "webviz is healthy"; break ;;
-        503) ok "webviz is up (Memgraph ping warming)"; break ;;
     esac
-    [[ $i -eq 30 ]] && { fail "webviz did not respond. Check: ${DOCKER_COMPOSE[*]} logs webviz"; exit 1; }
+    # 503 means webviz is up but cannot reach Memgraph (e.g. Bolt auth mismatch).
+    [[ $i -eq 30 ]] && { fail "webviz not healthy (last HTTP $code). Check: ${DOCKER_COMPOSE[*]} logs webviz"; exit 1; }
     sleep 2
 done
 

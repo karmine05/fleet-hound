@@ -14,7 +14,6 @@ services:
     container_name: fleet-memgraph
     ports:
       - "127.0.0.1:7687:7687" # Bolt protocol (loopback; webviz talks over the compose network)
-      - "127.0.0.1:7444:7444" # Monitoring
     volumes:
       - memgraph-data:/var/lib/memgraph
       - memgraph-log:/var/log/memgraph
@@ -28,12 +27,18 @@ services:
       test:
         [
           "CMD-SHELL",
-          "if [ -n \"$$MEMGRAPH_USER\" ] && [ -n \"$$MEMGRAPH_PASSWORD\" ]; then echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false --username=\"$$MEMGRAPH_USER\" --password=\"$$MEMGRAPH_PASSWORD\" || echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; else echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; fi || exit 1",
+          "if [ -n \"$$MEMGRAPH_USER\" ] && [ -n \"$$MEMGRAPH_PASSWORD\" ]; then echo 'RETURN 1;' | FLAGS_password=\"$$MEMGRAPH_PASSWORD\" /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false --username=\"$$MEMGRAPH_USER\" --fromenv=password || echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; else echo 'RETURN 1;' | /usr/bin/mgconsole --host 127.0.0.1 --port 7687 --use-ssl=false; fi || exit 1",
         ]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 40s
+    # Same hardening as webviz, minus read_only: Memgraph writes /tmp and its
+    # data/log volumes. The image runs as the unprivileged memgraph user.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     stop_grace_period: 60s
     logging:
@@ -57,9 +62,10 @@ services:
       dockerfile: Dockerfile
     container_name: fleet-webviz
     # Bind the dashboard to the loopback interface by default so a fresh install
-    # is not LAN-reachable. Operators expose it via a reverse proxy (nginx /
-    # traefik) terminating TLS + auth, or override this mapping after setting
-    # WEBVIZ_API_TOKEN.
+    # is not LAN-reachable. For non-loopback access, put a TLS-terminating
+    # reverse proxy (nginx / traefik) that sets HSTS in front, and keep
+    # WEBVIZ_API_TOKEN set. Do not publish 8080 directly: the bearer token
+    # would travel in cleartext.
     ports:
       - "127.0.0.1:8080:8080"
     # Container hardening — non-root user (Dockerfile), cap drops, read-only
@@ -71,9 +77,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Pulls non-secret defaults from .env. Secrets (FLEET_API_TOKEN,
-    # WEBVIZ_API_TOKEN, MEMGRAPH_PASSWORD) should live in .env (chmod 600)
-    # or be supplied via *_FILE references to mounted secret files.
+    # Secrets (FLEET_API_TOKEN, WEBVIZ_API_TOKEN, MEMGRAPH_PASSWORD) live in
+    # .env (chmod 600). Only WEBVIZ_API_TOKEN also accepts *_FILE, and its path
+    # must be mounted into the container.
     env_file:
       - .env
     environment:
@@ -85,11 +91,12 @@ services:
       # Optional Bolt auth — passes through from host env / .env file.
       - MEMGRAPH_USER
       - MEMGRAPH_PASSWORD
-      - MEMGRAPH_PASSWORD_FILE
       # Optional API token for /api/* routes.
       - WEBVIZ_API_TOKEN
       - WEBVIZ_API_TOKEN_FILE
-      - WEBVIZ_REQUIRE_AUTH
+      # The image default is fail-closed (true). A bare `- WEBVIZ_REQUIRE_AUTH`
+      # with no value in .env would unset it, so the default is restated here.
+      - WEBVIZ_REQUIRE_AUTH=${WEBVIZ_REQUIRE_AUTH:-true}
       - WEBVIZ_ALLOW_ANONYMOUS_READ
       - WEBVIZ_DEBUG_ERRORS
       # Wikipedia enricher — autonomous Orient-phase categorizer.

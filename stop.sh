@@ -26,21 +26,25 @@ else
 fi
 
 PURGE=0
+ASSUME_YES=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
             cat <<USAGE
-./stop.sh [--purge]
+./stop.sh [--purge [--yes]]
 
   (default)   Stop containers. Memgraph volume + /app/config artifacts kept.
   --purge     Also drop the Memgraph data volume AND wipe host-side runtime
               state (./config/.state.json, ./config/snapshots/,
               ./config/whitelist.json, ./.state.json, ./.etl.lock).
-              NEXT ./start.sh boots with no carry-over.
+              NEXT ./start.sh boots with no carry-over. Asks for confirmation;
+              the audit log is kept as ./config/audit.log.purged-<timestamp>.
+  --yes       Skip the --purge confirmation (for scripts).
 USAGE
             exit 0
             ;;
         --purge) PURGE=1 ;;
+        --yes)   ASSUME_YES=1 ;;
         *)       fail "Unknown argument: $arg"; exit 2 ;;
     esac
 done
@@ -51,9 +55,22 @@ echo "🩸 Stopping Fleet Hound..."
 # below sends SIGTERM and waits up to graceful_timeout (30s in Dockerfile)
 # for in-flight queries to drain. The fcntl lock on /tmp is freed on exit
 # so a fresh start.sh re-elects a leader cleanly.
+if [[ "$PURGE" -eq 1 && "$ASSUME_YES" -ne 1 ]]; then
+    warn "Purge drops the graph, the operator allowlist (whitelist.json) and all runtime state."
+    read -r -p "Type PURGE to confirm: " answer
+    [[ "$answer" == "PURGE" ]] || { fail "Aborted"; exit 1; }
+fi
+
 if [[ "$PURGE" -eq 1 ]]; then
     warn "Purging Memgraph volume — graph data will be lost."
     "${DOCKER_COMPOSE[@]}" down -v
+
+    # The audit trail is evidence, not state: keep it under a dated name.
+    if [[ -e ./config/audit.log ]]; then
+        kept="./config/audit.log.purged-$(date -u +%Y%m%dT%H%M%SZ)"
+        mv ./config/audit.log "$kept"
+        ok "  kept audit log as $kept"
+    fi
 
     # `docker compose down -v` removes named volumes only. The webviz service
     # bind-mounts ./config:/app/config (see docker-compose.yml), so anything
@@ -76,7 +93,6 @@ if [[ "$PURGE" -eq 1 ]]; then
         "./config/enricher_status.json"
         "./config/extension_status.json"
         "./config/extension_cache"
-        "./config/audit.log"
         "./config/.etl.lock"
     )
     removed=0

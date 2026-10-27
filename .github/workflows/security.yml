@@ -36,7 +36,6 @@ jobs:
 
       - name: Audit pinned dependencies
         # --strict flips warnings (e.g. unpinned, unresolvable) into failures
-        # so a malformed requirements.txt also fails the gate. --disable-pip
-        # avoids resolving transitive deps via pip's resolver (PyPI-only check
-        # against the exact pins we ship).
+        # so a malformed requirements.txt also fails the gate. requirements.txt
+        # is a full lock, so every audited version is one the image installs.
         run: pip-audit --strict --requirement requirements.txt

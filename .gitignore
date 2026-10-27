@@ -44,8 +44,6 @@ ENV/
 ehthumbs.db
 Thumbs.db
 
-# Docker
-.dockerignore
 
 # Logs
 *.log
@@ -91,6 +89,7 @@ config/whitelist.json
 test_wikidata.py
 docs/*
 !docs/extension-threat-intel.md
+!docs/enrichment-architecture.md
 .state.json
 .etl.lock
 pytest.ini
