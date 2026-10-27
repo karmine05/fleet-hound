@@ -282,12 +282,13 @@ def _get_shadow_it_uncached():
                      s.category AS db_category, s.wikidata_description AS db_desc,
                      s.sources AS db_sources,
                      s.risk_band AS ext_band, s.risk_score AS ext_score,
+                     coalesce(s.is_builtin, false) AS ext_builtin,
                      COUNT(DISTINCT h) AS host_count,
                      COLLECT(DISTINCT h.hostname) AS hosts,
                      COLLECT(DISTINCT h.platform) AS platforms
                 WHERE host_count <= $outlier_threshold
                 RETURN software_name, display_name, version, host_count, hosts, platforms,
-                       db_category, db_desc, db_sources, ext_band, ext_score
+                       db_category, db_desc, db_sources, ext_band, ext_score, ext_builtin
                 ORDER BY host_count ASC, display_name ASC
             """
             
@@ -318,11 +319,13 @@ def _get_shadow_it_uncached():
                 # Risk level based on install count, unless the extension
                 # worker already scored this node: its band wins, so the
                 # Shadow IT and Extensions views agree on the same software.
+                # Built-ins are exempt: their risk 0 rests on host-reported
+                # IDs/paths, which must not lower a rare install's level.
                 risk_level = "high" if record['host_count'] == 1 else "medium"
                 risk_reason = (f"Risk is {risk_level.upper()} because this software is installed on only "
                                f"{record['host_count']} host(s) (<{OUTLIER_THRESHOLD} threshold).")
                 ext_band = record.get('ext_band')
-                if ext_band in _EXT_BAND_TO_LEVEL:
+                if ext_band in _EXT_BAND_TO_LEVEL and not record.get('ext_builtin'):
                     risk_level = _EXT_BAND_TO_LEVEL[ext_band]
                     risk_reason = (f"Risk is {risk_level.upper()} from the browser-extension risk score "
                                    f"({record.get('ext_score')}/100, band {ext_band}). Installed on "
