@@ -12,6 +12,7 @@
 | 2. Free/no-auth store-metadata adapters | `src/extension_intel.py` (Chrome update2 + CRX manifest, Edge product-details, AMO, Mozilla blocklist; host allowlist, size caps, offline degrades to local score) |
 | 3. Risk-scoring engine | `src/extension_intel.py::analyze_extension` (capability / trust / threat / exposure + name-anomaly + rarity + download rules; built-ins score 0; blocklist + ≥100k installs ⇒ ≥95) |
 | 4. Worker + API + UI | `webviz/extension_worker.py` (leader-elected, cached, status/trigger files), `/api/extensions[...]` in `webviz/app.py`, "Extensions" tab in `webviz/static/index.html` |
+| 5. Store-listing reputation (2026-10-27) | Chrome-family detail page (`_chrome_listing`: users, rating, Featured, "no history of violations" badge, updated, developer email/website, EU trader, privacy disclosure); Edge `activeInstallCount`/`isBadgedAsFeatured`/website/privacy URL; AMO `promoted`, `support_email`, homepage, privacy policy. Scoring: featured +5 trust, established publisher +10 trust, rating < 2.5 from ≥ 50 reviewers ⇒ `poor-public-reputation` threat 15. Abuse reports stay private on every store, so ratings and takedowns are the only public complaint signals. Safari has no store lookup: Fleet reports no bundle ID to query the App Store with. |
 
 Runnable self-check (inside the container, so it uses the shipped code and env):
 `docker compose exec -T webviz python src/extension_intel.py`. Phase-1+ items below (policy

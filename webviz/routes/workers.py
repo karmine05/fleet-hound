@@ -420,7 +420,10 @@ def extension_detail():
     for field in ("risk_band", "risk_score", "capability_score", "trust_score",
                   "threat_score", "exposure_score", "install_users",
                   "manifest_version", "rating", "rating_count", "publisher",
-                  "store_status", "store_url", "latest_version", "category"):
+                  "store_status", "store_url", "latest_version", "category",
+                  "store_updated_at", "store_featured", "established_publisher",
+                  "developer_verified", "developer_email", "developer_website", "trader",
+                  "privacy_disclosure", "privacy_policy_url"):
         merged.setdefault(field, None)
     merged["extension_key"] = primary.get("extension_key") or key
     merged["risk_signals"] = _ext_signals_from_props(primary)

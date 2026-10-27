@@ -300,8 +300,8 @@ def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = 
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     extension_id = record["extension_id"]
     version = record.get("last_version") or ""
-    # v5: metadata gained store IDs for trust (Chrome publisher_id, AMO author_ids).
-    cache_key = f"v5:{store}:{extension_id}:{version}"
+    # v6: metadata gained store-listing facts (users, rating, featured, contact).
+    cache_key = f"v6:{store}:{extension_id}:{version}"
     cached = _cache_get(cache_dir, cache_key, METADATA_TTL_SEC)
     if cached is not None:
         return cached
@@ -317,6 +317,11 @@ def _metadata_for(record: dict, cache_dir: str, breaker: _StoreBreaker | None = 
     if not meta.get("error") or meta.get("status") == "public":
         _cache_set(cache_dir, cache_key, meta)
     return meta
+
+
+LISTING_FIELDS = ("updated_at", "featured", "established_publisher", "developer_verified",
+                  "developer_email", "developer_website", "trader",
+                  "privacy_disclosure", "privacy_policy_url")
 
 
 def _write_result(driver, names, result: dict, extension_key: str) -> bool:
@@ -347,6 +352,15 @@ def _write_result(driver, names, result: dict, extension_key: str) -> bool:
             s.permissions = $permissions,
             s.host_permissions = $host_permissions,
             s.content_script_matches = $content_script_matches,
+            s.store_updated_at = $updated_at,
+            s.store_featured = $featured,
+            s.established_publisher = $established_publisher,
+            s.developer_verified = $developer_verified,
+            s.developer_email = $developer_email,
+            s.developer_website = $developer_website,
+            s.trader = $trader,
+            s.privacy_disclosure = $privacy_disclosure,
+            s.privacy_policy_url = $privacy_policy_url,
             s.is_builtin = $is_builtin,
             s.intel_error = $intel_error,
             s.intel_refreshed_ts = $refreshed_ts,
@@ -357,6 +371,9 @@ def _write_result(driver, names, result: dict, extension_key: str) -> bool:
     # s.category (Wikidata). Keep the store's classification in its own
     # field so the two never clobber each other.
     payload["store_category"] = payload.pop("category", None)
+    # Built-in results carry no store listing; write NULL for those fields.
+    for field in LISTING_FIELDS:
+        payload.setdefault(field, None)
     payload.update({
         "names": list(names),
         "extension_key": extension_key,

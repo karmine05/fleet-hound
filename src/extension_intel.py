@@ -711,6 +711,14 @@ def _trust_score(meta: dict, record: dict, *, reputable: bool) -> tuple[int, lis
         score += 10
         signals.append({"code": "verified-developer", "weight": 0,
                         "detail": "store marks the developer as verified"})
+    elif meta.get("established_publisher") is True:
+        score += 10
+        signals.append({"code": "established-publisher", "weight": 0,
+                        "detail": "store: verified website owner with no history of violations"})
+    if meta.get("featured") is True:
+        score += 5
+        signals.append({"code": "store-featured", "weight": 0,
+                        "detail": "featured / recommended by the store"})
 
     mv = _as_int(meta.get("manifest_version"))
     if mv == 3:
@@ -770,6 +778,15 @@ def _threat_score(meta: dict, record: dict, blocklist_entry: dict | None) -> tup
         threat = max(threat, 10)
         signals.append({"code": "unlisted", "weight": 10,
                         "detail": "unlisted or self-distributed extension"})
+
+    # Stores keep abuse reports private; a low rating from many reviewers is
+    # the closest public complaint signal.
+    rating = _as_float(meta.get("rating"))
+    rating_count = _as_int(meta.get("rating_count")) or 0
+    if rating is not None and rating < 2.5 and rating_count >= 50:
+        threat = max(threat, 15)
+        signals.append({"code": "poor-public-reputation", "weight": 15,
+                        "detail": f"rated {rating:.1f}/5 by {rating_count:,} reviewers"})
 
     if meta.get("manifest_error"):
         threat = max(threat, 30)
@@ -995,6 +1012,14 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         "rating": _as_float(meta.get("rating")),
         "rating_count": _as_int(meta.get("rating_count")),
         "updated_at": _clean_str(meta.get("updated_at")) or None,
+        "featured": meta.get("featured") if isinstance(meta.get("featured"), bool) else None,
+        "established_publisher": meta.get("established_publisher") is True or None,
+        "developer_verified": meta.get("developer_verified") if isinstance(meta.get("developer_verified"), bool) else None,
+        "developer_email": _clean_str(meta.get("developer_email")) or None,
+        "developer_website": _clean_str(meta.get("developer_website")) or None,
+        "trader": meta.get("trader") if isinstance(meta.get("trader"), bool) else None,
+        "privacy_disclosure": _clean_str(meta.get("privacy_disclosure")) or None,
+        "privacy_policy_url": _clean_str(meta.get("privacy_policy_url")) or None,
         "intel_error": _clean_str(meta.get("error")) or None,
     }
 
@@ -1211,6 +1236,86 @@ def _chrome_publisher(page: bytes) -> tuple[str, str] | None:
     return pid.decode("ascii"), name or pid.decode("ascii")
 
 
+_CWS_WEBSITE_RE = re.compile(
+    r'<a href="(https?://[^"\s]{1,300})"[^>]{0,500}>'
+    r'(?:<svg[^>]{0,300}>(?:<path[^>]{0,3000}/>){0,5}</svg>)?\s{0,5}Website</a>'
+)
+_CWS_USERS_RE = re.compile(r"^([\d,]{1,15})\+? users?$")
+_CWS_RATING_RE = re.compile(r'aria-label="Average rating ([0-5](?:\.\d{1,2})?) out of 5')
+_CWS_RATING_COUNT_RE = re.compile(r"^([\d,.]{1,12})(K?) ratings?$")
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}$")
+_CWS_ESTABLISHED = "good record with no history of violations"
+
+
+def _chrome_listing(page: bytes) -> dict:
+    """Store-listing facts from a Chrome Web Store detail page (fetched with hl=en).
+
+    Labels, not CSS class names, anchor every field: the classes are minified
+    and rotate. Parsing stops at the "Related" carousel so another listing's
+    rating can never be attributed to this one. Missing fields are omitted.
+    """
+    text = page.decode("utf-8", "replace")
+    cut = text.find(">Related<")
+    if cut > 0:
+        text = text[:cut]
+    visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", text, flags=re.S)
+    lines = [html.unescape(s).strip() for s in re.split(r"<[^>]+>", visible)]
+    lines = [s for s in lines if s]
+    out: dict = {}
+
+    def after(label: str) -> str | None:
+        try:
+            i = lines.index(label)
+        except ValueError:
+            return None
+        return lines[i + 1] if i + 1 < len(lines) else None
+
+    for line in lines:
+        m = _CWS_USERS_RE.match(line)
+        if m:
+            out["users"] = int(m.group(1).replace(",", ""))
+            break
+    m = _CWS_RATING_RE.search(text)
+    if m:
+        out["rating"] = float(m.group(1))
+    for line in lines:
+        m = _CWS_RATING_COUNT_RE.match(line)
+        if m:
+            n = float(m.group(1).replace(",", ""))
+            out["rating_count"] = int(n * 1000 if m.group(2) else n)
+            break
+    if "Featured" in lines:
+        out["featured"] = True
+    if _CWS_ESTABLISHED in text:
+        out["established_publisher"] = True
+    updated = after("Updated")
+    if updated:
+        try:
+            out["updated_at"] = datetime.strptime(updated, "%B %d, %Y").replace(
+                tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            pass
+    m = re.search(r'href="\./category/extensions/[^"]{1,100}"[^>]{0,300}>([^<]{1,80})</a>', text)
+    if m:
+        out["category"] = html.unescape(m.group(1)).strip()
+    # Developer contact block: Website link, then the e-mail under "Email".
+    m = _CWS_WEBSITE_RE.search(text)
+    if m:
+        out["developer_website"] = html.unescape(m.group(1))
+    email = after("Email")
+    if email and _EMAIL_RE.match(email):
+        out["developer_email"] = email
+    if "Trader" in lines:
+        out["trader"] = True
+    elif "Non-trader" in lines:
+        out["trader"] = False
+    for line in lines:
+        if line.startswith("The developer has disclosed that it "):
+            out["privacy_disclosure"] = line.split(".")[0][:200]
+            break
+    return out
+
+
 def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None) -> dict:
     client = client or HttpClient()
     # Host-reported ID: only a real Chrome ID may reach a store URL path.
@@ -1258,8 +1363,9 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
         })
         # update2 carries no developer field; the detail page does. Without it
         # no Chrome-family extension can ever count as a reputable publisher.
+        # hl=en: the listing parser anchors on English labels.
         dstatus, dheaders, dbody, _ = client.get(
-            meta["url"], allowed_hosts=_CHROME_HOSTS, max_bytes=2 * 1024 * 1024
+            meta["url"] + "?hl=en", allowed_hosts=_CHROME_HOSTS, max_bytes=2 * 1024 * 1024
         )
         if _mark_rate_limited(meta, dstatus, dheaders):
             return meta
@@ -1267,6 +1373,7 @@ def fetch_chrome_metadata(extension_id: str, *, client: HttpClient | None = None
             publisher = _chrome_publisher(dbody)
             if publisher:
                 meta["publisher_id"], meta["publisher"] = publisher
+            meta.update(_chrome_listing(dbody))
         codebase = updatecheck.get("codebase") or ""
         expected_hash = (updatecheck.get("hash_sha256") or "").lower()
         if not codebase:
@@ -1326,18 +1433,24 @@ def fetch_edge_metadata(extension_id: str, *, client: HttpClient | None = None) 
     if isinstance(developer, dict):
         verified = developer.get("verified", verified)
         developer = _first(developer, "name", "displayName", "publisherName")
+    updated = _first(data, "lastUpdateDate", "lastUpdated", "updateDate")
+    if isinstance(updated, (int, float)) and updated > 0:  # live API returns epoch seconds
+        updated = datetime.fromtimestamp(updated, timezone.utc).isoformat()
+    featured = data.get("isBadgedAsFeatured")
     meta.update({
         "status": "public",
         "name": _clean_str(_first(data, "name", "extensionName")) or manifest_fields.get("name"),
         "version": _clean_str(_first(data, "version", "latestVersion")) or manifest_fields.get("version"),
-        "users": _as_int(_first(data, "users", "userCount", "usersCount", "installCount")),
+        "users": _as_int(_first(data, "activeInstallCount", "users", "userCount", "installCount")),
         "rating": _as_float(_first(data, "rating", "averageRating")),
         "rating_count": _as_int(_first(data, "ratingCount", "ratingsCount", "rating_count")),
         "developer": _clean_str(developer) or None,
         "developer_verified": bool(verified) if verified is not None else None,
+        "developer_website": _clean_str(data.get("publisherWebsiteUri")) or None,
+        "featured": featured if isinstance(featured, bool) else None,
         "category": _clean_str(_first(data, "category", "categories")) or None,
-        "updated_at": _clean_str(_first(data, "lastUpdateDate", "lastUpdated", "updateDate")) or None,
-        "privacy_policy_url": _clean_str(_first(data, "privacyPolicyUrl", "privacyPolicy")) or None,
+        "updated_at": _clean_str(updated) or None,
+        "privacy_policy_url": _clean_str(_first(data, "privacyUrl", "privacyPolicyUrl", "privacyPolicy")) or None,
     })
     for key, value in manifest_fields.items():
         if value not in (None, [], ""):
@@ -1386,6 +1499,14 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         meta_status = "removed"
     else:
         meta_status = "public"
+    if data.get("is_disabled") is True:
+        meta_status = "removed"
+    promoted = data.get("promoted") if isinstance(data.get("promoted"), list) else []
+    categories = [p.get("category") for p in promoted if isinstance(p, dict)]
+    email = _clean_str(_localised_name(data.get("support_email")))
+    homepage = data.get("homepage")
+    if isinstance(homepage, dict) and "url" in homepage:  # v5: {"url": {locale: url}, ...}
+        homepage = homepage["url"]
 
     permissions = _as_string_list(
         file_info.get("permissions") or current.get("permissions") or data.get("permissions")
@@ -1409,7 +1530,8 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         "rating": _as_float(ratings.get("average")),
         "rating_count": _as_int(ratings.get("count")),
         "developer": _clean_str(developer) or None,
-        "category": _clean_str(data.get("category")) or None,
+        "category": _clean_str(data.get("category") or next(iter(
+            data.get("categories") if isinstance(data.get("categories"), list) else []), None)) or None,
         "updated_at": _clean_str(current.get("created")) or _clean_str(data.get("last_updated")) or None,
         "manifest_version": _as_int(current.get("manifest_version")),
         "permissions": permissions,
@@ -1417,6 +1539,12 @@ def fetch_amo_metadata(guid: str, *, client: HttpClient | None = None) -> dict:
         "optional_permissions": optional,
         "content_script_matches": content_matches,
         "crx_hash_verified": None,
+        # Mozilla's "recommended"/"line" programs include a manual code review.
+        "featured": any(c in ("recommended", "line") for c in categories),
+        "developer_email": email if _EMAIL_RE.match(email) else None,
+        "developer_website": _clean_str(_localised_name(homepage)) or None,
+        "privacy_policy_url": (meta["url"] + "privacy/") if data.get("has_privacy_policy") else None,
+        "created_at": _clean_str(data.get("created")) or None,
     })
     return meta
 
@@ -1812,6 +1940,38 @@ def _self_check() -> None:
     assert _chrome_publisher(b"<html>no publisher link</html>") is None
     assert not publisher_is_reputable("Totally Not 1Password Devs")
     os.unlink(tmp.name)
+
+    # Chrome listing: labels anchor fields; the Related carousel is ignored.
+    page = (
+        '<span>Featured</span><span aria-label="Average rating 3.9 out of 5 stars."></span>'
+        '<p>1.2K ratings</p><a href="./category/extensions/productivity/workflow" x="1">'
+        'Workflow &amp; Planning</a>100,000 users<div>Updated</div><div>September 22, 2026</div>'
+        '<a href="https://noscript.net" rel="ugc"><svg w="1"><path d="M1 2z"/></svg> Website</a>'
+        '<summary> Email </summary><div>info@hackademix.net</div><div>Non-trader</div>'
+        '<span>The developer has disclosed that it will not collect or use your data. More</span>'
+        '<a aria-label="Created by the owner of the listed website. The publisher has a good record'
+        ' with no history of violations.">x</a>'
+        '<h2>Related</h2><span aria-label="Average rating 1.0 out of 5 stars."></span>9 users'
+    ).encode()
+    listing = _chrome_listing(page)
+    assert listing == {
+        "users": 100_000, "rating": 3.9, "rating_count": 1200, "featured": True,
+        "established_publisher": True, "updated_at": "2026-09-22T00:00:00+00:00",
+        "category": "Workflow & Planning", "developer_website": "https://noscript.net",
+        "developer_email": "info@hackademix.net", "trader": False,
+        "privacy_disclosure": "The developer has disclosed that it will not collect or use your data",
+    }, listing
+    assert _chrome_listing(b"<h2>Related</h2>5 users<div>Featured</div>") == {}
+    assert "developer_email" not in _chrome_listing(b"<div>Email</div><div>not an email</div>")
+    listed_chrome = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x",
+                                       "host_count": 1, "store_meta": {"status": "public", **listing}})
+    codes = {s["code"] for s in listed_chrome["risk_signals"]}
+    assert {"store-featured", "established-publisher", "install-popularity"} <= codes, codes
+    assert listed_chrome["developer_email"] == "info@hackademix.net" and listed_chrome["featured"] is True
+    panned = analyze_extension({"store": "chrome", "extension_id": "c" * 32, "name": "x", "host_count": 1,
+                                "store_meta": {"status": "public", "rating": 1.8, "rating_count": 400}})
+    assert any(s["code"] == "poor-public-reputation" for s in panned["risk_signals"]), panned
+    assert panned["threat_score"] >= 15
     print("extension_intel self-check: OK")
 
 

@@ -4920,6 +4920,7 @@ async function showExtensionDetail(key) {
                 </div>
             </div>
             ${/^https:\/\//i.test(ext.store_url || '') ? `<div class="detail-row"><div class="detail-label">Store listing</div><div class="detail-value"><a href="${escapeHtml(ext.store_url)}" target="_blank" rel="noopener noreferrer" class="text-sm">${escapeHtml(ext.store_url)}</a></div></div>` : ''}
+            ${_extReputationRow(ext)}
             <div class="detail-row">
                 <div class="detail-label">Why this score</div>
                 <div class="detail-value">${signals}</div>
@@ -4946,6 +4947,29 @@ async function showExtensionDetail(key) {
     } catch (error) {
         showStatus(`Extension detail failed: ${error.message}`, true);
     }
+}
+
+function _extReputationRow(ext) {
+    const link = u => /^https?:\/\//i.test(u || '')
+        ? `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer">${escapeHtml(truncateText(u, 48))}</a>` : '';
+    const badges = [
+        ext.store_featured ? '<span class="extension-signal good">featured</span>' : '',
+        ext.established_publisher ? '<span class="extension-signal good">no history of violations</span>' : '',
+        ext.developer_verified ? '<span class="extension-signal good">verified developer</span>' : '',
+        ext.trader === true ? '<span class="extension-signal">EU trader</span>' : '',
+        ext.trader === false ? '<span class="extension-signal">non-trader</span>' : '',
+    ].filter(Boolean).join(' ');
+    const parts = [
+        ext.rating != null ? `rated <strong>${Number(ext.rating).toFixed(1)}</strong>/5${ext.rating_count != null ? ` (${Number(ext.rating_count).toLocaleString()} ratings)` : ''}` : '',
+        ext.store_updated_at ? `updated ${escapeHtml(String(ext.store_updated_at).slice(0, 10))}` : '',
+        ext.developer_email ? `email <a href="mailto:${escapeHtml(ext.developer_email)}">${escapeHtml(ext.developer_email)}</a>` : '',
+        link(ext.developer_website) ? `website ${link(ext.developer_website)}` : '',
+        ext.privacy_disclosure ? escapeHtml(ext.privacy_disclosure) : '',
+        link(ext.privacy_policy_url) ? `privacy policy ${link(ext.privacy_policy_url)}` : '',
+    ].filter(Boolean);
+    if (!badges && !parts.length) return '';
+    return `<div class="detail-row"><div class="detail-label">Reputation</div>
+        <div class="detail-value text-sm">${badges}${badges && parts.length ? '<br>' : ''}${parts.join(' · ')}</div></div>`;
 }
 
 function closeExtensionDetails(event) {
