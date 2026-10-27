@@ -32,8 +32,10 @@ jobs:
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0
           -S warning start.sh stop.sh scripts/ensure_memgraph_user.sh
 
-      - name: Build image
-        run: docker build -t fleet-hound-webviz:ci .
+      - name: Build images
+        run: |
+          docker build -t fleet-hound-webviz:ci .
+          docker build -t fleet-hound-memgraph:ci memgraph
 
       - name: Scan image (fail on fixable HIGH/CRITICAL)
         # Unfixed OS findings have no upstream package yet; failing on them
@@ -43,3 +45,10 @@ jobs:
           aquasec/trivy:0.69.3 image --quiet --scanners vuln
           --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
           fleet-hound-webviz:ci
+
+      - name: Scan Memgraph image (fail on fixable HIGH/CRITICAL)
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.69.3 image --quiet --scanners vuln
+          --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+          fleet-hound-memgraph:ci
