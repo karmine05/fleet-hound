@@ -1,0 +1,28 @@
+{
+  "_about": [
+    "Open threat feeds of malicious / removed browser extension IDs. Every fleet extension is",
+    "matched against every feed on each scoring cycle; a hit adds a threat-feed:<name> signal.",
+    "Add a feed by adding an entry; no code change or rebuild (read at the start of each cycle).",
+    "Fields: name (a-z0-9_-), url (https, public host), format ('csv'), platform ('chromium' covers",
+    "chrome/edge/brave/opera/vivaldi/chromium IDs; 'firefox' covers AMO GUIDs), id_field (column with",
+    "the extension ID), optional reason_field / source_field / date_field (columns), optional",
+    "default_reason (used when the feed has no reason column), added_at (ISO 8601 UTC), license.",
+    "Reason text sets severity: malware/spyware/phishing/stealer => known-bad (risk >= 85);",
+    "adware/hijacking/bundling/suspicious => risk >= 70; anything else (policy takedown) => risk >= 60.",
+    "Mozilla's own blocklist is built in (version-aware) and is not configured here."
+  ],
+  "feeds": [
+    {
+      "name": "malext-sentry",
+      "url": "https://raw.githubusercontent.com/toborrm9/malicious_extension_sentry/main/malicious_extensions_detailed.csv",
+      "format": "csv",
+      "platform": "chromium",
+      "id_field": "extension_id",
+      "reason_field": "reason",
+      "source_field": "source",
+      "date_field": "insert_date_fmt",
+      "license": "CC BY 4.0, (c) toborrm9, https://github.com/toborrm9/malicious_extension_sentry",
+      "added_at": "2026-10-27T15:00:00Z"
+    }
+  ]
+}

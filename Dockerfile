@@ -20,6 +20,7 @@ COPY main.py ./main.py
 # Default known-publisher list for deployments that don't bind-mount config/
 # (compose mounts ./config over /app/config, so the repo copy is what is used).
 COPY config/known_publishers.json /app/config/known_publishers.json
+COPY config/extension_threat_feeds.json /app/config/extension_threat_feeds.json
 RUN mkdir -p /app/config /app/config/snapshots \
  && chown -R webviz:webviz /app
 

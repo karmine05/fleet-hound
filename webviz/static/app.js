@@ -4837,7 +4837,15 @@ function _renderExtensionWorkerLine(worker) {
     const state = worker.enabled ? (worker.running ? 'running' : 'idle') : 'disabled';
     const tick = worker.last_tick_iso ? worker.last_tick_iso.replace('T', ' ').slice(0, 16) : 'never';
     const err = worker.last_error ? ` · last error: ${worker.last_error}` : '';
-    line.textContent = `Worker: ${state} · last run ${tick}${err}`;
+    const feeds = (worker.threat_feeds || []).map(f =>
+        `${f.name} ${Number(f.entries || 0).toLocaleString()} IDs${f.error ? ` (${f.error})` : ''}`).join(', ');
+    // Fill rates per store: a store whose numbers drop is a broken adapter.
+    const cov = (worker.coverage || []).filter(c => c.total).map(c =>
+        `${c.store} ${c.with_users}/${c.total} installs, ${c.manifest_parsed}/${c.total} manifests` +
+        (c.uninspected ? `, ${c.uninspected} uninspected` : '') + (c.feed_hits ? `, ${c.feed_hits} feed hits` : ''));
+    line.textContent = `Worker: ${state} · last run ${tick}${err}` +
+        (feeds ? ` · feeds: ${feeds}` : ' · feeds: none configured');
+    line.title = cov.length ? `Enrichment coverage\n${cov.join('\n')}` : '';
 }
 
 function _renderExtensionsTable(extensions) {
