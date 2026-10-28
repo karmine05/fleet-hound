@@ -98,11 +98,13 @@ info "Building images..."
 # ./config is bind-mounted over /app/config, hiding the image's chown. Docker
 # Desktop (macOS) remaps ownership; a Linux host does not, so give the mount
 # to the container user (uid 10001). Plain `docker run`, because compose's
-# cap_drop: ALL removes CAP_CHOWN.
+# cap_drop: ALL removes CAP_CHOWN. busybox, because the distroless app image
+# ships no chown.
 if [[ "$(uname -s)" == "Linux" ]]; then
     info "Giving ./config to the container user (uid 10001)..."
-    docker run --rm --user 0 --entrypoint chown -v "$PWD/config:/app/config" \
-        fleet-hound-webviz -R 10001:10001 /app/config
+    docker run --rm --user 0 -v "$PWD/config:/app/config" \
+        busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 \
+        chown -R 10001:10001 /app/config
 fi
 
 info "Starting containers..."
@@ -144,12 +146,7 @@ OODA_TEAMS_VAL="$(read_env OODA_TEAMS || true)"
 if [[ -z "${OODA_TEAMS_VAL}" ]]; then
     if [[ -t 0 ]]; then
         info "No Fleet teams selected (OODA_TEAMS). Fetching team list..."
-        "${DOCKER_COMPOSE[@]}" exec -T webviz python -c '
-import os, main
-teams = main._list_teams(os.environ["FLEET_URL"], os.environ.get("FLEET_API_TOKEN", ""),
-                         os.environ.get("INSECURE", "").lower() in ("1", "true", "yes", "on"), False)
-main._print_teams(teams)
-' || warn "Could not list teams (check FLEET_URL / FLEET_API_TOKEN)."
+        "${DOCKER_COMPOSE[@]}" exec -T webviz fleethound etl --list-teams || warn "Could not list teams (check FLEET_URL / FLEET_API_TOKEN)."
         while [[ -z "${OODA_TEAMS_VAL}" ]]; do
             read -r -p "Team IDs to scan (comma-separated): " picked
             picked="${picked// /}"
@@ -211,8 +208,8 @@ fi
 # --- Optional: one ETL pass inside the container ---------------------------
 if [[ $# -gt 0 ]]; then
     echo
-    info "Running ETL in the webviz container: python main.py $*"
-    if ! "${DOCKER_COMPOSE[@]}" exec -T webviz python main.py "$@"; then
+    info "Running ETL in the webviz container: fleethound etl $*"
+    if ! "${DOCKER_COMPOSE[@]}" exec -T webviz fleethound etl "$@"; then
         warn "ETL exited non-zero. The container OODA loop will keep running."
     fi
 fi
@@ -231,17 +228,17 @@ echo "  Memgraph Bolt:    bolt://localhost:7687"
 echo
 echo "  Logs:             ${DOCKER_COMPOSE[*]} logs -f"
 echo "  Stop:             ./stop.sh"
-echo "  Wipe DB:          ${DOCKER_COMPOSE[*]} exec webviz python clear_db.py --yes"
+echo "  Wipe DB:          ${DOCKER_COMPOSE[*]} exec webviz fleethound clear-db --yes"
 echo
-echo "  ETL (one pass):   ${DOCKER_COMPOSE[*]} exec -T webviz python main.py"
-echo "  ETL (full):       ${DOCKER_COMPOSE[*]} exec -T webviz python main.py --full-scan"
+echo "  ETL (one pass):   ${DOCKER_COMPOSE[*]} exec -T webviz fleethound etl"
+echo "  ETL (full):       ${DOCKER_COMPOSE[*]} exec -T webviz fleethound etl --full-scan"
 echo
 
 if [[ "${OODA_ENABLED_VAL:-false}" =~ ^([Tt]rue|1|[Yy]es|on)$ ]]; then
     info "OODA_ENABLED=true — webviz will drive ETL cycles autonomously."
     info "If this is the very first run, the first cycle will behave like --full-scan."
 else
-    warn "OODA_ENABLED is not true. Run one pass with: ${DOCKER_COMPOSE[*]} exec -T webviz python main.py"
+    warn "OODA_ENABLED is not true. Run one pass with: ${DOCKER_COMPOSE[*]} exec -T webviz fleethound etl"
 fi
 
 if [[ "${FOLLOW_LOGS:-0}" == "1" ]]; then

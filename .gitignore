@@ -76,6 +76,7 @@ config/*
 # Test suite + debug pages stay local; they never ship to GitHub.
 tests/
 webviz/static/ping.html
+**/*_test.go
 
 # Test artifacts
 .pytest_cache/
@@ -107,3 +108,6 @@ README.md
 AGENTS.md
 data/memory*
 agentdb.rvf*
+
+# API parity scratch
+.parity/

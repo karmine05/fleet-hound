@@ -1,8 +1,8 @@
 # Fleet Hound Web Dashboard
 
-Security-analysis UI and API for the Fleet Hound graph: one self-contained page served by Flask + Gunicorn, backed by Memgraph.
+Security-analysis UI and API for the Fleet Hound graph: one self-contained page served by the `fleethound serve` Go binary, backed by Memgraph.
 
-The dashboard only ships as a container. There is no supported host-side `python webviz/app.py` path — the image carries the exact code, env, and read-only filesystem assumptions the app is built for.
+The dashboard only ships as a container. There is no supported host-side `fleethound serve` path: the image carries the exact code, env, and read-only filesystem assumptions the app is built for.
 
 ## Running it
 
@@ -16,12 +16,12 @@ open http://127.0.0.1:8080
 Compose publishes the dashboard on `127.0.0.1:8080` only. To reach it from another machine, put nginx/traefik in front for TLS and keep `WEBVIZ_API_TOKEN` set.
 
 ```bash
-docker compose logs -f webviz           # app + gunicorn access log
+docker compose logs -f webviz           # app + access log
 docker compose ps                      # container health
 docker compose up -d --no-deps webviz  # restart the dashboard only
 ```
 
-The container healthcheck calls `GET /api/health`, which pings Memgraph; a container that reports `unhealthy` means the DB is unreachable, not that gunicorn is down.
+The container healthcheck calls `GET /api/health`, which pings Memgraph; a container that reports `unhealthy` means the DB is unreachable, not that the server is down.
 
 ## Authentication
 
@@ -61,14 +61,17 @@ UI guarantees:
 
 ## Architecture
 
+The server code lives in Go under `internal/`; this directory holds only the static UI.
+
 ```text
+internal/
+├── server/              # HTTP server, auth, security headers, worker lifecycle
+├── api/                 # one package per endpoint group (entities, graphapi, shadowit, workersapi)
+├── api/graphapi/sample.go  # degree-ranked, type-balanced sampler for the Command Deck
+├── enrich/              # Wikipedia categorization (leader-elected, cached)
+├── extworker/           # extension metadata + risk scoring (leader-elected, cached)
+└── ooda/                # Observe→Orient→Decide→Act supervisor
 webviz/
-├── app.py               # Flask app, auth, security headers, worker lifecycle
-├── routes/              # one blueprint per endpoint group (graph, search, blast_radius, …)
-├── graph_sample.py      # degree-ranked, type-balanced sampler for the Command Deck
-├── enrich_worker.py     # Wikipedia categorization (leader-elected, cached)
-├── extension_worker.py  # extension metadata + risk scoring (leader-elected, cached)
-├── ooda_worker.py       # Observe→Orient→Decide→Act supervisor
 └── static/
     ├── index.html       # markup only
     ├── app.js           # all UI logic (D3 v7); event bindings at the bottom
@@ -100,7 +103,7 @@ All routes are under `/api/` and require the token except `/api/health`.
 | `POST /api/authorize-software` | Approve/deny a title; takes effect on the next read. |
 | `GET /api/extensions` | Scored inventory; filters: `risk`, `store`, `search`, `known_bad`, `include_builtin`. |
 | `GET /api/extensions/status`, `POST /api/extensions/refresh`, `GET /api/extensions/detail` | Worker state and per-extension detail. |
-| `GET /api/snapshots?limit=N` | Newest-first snapshot metadata (default 100, cap 500). |
+| `GET /api/snapshots?limit=N` | Newest-first snapshot metadata (all by default; `limit` caps at 500). |
 | `GET /api/diff?from=<ts>&to=<ts>` | Added/removed/changed nodes, edges, and properties. |
 | `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikipedia worker. |
 | `GET /api/ooda/status`, `/findings`, `/cycles`, `POST /api/ooda/trigger` | Autonomy supervisor. |
@@ -117,7 +120,8 @@ Read from the container environment (supplied by `.env` through Compose):
 | `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | — | Bolt auth; `_FILE` variants supported. |
 | `WEBVIZ_API_TOKEN` | — | Required by the production image. |
 | `WEBVIZ_REQUIRE_AUTH` | `true` (image) | Refuse to start without a token. |
-| `PORT` | `8080` | Gunicorn bind port. |
+| `PORT` | `8080` | HTTP listen port. |
+| `WEBVIZ_BIND_HOST` | `0.0.0.0` (image) | Listen address; `127.0.0.1` outside the image. |
 | `STATE_FILE` | `/app/config/.state.json` | Compose sets it; the rootfs is read-only. |
 | `SNAPSHOT_DIR` | `config/snapshots` | Under the `/app/config` mount. |
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | `30` / `5000` | Pruned after each ETL run. |
@@ -133,33 +137,32 @@ Read from the container environment (supplied by `.env` through Compose):
 - `/api/graph/full` without `sample` returns everything; the Overview always asks for a sample (`120` desktop, fewer on phones) so first paint stays cheap.
 - Long force simulations are bounded; labels are counter-scaled and decluttered rather than rendered for every node.
 - Blast-radius and Shadow IT queries are scoped by team/platform/label before traversal, so the walk never starts from the whole graph.
-- Workers are leader-elected with `fcntl` locks, so two gunicorn workers don't double-hit Wikipedia or the extension stores.
+- Workers are leader-elected with `flock` locks, so two server processes sharing `/app/config` don't double-hit Wikipedia or the extension stores.
 
 ## Troubleshooting
 
 ```bash
 # Is the DB reachable?
-docker compose exec -T webviz python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/api/health').read())"
+docker compose exec -T webviz fleethound healthcheck && echo healthy
 
 # 401 from the API
 grep '^WEBVIZ_API_TOKEN=' .env | tail -1
 
 # Blank dashboard / stale data
 docker compose logs --tail=100 webviz
-docker compose exec -T webviz python main.py --full-scan
+docker compose exec -T webviz fleethound etl --full-scan
 ```
 
 The UI keeps the last successful payload on screen when a refresh fails and shows a stale marker; an empty graph usually means the ETL has not run yet, not that the API is broken.
 
 ## Tests
 
-The pure-function test suite lives in `tests/` and is **local-only** — `.gitignore`
-keeps it out of the repo on purpose. Run it from the repo root with a Python that
-has the project's dependencies installed:
+Unit tests are `*_test.go` files next to the code and are **local-only**:
+`.gitignore` keeps them out of the repo on purpose. Run them from the repo root:
 
 ```bash
-python3 -m unittest discover -s tests -v
+go test -race ./...
 ```
 
-It covers the graph sampler, ingest identity/version handling, ETL cadence, and
-the Shadow IT eligibility gate. No Flask app import and no Memgraph required.
+Tests that read a live Memgraph or webviz only run when `FLEETHOUND_LIVE_BOLT`
+(and, for the parity checks, `FLEETHOUND_LIVE_WEBVIZ` + `WEBVIZ_API_TOKEN`) are set.

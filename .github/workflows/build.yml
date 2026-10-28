@@ -11,25 +11,35 @@ permissions:
 
 jobs:
   check:
-    name: compile, shellcheck, image build + scan
+    name: vet, build, shellcheck, image build + scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: '3.11'
+          # No GITHUB_TOKEN left in .git/config for later steps to read.
+          persist-credentials: false
 
-      - name: Byte-compile Python
-        run: python -m compileall -q src webviz main.py categorize_software.py clear_db.py
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # Matches go.mod `toolchain` (Go 1.24 is EOL; stdlib fixes land in 1.26).
+          go-version: '1.26.10'
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/fleethound ./cmd/fleethound
 
       - name: Extension scorer self-check
-        run: python src/extension_intel.py
+        run: go run ./cmd/fleethound selfcheck
 
       - name: ShellCheck
-        # Pinned image tag, not a third-party action.
+        # Pinned image digest, not a third-party action.
         run: >
-          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0@sha256:2097951f02e735b613f4a34de20c40f937a6c8f18ecb170612c88c34517221fb
           -S warning start.sh stop.sh scripts/ensure_memgraph_user.sh
 
       - name: Build images
@@ -42,13 +52,13 @@ jobs:
         # would block every build without a remedy.
         run: >
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
-          aquasec/trivy:0.69.3 image --quiet --scanners vuln
+          aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c image --quiet --scanners vuln
           --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
           fleet-hound-webviz:ci
 
       - name: Scan Memgraph image (fail on fixable HIGH/CRITICAL)
         run: >
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
-          aquasec/trivy:0.69.3 image --quiet --scanners vuln
+          aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c image --quiet --scanners vuln
           --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
           fleet-hound-memgraph:ci
