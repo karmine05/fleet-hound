@@ -2,7 +2,7 @@
 
 **Status:** implemented (Phases 0–5 shipped 2026-10-25). Screenshots of the shipped UI are in `assets/`.
 **Scope:** visual system, motion, hero diagrams, new Overview, Graph, Blast Radius, Shadow IT, Extensions, Changes, and all loading/empty/error states.
-**Runtime constraint:** Flask serves one static `webviz/static/index.html`; D3 v7 is vendored locally. There is no build step. The shipped implementation keeps that architecture.
+**Runtime constraint:** The Go `net/http` server (`internal/server/handlers.go`) serves one static `webviz/static/index.html` from `WEBVIZ_STATIC_DIR`; D3 v7 is vendored locally. There is no build step. The shipped implementation keeps that architecture.
 
 ---
 
@@ -654,7 +654,7 @@ No GSAP, no Three.js, no chart library. A dashboard does not need a 3D scene; th
 
 **B. `GET /api/snapshots?limit=<n>`**
 
-- Optional `limit`, default 100, cap 500. Slice newest-first.
+- Optional `limit`, cap 500; omitted returns every snapshot. Slice newest-first.
 - Overview requests 8; Changes requests 60.
 - Existing callers without `limit` keep working.
 
@@ -666,9 +666,9 @@ No GSAP, no Three.js, no chart library. A dashboard does not need a 3D scene; th
 
 **D. Tests**
 
-- Add a pure-Python test for the sample trimmer (degree ranking, link filtering, caps).
+- Add a Go unit test (`internal/api/graphapi/graphapi_test.go`) for the sample trimmer `SampleGraph` in `internal/api/graphapi/sample.go` (degree ranking, link filtering, caps).
 - Add a test for `limit` validation (0, negative, >500, non-int).
-- Run `python3 -m unittest discover -s tests -v`.
+- Run `go test ./...`.
 
 ### 8.3 File layout
 

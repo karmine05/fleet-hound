@@ -8,22 +8,22 @@
 
 | Action | Where |
 |---|---|
-| 1. Preserve extension identity/fields at ingestion | `src/ingestion.py` (additive `extension_key`, `kind`, `store`, `extension_id`, `browser`, per-host edge props `version/source/browser/installed_path/first_seen/last_seen`, vuln + signature summaries). MERGE key stays `name`. |
-| 2. Free/no-auth store-metadata adapters | `src/extension_intel.py` (Chrome Web Store listing RPC, update2 + CRX manifest for unlisted items, Edge product-details, AMO, Mozilla blocklist; host allowlist, size caps, offline degrades to local score) |
-| 3. Risk-scoring engine | `src/extension_intel.py::analyze_extension` (capability / trust / threat / exposure + name-anomaly + rarity + download rules; built-ins score 0; blocklist + ≥100k installs ⇒ ≥95) |
-| 4. Worker + API + UI | `webviz/extension_worker.py` (leader-elected, cached, status/trigger files), `/api/extensions[...]` in `webviz/app.py`, "Extensions" tab in `webviz/static/index.html` |
-| 5. Store-listing reputation (2026-10-27) | Chrome-family listing RPC (`fetch_chrome_listings`, replaced the detail-page scrape: users, rating, Featured, updated, developer email/website, EU trader, privacy disclosure, the "no history of violations" badge from `[0][8]` and `[0][15]` (both matched the badge on every listing probed)); Edge `activeInstallCount`/`isBadgedAsFeatured`/website/privacy URL; AMO `promoted`, `support_email`, homepage, privacy policy. Scoring: featured +5 trust, established publisher +10 trust, rating < 2.5 from ≥ 50 reviewers ⇒ `poor-public-reputation` threat 15. Abuse reports stay private on every store, so ratings and takedowns are the only public complaint signals. Opera (2026-10-28): addons.opera.com listing page (`details/app_id/<id>/`) and CRX, falling back to the Chrome Web Store. Safari (2026-10-28): Fleet reports no extension ID, so ingestion takes the containing app's bundle ID from the same host's `apps` row and the worker queries the iTunes lookup API (`itunes.apple.com/lookup?bundleId=`). |
-| 6. Open threat feeds + self-reported coverage (2026-10-27) | `config/extension_threat_feeds.json` (data file, no code change to add a feed; ships MalExt Sentry: store takedowns + Unit 42 / Socket / researcher reports, ~8k IDs, daily). `load_threat_feeds` / `fetch_threat_feed` / `match_threat_feeds` / `classify_feed_reason` in `src/extension_intel.py`: malware-class reasons => known-bad (risk >= 85), adware/hijack => risk >= 70, other takedowns => >= 60. Worker re-scores newly listed fleet extensions in the same cycle. Edge IDs unknown to Edge's store fall back to the Chrome Web Store. AMO add-ons read MV + content scripts from the hash-verified signed XPI. Per-store coverage (`/api/extensions/status` -> `coverage`) makes a failing adapter visible without inspecting single extensions. |
+| 1. Preserve extension identity/fields at ingestion | `internal/ingest/ingest.go` `cleanSoftware` + `internal/extintel/identity.go` `DeriveExtensionIdentity` (additive `extension_key`, `kind`, `store`, `extension_id`, `browser`, per-host edge props `version/source/browser/installed_path/first_seen/last_seen`, vuln + signature summaries). MERGE key stays `name`. |
+| 2. Free/no-auth store-metadata adapters | `internal/extintel/stores.go` (Chrome Web Store listing RPC, update2 + CRX manifest for unlisted items, Edge product-details, AMO, Mozilla blocklist; host allowlist, size caps, offline degrades to local score) |
+| 3. Risk-scoring engine | `extintel.AnalyzeExtension` in `internal/extintel/score.go:386` (capability / trust / threat / exposure + name-anomaly + rarity + download rules; built-ins score 0; blocklist + ≥100k installs ⇒ ≥96) |
+| 4. Worker + API + UI | `internal/extworker/extworker.go` (flock leader, cached, status/trigger files `<CONFIG_DIR>/.extensions.{lock,trigger}`), `/api/extensions[...]` in `internal/api/workersapi/routes.go:38-41`, "Extensions" tab in `webviz/static/index.html` |
+| 5. Store-listing reputation (2026-10-27) | Chrome-family listing RPC (`FetchChromeListings`, `internal/extintel/stores.go:470`, replaced the detail-page scrape: users, rating, Featured, updated, developer email/website, EU trader, privacy disclosure, the "no history of violations" badge from `[0][8]` and `[0][15]` (both matched the badge on every listing probed)); Edge `activeInstallCount`/`isBadgedAsFeatured`/website/privacy URL; AMO `promoted`, `support_email`, homepage, privacy policy. Scoring: featured +5 trust, established publisher +10 trust, rating < 2.5 from ≥ 50 reviewers ⇒ `poor-public-reputation` threat 15. Abuse reports stay private on every store, so ratings and takedowns are the only public complaint signals. Opera (2026-10-28): addons.opera.com listing page (`details/app_id/<id>/`) and CRX, falling back to the Chrome Web Store. Safari (2026-10-28): Fleet reports no extension ID, so ingestion takes the containing app's bundle ID from the same host's `apps` row and the worker queries the iTunes lookup API (`itunes.apple.com/lookup?bundleId=`). |
+| 6. Open threat feeds + self-reported coverage (2026-10-27) | `config/extension_threat_feeds.json` (data file, no code change to add a feed; ships MalExt Sentry: store takedowns + Unit 42 / Socket / researcher reports, ~8k IDs, daily). `LoadThreatFeeds` / `FetchThreatFeed` / `MatchThreatFeeds` / `classifyFeedReason` in `internal/extintel/feeds.go`: malware-class reasons => known-bad (risk >= 85), adware/hijack => risk >= 70, other takedowns => >= 60. Worker re-scores newly listed fleet extensions in the same cycle. Edge IDs unknown to Edge's store fall back to the Chrome Web Store. AMO add-ons read MV + content scripts from the hash-verified signed XPI. Per-store coverage (`/api/extensions/status` -> `coverage`) makes a failing adapter visible without inspecting single extensions. |
 
 Runnable self-check (inside the container, so it uses the shipped code and env):
-`docker compose exec -T webviz python src/extension_intel.py`. Phase-1+ items below (policy
+`docker compose exec -T webviz fleethound selfcheck`. Phase-1+ items below (policy
 export, threat feeds with keys, static analysis) are intentionally NOT built yet.
 
 ---
 
 ## 1. Bottom line
 
-- Fleet already returns everything needed to identify an extension: `extension_id`, `browser`, `extension_for`, `vendor`, `generated_cpe`, `vulnerabilities`, `signature_information`, `installed_paths`, `display_name`. Ingestion keeps only `name`, `version`, `source` (`src/ingestion.py:468`). **The highest-value change is to stop dropping those fields.**
+- Fleet already returns everything needed to identify an extension: `extension_id`, `browser`, `extension_for`, `vendor`, `generated_cpe`, `vulnerabilities`, `signature_information`, `installed_paths`, `display_name`. Ingestion kept only `name`, `version`, `source` before Phase 0 (`cleanSoftware`, `internal/ingest/ingest.go:743`, now adds the extension fields). **The highest-value change is to stop dropping those fields.**
 - The missing primary key is the extension ID. Names are unreliable (some are filesystem paths), and the same 32-char ID can exist in both Chrome and Edge. Use `ext:<store>:<id>` as the canonical key; keep the human name for display.
 - Enrich in a separate worker, not inline in ETL. Store metadata is rate-limited and failure-prone; ETL is already the long pole.
 - Free sources cover identity, permissions, store status, blocklists, vulnerabilities, and reputation. No paid API is required. CRXcavator is dead; ExtensionTotal is now paid (Koidex/Koi); Chrome-Stats blocks automated access.
@@ -52,14 +52,14 @@ Fleet host payload (verified against the live API):
 }
 ```
 
-Ingestion (`src/ingestion.py:468`):
+Ingestion before Phase 0 kept only this base row. `cleanSoftware` still builds it (`internal/ingest/ingest.go:775-779`) and merges the extension fields on top for extensions (`:780-809`):
 
-```python
-cleaned_software.append({
-    "name": name_lc,
-    "version": s.get("version") or "unknown",
-    "source": (s.get("source") or "").strip(),
-})
+```go
+entry := map[string]any{
+	"name":    nameLC,
+	"version": pyjson.Or(s["version"], "unknown"),
+	"source":  source,
+}
 ```
 
 Consequences:
@@ -174,7 +174,7 @@ MATCH (s:Software)
 WHERE s.extension_id IS NOT NULL AND s.store IS NOT NULL
 SET s.software_key = 'ext:' + s.store + ':' + s.extension_id;
 
-// dedupe by software_key in Python (see 3.3), then:
+// dedupe by software_key in Go (see 3.3), then:
 DROP CONSTRAINT ON (s:Software) ASSERT s.name IS UNIQUE;
 CREATE CONSTRAINT ON (s:Software) ASSERT s.software_key IS UNIQUE;
 ```
@@ -186,9 +186,9 @@ CREATE CONSTRAINT ON (s:Software) ASSERT s.software_key IS UNIQUE;
 3. Re-key extension nodes to `ext:<store>:<id>`.
 4. Deduplicate: group by `software_key`; pick canonical (most edges, then oldest `first_seen`); redirect `INSTALLED_ON`; union `versions` / `sources`; copy best `display_name`; `DETACH DELETE` duplicates.
 5. Drop `UNIQUE(name)`; create `UNIQUE(software_key)`.
-6. Change MERGE in `_batch_create_software_grouped` to `software_key`.
+6. Change MERGE in `batchCreateSoftwareGrouped` to `software_key`.
 7. Change stale-rel delete from `NOT s.name IN ...` to `NOT s.software_key IN ...`.
-8. Gate `_dedupe_case_variant_software` to `software_key STARTS WITH 'name:'` — otherwise it will merge Chrome/Edge extensions that share a display name.
+8. Gate `dedupeCaseVariantSoftware` to `software_key STARTS WITH 'name:'` — otherwise it will merge Chrome/Edge extensions that share a display name.
 9. Update snapshot identity from `s.name` to `s.software_key` (snapshot format v2).
 10. Update the whitelist to store `software_key`; migrate existing entries to `name:<lower>`.
 
@@ -293,9 +293,9 @@ Fleet API ──> extractor ──> ingestion ──> Memgraph
 
 | File | Responsibility |
 |---|---|
-| `src/extension_intel.py` | Pure logic: store adapters, manifest analyzer, scoring, policy export. No Flask, no DB. Testable. |
-| `webviz/extension_worker.py` | Leader-elected background worker: fingerprint every extension, fetch only due listings, re-score changed ones, batch-write graph, cache/status. |
-| `webviz/app.py` | APIs: list/detail/decision/status/policy. |
+| `internal/extintel` | Pure logic: store adapters, manifest analyzer, scoring, policy export. No HTTP server, no DB. Testable. |
+| `internal/extworker` | Leader-elected background worker: fingerprint every extension, fetch only due listings, re-score changed ones, batch-write graph, cache/status. |
+| `internal/api/workersapi` | APIs: list/detail/decision/status/policy. |
 | `webviz/static/index.html` | "Extensions" tab. |
 | `config/extension_policy.json` | Generated policy + decisions. |
 | `config/extension_cache/` | Raw manifests + metadata (versioned). |
@@ -310,7 +310,7 @@ Why not inline in ingestion:
 
 ### 5.2 Worker loop
 
-1. Acquire `fcntl` lock (same pattern as `enrich_worker.py`).
+1. Acquire the flock on `<CONFIG_DIR>/.extensions.lock` (`workerutil.TryAcquireLock`, same pattern as the enricher).
 2. Load every extension identity in one query, grouped by `extension_key` (host counts, versions, installs, stored fingerprints).
 3. Per group, compute a fingerprint: sha1 over `SCORER_VERSION`, store, ID, sorted host versions, sorted (path, platform) installs, host count, whether it is rare in the fleet (< 3% of ≥ 10 hosts; not the raw fleet count, so an enrolment does not re-score everything), the ingestion-owned node fields the scorer reads (name, display name, vendor, builtin flag, installed paths, max CVSS, vulnerabilities), a digest of its blocklist match and threat-feed hits, the `known_publishers.json` content hash, and the cached listing. A failed fleet host count query skips the cycle.
 4. A store call is due only when: there is no cached listing; a host reports a version newer than the cached listing's that was not already reported at the last fetch (older or equal does not fetch, and a store that stays behind is not refetched every cycle); the extension has a new blocklist or threat-feed hit; or the listing is past its TTL.
@@ -324,7 +324,7 @@ Why not inline in ingestion:
 8. Write status: `queue_remaining` (work items left), and `last_cycle` with `due`, `scored`, `fetched` and `refresh_failed` per store, `cache_hits`, `unchanged_skipped`, `deferred`, `rate_limited_stores`. `/api/extensions*` reads `queue_remaining` from this file, not from a live query.
 9. Sleep; respect `EXTENSION_WORKER_INTERVAL_SEC` (default 6h).
 
-Cache tiers (JSON files under `EXTENSION_CACHE_DIR`, key prefix `v11`):
+Cache tiers (JSON files under `EXTENSION_CACHE_DIR`, key prefix `v14` for listings, `v13` for manifests):
 
 | Data | Key | TTL |
 |---|---|---|
@@ -424,10 +424,11 @@ A refetch that fails falls back to the last good listing, with the failure in `i
 
 **Composite:**
 
-```python
-risk = round(0.35 * cap + 0.25 * (100 - trust) + 0.25 * threat + 0.15 * exposure)
-if threat >= 80:
-    risk = max(risk, 85)
+```go
+risk := round(0.35*cap + 0.25*(100-trust) + 0.25*threat + 0.15*exposure)
+if threat >= 80 {
+	risk = max(risk, 85)
+}
 ```
 
 Bands:
@@ -561,7 +562,7 @@ Detail drawer:
 - Decision: allow/review/block + note + audit trail.
 - Impact: "blocking affects N hosts / M users".
 
-Reuse the existing Shadow IT table/filter patterns in `webviz/static/index.html`. Decisions use the same atomic temp+replace write pattern as `save_whitelist`. Decision endpoints inherit the existing LAN trust model; add authentication before exposing them beyond the LAN.
+Reuse the existing Shadow IT table/filter patterns in `webviz/static/index.html`. Decisions use the same atomic temp+replace write pattern as `Whitelist.Save` (`internal/app/app.go:143`). Decision endpoints inherit the existing LAN trust model; add authentication before exposing them beyond the LAN.
 
 ---
 
@@ -569,19 +570,19 @@ Reuse the existing Shadow IT table/filter patterns in `webviz/static/index.html`
 
 ### Phase 0 — Stop dropping data (1-2 days)
 
-- Preserve Fleet extension fields in `cleaned_software` (`src/ingestion.py:468`).
+- Preserve Fleet extension fields in `cleanSoftware` (`internal/ingest/ingest.go:743`).
 - Add `INSTALLED_ON` edge props (`version`, `source`, `browser`, `installed_path`, `first_seen`, `last_seen`).
 - Add `first_seen` on `:Software`.
-- Fix the whitelist lowercase bug (`webviz/app.py:2491`).
-- Delete dead `_batch_create_software` (`src/ingestion.py:671`).
+- Fix the whitelist lowercase bug (`NormalizeWhitelist`, `internal/httpx/validate.go:215`).
+- Delete the dead ungrouped software batch writer (gone; only `batchCreateSoftwareGrouped`, `internal/ingest/ingest.go:1257`, remains).
 - Snapshot: include `versions`.
 - Acceptance: `MATCH (s:Software) WHERE s.extension_id IS NOT NULL RETURN count(s)` > 0; edge props populated; no ETL slowdown.
 
 ### Phase 1 — Identity + store metadata (3-5 days)
 
-- `src/extension_intel.py` adapters: Chrome Web Store listing RPC, update2 + CRX for unlisted items, Edge detail JSON, AMO, Mozilla blocklist.
+- `internal/extintel` adapters: Chrome Web Store listing RPC, update2 + CRX for unlisted items, Edge detail JSON, AMO, Mozilla blocklist.
 - Manifest analyzer + capability/trust scoring.
-- `webviz/extension_worker.py` with fcntl lock, cache, status.
+- `internal/extworker` with flock lock, cache, status.
 - Schema migration to `software_key`; dedupe; constraint swap.
 - Acceptance: every browser extension has `store`, `extension_id`, `latest_version`, `permissions`, `risk_score`; worker runs < 2 min for 100 extensions; failures degrade gracefully.
 
@@ -631,13 +632,13 @@ Total: ~3-4 weeks for one engineer. Phase 0 is independent and safe.
 
 | Bug | Location | Fix |
 |---|---|---|
-| Whitelist stores raw case, graph names are lowercased → `NOT s.name IN $whitelist` misses `Obsidian Web Clipper` | `webviz/app.py:2491` | Lowercase on save and load; migrate existing entries |
-| OODA "shadow IT" proxy counts all software with ≤3 hosts, no source filter | `webviz/ooda_worker.py:245` | Add `s.sources` intersection with `SHADOW_IT_SOURCES` |
-| Enricher categorizes extensions via Wikipedia | `webviz/enrich_worker.py` `_pick_uncategorized` | Fixed: `coalesce(s.kind, '') <> 'browser_extension'` |
-| Snapshot omits `versions` and edge props | `src/snapshot.py:154` | Add `s.versions`; edge props in `INSTALLED_ON` lines |
-| Dead `_batch_create_software` duplicates grouped logic | `src/ingestion.py:671` | Delete |
-| Case-variant dedupe would merge same-named Chrome/Edge extensions | `src/ingestion.py:1418` | Gate to `software_key STARTS WITH 'name:'` |
-| Shadow IT risk level is only host count (`high` if 1 host) | `webviz/app.py` outlier block | Use `risk_score` once available |
+| Whitelist stores raw case, graph names are lowercased → `NOT s.name IN $whitelist` misses `Obsidian Web Clipper` | `internal/httpx/validate.go:215` `NormalizeWhitelist` | Fixed: entries lowercased on load; `Whitelist.Add` saves the normalized list |
+| OODA "shadow IT" proxy counts all software with ≤3 hosts, no source filter | `internal/ooda/ooda.go:166` `shadowITQuery` | Fixed: `s.sources` intersected with `catalog.ShadowITSourceList()`, per-platform threshold |
+| Enricher categorizes extensions via Wikipedia | `internal/enrich/enrich.go:52` `cypherPickUncategorized` | Fixed: `coalesce(s.kind, '') <> 'browser_extension'` |
+| Snapshot omits `versions` and edge props | `internal/snapshot/snapshot.go:84-96`, `:127-130` | `s.versions` added; edge props in `INSTALLED_ON` lines still missing |
+| Dead ungrouped software batch writer duplicated grouped logic | removed; only `internal/ingest/ingest.go:1257` `batchCreateSoftwareGrouped` | Fixed: deleted |
+| Case-variant dedupe would merge same-named Chrome/Edge extensions | `internal/ingest/ingest.go:508` `dedupeCaseVariantSoftware` | Gate to `software_key STARTS WITH 'name:'` |
+| Shadow IT risk level is only host count (`high` if 1 host) | `internal/api/shadowit/routes.go:519-533` outlier block | Fixed: the extension `risk_band` wins once scored |
 
 ---
 
@@ -653,4 +654,4 @@ Total: ~3-4 weeks for one engineer. Phase 0 is independent and safe.
 
 ## 13. Immediate next step
 
-Phase 0, one file: `src/ingestion.py`. Preserve the fields, add edge props, fix the whitelist lowercase bug. No schema migration, no worker, no UI. Ship it, verify on the live fleet, then start Phase 1.
+Phase 0, one file: `internal/ingest/ingest.go`. Preserve the fields, add edge props, fix the whitelist lowercase bug. No schema migration, no worker, no UI. Ship it, verify on the live fleet, then start Phase 1.
