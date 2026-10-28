@@ -182,25 +182,20 @@ if [[ -n "${WEBVIZ_API_TOKEN_VAL}" ]]; then
     info "Checking OODA supervisor..."
     ooda_json="$(curl -sS -H "Authorization: Bearer ${WEBVIZ_API_TOKEN_VAL}" \
                        "$BASE_URL/api/ooda/status" 2>/dev/null || true)"
-    if [[ -n "$ooda_json" ]] && command -v python3 &>/dev/null; then
-        printf '%s' "$ooda_json" | python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-except Exception:
-    sys.exit(0)
-state = "ENABLED" if d.get("enabled") else "DISABLED"
-running = "running" if d.get("running") else "idle"
-interval = d.get("interval_sec", "?")
-full_scan = d.get("full_scan_every", "?")
-total = d.get("cycles_total", 0)
-failed = d.get("cycles_failed", 0)
-print(
-    f"   OODA: {state}, leader={running}, "
-    f"interval={interval}s, full-scan-every={full_scan} cycles, "
-    f"cycles_total={total}, cycles_failed={failed}"
-)
-'
+    if [[ "$ooda_json" == \{* ]]; then
+        # shortcut: first-match scalar lookup, fine for these flat top-level keys
+        # (none recur under last_cycle); use jq if the status payload grows.
+        ooda_field() {
+            local m
+            m="$(printf '%s' "$ooda_json" | grep -o "\"$1\":[^,}]*" | head -n 1 || true)"
+            m="${m#*:}"
+            printf '%s' "${m:-$2}"
+        }
+        state=DISABLED; [[ "$(ooda_field enabled false)" == true ]] && state=ENABLED
+        running=idle; [[ "$(ooda_field running false)" == true ]] && running=running
+        echo "   OODA: ${state}, leader=${running}, interval=$(ooda_field interval_sec '?')s," \
+             "full-scan-every=$(ooda_field full_scan_every '?') cycles," \
+             "cycles_total=$(ooda_field cycles_total 0), cycles_failed=$(ooda_field cycles_failed 0)"
     fi
     ok "Stack reachable"
 fi
