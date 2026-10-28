@@ -16,7 +16,12 @@ logger = logging.getLogger(__name__)
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
 
-from src.extension_intel import derive_extension_identity, summarize_vulnerabilities
+from src.extension_intel import (derive_extension_identity, summarize_vulnerabilities,
+                                 with_safari_app)
+
+# Bump when the Fleet-row -> :Software identity rules change (2: Safari
+# extensions keyed by containing-app bundle ID).
+SOFTWARE_IDENTITY_VERSION = 2
 
 
 def _version_key(version) -> tuple:
@@ -484,7 +489,12 @@ class MemgraphIngestion:
                 # edges, or with a changed timestamp, falls through to full
                 # ingest. User rels + Host MERGE still run unconditionally
                 # above so seen_time, team_id, USES edges stay fresh.
-                fleet_sw_updated = host.get('software_updated_at')
+                # The watermark carries SOFTWARE_IDENTITY_VERSION: a change to
+                # how rows map to :Software nodes rebuilds every host once.
+                fleet_sw_raw = host.get('software_updated_at')
+                fleet_sw_updated = (f"{fleet_sw_raw}|{SOFTWARE_IDENTITY_VERSION}"
+                                    if fleet_sw_raw else None)
+                synced_raw = str(sw_synced_map.get(fleet_host_id) or '').split('|')[0] or None
                 skip_sw = (
                     bool(fleet_sw_updated)
                     and sw_synced_map.get(fleet_host_id) == fleet_sw_updated
@@ -493,8 +503,8 @@ class MemgraphIngestion:
                 if skip_sw:
                     skipped_unchanged_sw += 1
                 elif (isinstance(host.get('software'), list) and not host['software']
-                        and fleet_sw_updated
-                        and sw_synced_map.get(fleet_host_id) not in (None, fleet_sw_updated)):
+                        and fleet_sw_raw
+                        and synced_raw not in (None, fleet_sw_raw)):
                     # Fleet re-inventoried this host (timestamp moved) and now
                     # reports zero software: drop its stale INSTALLED_ON edges.
                     # An empty list without a timestamp change could be a
@@ -521,6 +531,18 @@ class MemgraphIngestion:
                         # (deferred — most names round-trip cleanly).
                         cleaned_software = []
                         seen_lower = set()
+                        # Safari extensions carry no ID; the App Store lists
+                        # their containing app, whose bundle ID and signing
+                        # team are on the same host's `apps` row at that path.
+                        safari_apps = {
+                            p: (s['bundle_identifier'], next(
+                                (i.get('team_identifier') for i in s.get('signature_information') or []
+                                 if isinstance(i, dict) and i.get('installed_path') == p
+                                 and i.get('team_identifier')), None))
+                            for s in software_list
+                            if s.get('source') == 'apps' and s.get('bundle_identifier')
+                            for p in (s.get('installed_paths') or [])
+                        }
                         for s in software_list:
                             raw = s.get('name')
                             if not raw:
@@ -531,6 +553,8 @@ class MemgraphIngestion:
                             # on the canonical key when present so two extensions
                             # that share a name aren't collapsed on one host.
                             ext = derive_extension_identity(s)
+                            if ext:
+                                ext = with_safari_app(ext, safari_apps)
                             dedupe_key = (ext or {}).get('extension_key') or name_lc
                             if not name_lc or dedupe_key in seen_lower:
                                 # Skip per-host duplicates that only differ in
@@ -1055,7 +1079,9 @@ class MemgraphIngestion:
                           s.vulnerabilities_json = sw.vulnerabilities_json,
                           s.vulnerability_count = sw.vulnerability_count,
                           s.max_cvss = sw.max_cvss,
-                          s.is_builtin = sw.is_builtin
+                          s.is_builtin = sw.is_builtin,
+                          s.app_bundle_id = sw.app_bundle_id,
+                          s.app_team_id = sw.app_team_id
             ON MATCH SET s.versions = CASE
                 WHEN s.versions IS NULL THEN [sw.version]
                 WHEN NOT sw.version IN s.versions THEN s.versions + [sw.version]
@@ -1084,7 +1110,9 @@ class MemgraphIngestion:
                 s.vulnerabilities_json = CASE WHEN sw.vulnerabilities_json IS NOT NULL THEN sw.vulnerabilities_json ELSE s.vulnerabilities_json END,
                 s.vulnerability_count = CASE WHEN sw.vulnerability_count IS NOT NULL THEN sw.vulnerability_count ELSE s.vulnerability_count END,
                 s.max_cvss = CASE WHEN sw.max_cvss IS NOT NULL THEN sw.max_cvss ELSE s.max_cvss END,
-                s.is_builtin = CASE WHEN sw.kind IS NOT NULL THEN sw.is_builtin ELSE s.is_builtin END
+                s.is_builtin = CASE WHEN sw.kind IS NOT NULL THEN sw.is_builtin ELSE s.is_builtin END,
+                s.app_bundle_id = CASE WHEN sw.app_bundle_id IS NOT NULL THEN sw.app_bundle_id ELSE s.app_bundle_id END,
+                s.app_team_id = CASE WHEN sw.kind IS NOT NULL THEN sw.app_team_id ELSE s.app_team_id END
         """
         # Chunked like the rel writes: one oversized UNWIND can exceed the
         # query timeout and then fail the same flush on every cycle.

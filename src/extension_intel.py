@@ -10,6 +10,10 @@ Sources used (all verified anonymous):
                                      only for items the listing RPC does not serve
   * Edge product-details JSON       (microsoftedge.microsoft.com)
   * Firefox AMO add-on API          (addons.mozilla.org)
+  * Opera add-ons listing page + CRX (addons.opera.com; no public API, the
+                                     listing HTML is parsed)
+  * Apple iTunes lookup API         (itunes.apple.com; Safari extensions, by
+                                     the containing app's bundle ID)
   * Mozilla add-on blocklist        (firefox.settings.services.mozilla.com)
 
 The module is deliberately defensive: a dead network or a changed store response
@@ -21,6 +25,7 @@ from __future__ import annotations
 import csv
 import functools
 import hashlib
+import html
 import io
 import json
 import logging
@@ -114,6 +119,33 @@ def _infer_extension_id(source: str, name: str, display_name: str,
         if source == "safari_extensions" and c.count(".") >= 2 and " " not in c:
             return c
     return ""
+
+
+# osquery reports only Safari extensions bundled in a top-level /Applications app.
+_SAFARI_APPEX_RE = re.compile(r"(/Applications/[^/]+\.app)/Contents/PlugIns/[^/]+\.appex/?")
+
+
+def safari_containing_app(path) -> str | None:
+    """`/Applications/X.app` for a Safari `.appex` path, else None."""
+    m = _SAFARI_APPEX_RE.fullmatch(_clean_str(path))
+    return m.group(1) if m else None
+
+
+def with_safari_app(ext: dict, apps: dict) -> dict:
+    """Bind a Safari extension to its containing app.
+
+    `apps`: {app path: (bundle ID, team ID or None)} from the same host's
+    Fleet `apps` rows. Safari extensions carry no ID, so when the app is known
+    the identity becomes `<app bundle ID>/<appex name>`: extensions of
+    different apps never share a node (and its App Store lookup).
+    """
+    path = ext.get("installed_path") or ""
+    bundle, team = apps.get(safari_containing_app(path)) or (None, None)
+    if ext.get("store") != "safari" or not bundle:
+        return ext
+    ext_id = f"{bundle}/{path.rstrip('/').rsplit('/', 1)[-1]}"
+    return {**ext, "extension_id": ext_id, "extension_key": f"ext:safari:{ext_id}".lower(),
+            "app_bundle_id": bundle, "app_team_id": team or None}
 
 
 def derive_extension_identity(software: dict) -> dict | None:
@@ -470,6 +502,8 @@ _FIREFOX_ROOTS = (
 
 
 def _store_path_re(store: str, extension_id: str):
+    if store == "safari":  # App Store or not, the extension lives in its app bundle
+        return _SAFARI_APPEX_RE
     eid = re.escape(extension_id)
     if store == "firefox":
         tail = rf"(?:{_FIREFOX_ROOTS})/[^/]+/extensions/{eid}\.xpi"
@@ -496,7 +530,8 @@ def store_install_verified(store, extension_id, installs) -> bool:
     profile directory still passes; osquery's from_webstore would close
     that, but Fleet's software inventory does not expose it.
     """
-    if not extension_id or not installs:
+    # Safari extensions carry no ID of their own (see safari_containing_app).
+    if (not extension_id and store != "safari") or not installs:
         return False
     pattern = _store_path_re(store, extension_id)
     verified = 0
@@ -516,7 +551,7 @@ def store_install_verified(store, extension_id, installs) -> bool:
 def publisher_is_reputable(*values) -> bool:
     """True when a store-sourced developer/publisher NAME is a known publisher.
 
-    Safari only; Chrome-family, Firefox and Edge trust is by store ID
+    Safari only (App Store seller name); Chrome-family, Firefox and Edge trust is by store ID
     (chrome_publisher_is_reputable / amo_author_is_reputable /
     edge_extension_is_reputable). Callers pass store fields only: Fleet's
     host-reported `vendor` is attacker-influenced. Normalized equality, not a
@@ -820,6 +855,10 @@ def _threat_score(meta: dict, record: dict, blocklist_entry: dict | None) -> tup
         threat = max(threat, 10)
         signals.append({"code": "unlisted", "weight": 10,
                         "detail": "unlisted or self-distributed extension"})
+    elif status == "off_store":
+        signals.append({"code": "not-in-app-store", "weight": 0,
+                        "detail": "containing app is not in the Mac App Store "
+                                  "(direct download or sideloaded)"})
 
     # Stores keep abuse reports private; a low rating from many reviewers is
     # the closest public complaint signal.
@@ -876,7 +915,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 9
+SCORER_VERSION = 10
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -957,10 +996,15 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         reputable = amo_author_is_reputable(meta.get("author_ids"))
     elif meta.get("store") == "edge":
         reputable = edge_extension_is_reputable(record.get("extension_id"), meta.get("status"))
+    elif meta.get("store") == "safari":
+        # The bundle ID is host-reported; an unsigned app can claim any. Seller
+        # trust needs the containing app signed with an Apple team ID.
+        reputable = publisher_is_reputable(meta.get("developer")) and bool(record.get("app_team_id"))
     else:
-        reputable = publisher_is_reputable(meta.get("developer"), meta.get("publisher"))
+        # Opera exposes only a developer username; names are display-only.
+        reputable = False
     sideload_signal = None
-    if reputable and meta.get("store") in ("chrome", "firefox", "edge"):
+    if reputable and meta.get("store") in ("chrome", "firefox", "edge", "safari"):
         if not store_install_verified(meta.get("store"), record.get("extension_id"),
                                       record.get("installs")):
             reputable = False
@@ -1131,6 +1175,8 @@ _CHROME_HOSTS = frozenset({
 _EDGE_HOSTS = frozenset({"microsoftedge.microsoft.com"})
 _AMO_HOSTS = frozenset({"addons.mozilla.org"})
 _MOZILLA_HOSTS = frozenset({"firefox.settings.services.mozilla.com"})
+_OPERA_HOSTS = frozenset({"addons.opera.com"})
+_APPLE_HOSTS = frozenset({"itunes.apple.com"})
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1810,6 +1856,177 @@ def _amo_package_manifest(meta: dict, file_info: dict, client: HttpClient) -> No
             meta[key] = value
 
 
+_OPERA_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,100}")
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def _html_text(fragment: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment or ""))).strip()
+
+
+def _opera_date(text: str) -> str | None:
+    """'Sept. 18, 2026' (the page's Django "N j, Y") as ISO, else None."""
+    m = re.fullmatch(r"([A-Za-z]+)\.?\s+(\d{1,2}),\s+(\d{4})", text)
+    month = _MONTHS.get(m.group(1)[:3].lower()) if m else None
+    try:
+        return datetime(int(m.group(3)), month, int(m.group(2)), tzinfo=timezone.utc).isoformat() \
+            if month else None
+    except ValueError:
+        return None
+
+
+def _opera_listing(extension_id: str, page: str) -> dict:
+    """Listing fields from an addons.opera.com detail page. Raises ValueError on drift."""
+    def meta_prop(name):
+        m = re.search(r'<meta property="%s" content="([^"]*)"' % re.escape(name), page)
+        return html.unescape(m.group(1)).strip() if m else ""
+
+    if meta_prop("aoc:app_id") != extension_id:
+        raise ValueError("listing page id does not match the request")
+    slug = meta_prop("aoc:slug")
+    if not _OPERA_SLUG_RE.fullmatch(slug):
+        raise ValueError("listing page has no valid slug")
+    out = {"status": "public", "slug": slug,
+           "url": f"https://addons.opera.com/en/extensions/details/{slug}/"}
+    name = meta_prop("og:title")
+    if name:
+        out["name"] = name
+    m = re.search(r'class="h-byline".*?developer=[^"]*"[^>]*>(.*?)</a>', page, re.S)
+    if m and _html_text(m.group(1)):
+        out["developer"] = _html_text(m.group(1))
+    m = re.search(r'id="rating-value">\s*([0-9.]+)\s*<', page)
+    if m and 0 <= float(m.group(1)) <= 5:
+        out["rating"] = round(float(m.group(1)), 1)
+    m = re.search(r'id="rating-count"[^>]*>\s*([0-9,]+)\s*<', page)  # related items repeat reviewCount
+    if m:
+        out["rating_count"] = int(m.group(1).replace(",", ""))
+    about = {_html_text(k): _html_text(v)
+             for k, v in re.findall(r"<dt>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>", page, re.S)}
+    if re.fullmatch(r"[0-9,]+", about.get("Downloads", "")):
+        out["users"] = int(about["Downloads"].replace(",", ""))  # total downloads, not active users
+    if about.get("Category"):
+        out["category"] = about["Category"]
+    if about.get("Version"):
+        out["version"] = about["Version"]
+    updated = _opera_date(about.get("Last update", ""))
+    if updated:
+        out["updated_at"] = updated
+    website = _http_url(about.get("Support page"))
+    if website:
+        out["developer_website"] = website
+    return out
+
+
+def fetch_opera_metadata(extension_id: str, *, client: HttpClient | None = None,
+                         manifest_for=None) -> dict:
+    """addons.opera.com has no API: `details/app_id/<id>/` redirects to the
+    listing page (404 for an ID the store does not list), and the CRX comes
+    from `download/<slug>/`."""
+    client = client or HttpClient()
+    if not _CHROME_EXTENSION_ID_RE.fullmatch(extension_id or ""):
+        return {"store": "opera", "status": "unknown", "error": "invalid opera extension id"}
+    meta = {"store": "opera", "status": "unknown"}
+    url = f"https://addons.opera.com/en/extensions/details/app_id/{extension_id}/"
+    status, headers, body, error = client.get(url, allowed_hosts=_OPERA_HOSTS, max_bytes=2_000_000)
+    if _mark_rate_limited(meta, status, headers):
+        return meta
+    if status == 404:
+        meta["status"] = "not_found"
+        meta["error"] = "Opera add-ons returned 404"
+        return meta
+    if status != 200 or not body:
+        meta["error"] = error or f"Opera add-ons HTTP {status}"
+        return meta
+    try:
+        meta.update(_opera_listing(extension_id, body.decode("utf-8", "replace")))
+    except ValueError as exc:
+        meta["error"] = f"Opera listing parse failed: {exc}"
+        return meta
+    cached = manifest_for(meta["version"]) if manifest_for and meta.get("version") else None
+    if cached:
+        meta.update(cached)
+        return meta
+    cstatus, cheaders, crx, cerr = client.get(
+        f"https://addons.opera.com/extensions/download/{meta['slug']}/",
+        allowed_hosts=_OPERA_HOSTS, max_bytes=50 * 1024 * 1024)
+    if _mark_rate_limited(meta, cstatus, cheaders):
+        return meta
+    if cstatus == 0 or cstatus >= 500:
+        # Transient (Opera resets bursts): an uncached "unknown" retries next
+        # cycle instead of caching a manifest_error for weeks.
+        return {"store": "opera", "status": "unknown", "error": f"Opera CRX: {cerr or cstatus}"}
+    if cstatus == 200 and cerr == "response too large":
+        meta["manifest_unavailable"] = "CRX exceeds 50 MB download cap"
+        return meta
+    if cstatus != 200 or not crx:
+        meta["manifest_error"] = cerr or f"CRX HTTP {cstatus}"
+        return meta
+    try:
+        manifest = _parse_crx(crx)
+    except ValueError as exc:
+        meta["manifest_error"] = str(exc)
+        return meta
+    for key, value in _manifest_fields({"manifest": manifest}).items():
+        # The listing's store name and version stay authoritative.
+        if value not in (None, [], "") and not meta.get(key):
+            meta[key] = value
+    return meta
+
+
+_BUNDLE_ID_RE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+def fetch_safari_metadata(bundle_id: str, *, client: HttpClient | None = None) -> dict:
+    """Mac App Store listing of the app that bundles a Safari extension.
+
+    `bundle_id` is the containing app's CFBundleIdentifier (Fleet `apps` row
+    at the extension's app path). The App Store serves no package, so the
+    manifest is never inspected. Residual: the bundle ID is host-reported, so
+    a non-App-Store app that claims a listed app's bundle ID inherits that
+    listing.
+    """
+    client = client or HttpClient()
+    bundle_id = _clean_str(bundle_id)
+    if len(bundle_id) > 255 or not _BUNDLE_ID_RE.fullmatch(bundle_id):
+        return {"store": "safari", "status": "unknown", "error": "invalid app bundle id"}
+    meta = {"store": "safari", "status": "unknown"}
+    url = ("https://itunes.apple.com/lookup?entity=macSoftware&bundleId="
+           + urllib.parse.quote(bundle_id, safe=""))
+    status, headers, body, error = client.get(url, allowed_hosts=_APPLE_HOSTS, max_bytes=1_000_000)
+    if _mark_rate_limited(meta, status, headers):
+        return meta
+    data = _json_loads(body) if body else None
+    if status != 200 or not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        meta["error"] = error or f"iTunes lookup HTTP {status}"
+        return meta
+    app = next((r for r in data["results"] if isinstance(r, dict)
+                and _clean_str(r.get("bundleId")).lower() == bundle_id.lower()), None)
+    if app is None:
+        # Developer ID (notarized) distribution outside the App Store is a normal
+        # Safari channel, unlike an off-store Chrome item: not "not_found".
+        meta["status"] = "off_store"
+        return meta
+    rating_count = _as_int(app.get("userRatingCount")) or 0
+    rating = _as_float(app.get("averageUserRating"))
+    meta.update({
+        "status": "public",
+        "name": _clean_str(app.get("trackName")) or None,
+        "version": _clean_str(app.get("version")) or None,
+        "developer": _clean_str(app.get("sellerName")) or _clean_str(app.get("artistName")) or None,
+        # The lookup reports 0 for "no ratings"; only a counted rating means anything.
+        "rating": rating if rating_count > 0 and rating is not None and 0 <= rating <= 5 else None,
+        "rating_count": rating_count or None,
+        "category": _clean_str(app.get("primaryGenreName")) or None,
+        "updated_at": _clean_str(app.get("currentVersionReleaseDate")) or None,
+        "created_at": _clean_str(app.get("releaseDate")) or None,
+        "url": _http_url(app.get("trackViewUrl")),
+        "developer_website": _http_url(app.get("sellerUrl")),
+        "manifest_unavailable": "the App Store serves no inspectable extension package",
+    })
+    return meta
+
+
 def fetch_store_metadata(store: str, extension_id: str, *,
                          client: HttpClient | None = None, manifest_for=None) -> dict:
     """Dispatch to the anonymous adapter for `store`. Never raises.
@@ -1821,8 +2038,23 @@ def fetch_store_metadata(store: str, extension_id: str, *,
     if not extension_id:
         return {"store": store, "status": "unknown", "error": "missing extension id"}
     try:
-        if store in ("chrome", "brave", "opera", "vivaldi", "chromium"):
+        if store in ("chrome", "brave", "vivaldi", "chromium"):
             return fetch_chrome_metadata(extension_id, client=client, manifest_for=manifest_for)
+        if store == "opera":
+            meta = fetch_opera_metadata(extension_id, client=client, manifest_for=manifest_for)
+            # Opera also installs from the Chrome Web Store ("Install Chrome
+            # Extensions"), so any Opera miss or failure asks the CWS; a CWS
+            # miss or failure keeps Opera's own answer.
+            if meta.get("status") != "public" and not meta.get("rate_limited"):
+                chrome = fetch_chrome_metadata(extension_id, client=client,
+                                               manifest_for=manifest_for)
+                if chrome.get("status") not in ("not_found", "unknown"):
+                    chrome["resolved_from"] = "opera"
+                    return chrome
+            return meta
+        if store == "safari":
+            # `extension_id` here is the containing app's bundle ID (the worker's lookup ID).
+            return fetch_safari_metadata(extension_id, client=client)
         if store == "edge":
             meta = fetch_edge_metadata(extension_id, client=client)
             # Edge installs from the Chrome Web Store too; an ID Edge's store
@@ -2418,6 +2650,54 @@ def _self_check() -> None:
     os.utime(tmp.name, (os.path.getmtime(tmp.name) + 5,) * 2)
     assert publisher_is_reputable("Late Addition Inc")
     assert not publisher_is_reputable("Totally Not 1Password Devs")
+    # Safari: the App Store lists the containing app, looked up by its bundle ID.
+    assert safari_containing_app("/Applications/Wipr.app/Contents/PlugIns/Wipr Extra.appex") == \
+        "/Applications/Wipr.app"
+    assert safari_containing_app("/Users/a/Applications/X.app/Contents/PlugIns/X.appex") is None
+
+    class _Itunes:
+        def __init__(self, results, status=200):
+            self.results, self.status, self.urls = results, status, []
+
+        def get(self, url, **_):
+            self.urls.append(url)
+            return self.status, {}, json.dumps({"resultCount": len(self.results),
+                                                "results": self.results}).encode(), None
+    app = {"bundleId": "com.1password.safari", "trackName": "1Password for Safari",
+           "sellerName": "AgileBits Inc.", "version": "8.12.42", "averageUserRating": 0,
+           "userRatingCount": 0, "currentVersionReleaseDate": "2026-10-22T16:41:31Z",
+           "primaryGenreName": "Utilities", "sellerUrl": "https://1password.com",
+           "trackViewUrl": "https://apps.apple.com/us/app/id1569813296?mt=12"}
+    itunes = _Itunes([app])
+    sm = fetch_store_metadata("safari", "com.1password.safari", client=itunes)
+    assert sm["status"] == "public" and sm["developer"] == "AgileBits Inc." and sm["rating"] is None, sm
+    assert "bundleId=com.1password.safari" in itunes.urls[0] and sm["manifest_unavailable"], itunes.urls
+    other = fetch_safari_metadata("com.evil.app", client=_Itunes([app]))      # answer for another app
+    assert other["status"] == "off_store", other
+    off = analyze_extension({"store": "safari", "name": "x", "host_count": 2, "store_meta": other})
+    assert off["threat_score"] == 0 and any(s["code"] == "not-in-app-store" for s in off["risk_signals"])
+    apps = {"/Applications/W.app": ("site.w", "TEAM1")}
+    ext = derive_extension_identity({"source": "safari_extensions", "name": "Wipr Extra",
+                                     "installed_paths": ["/Applications/W.app/Contents/PlugIns/X.appex"]})
+    bound = with_safari_app(ext, apps)
+    assert bound["extension_key"] == "ext:safari:site.w/x.appex" and bound["app_team_id"] == "TEAM1", bound
+    assert with_safari_app(ext, {}) == ext
+    assert fetch_safari_metadata("../x", client=_Itunes([app]))["error"] == "invalid app bundle id"
+    assert fetch_safari_metadata("com.a.b", client=_Itunes([], status=500))["status"] == "unknown"
+    appex = "/Applications/1Password for Safari.app/Contents/PlugIns/1Password.appex"
+    sr = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
+                            "installs": [{"path": appex, "platform": "darwin"}], "store_meta": sm})
+    assert sr["publisher_reputable"] and sr["store_status"] == "public", sr
+    assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,   # unsigned app
+                                  "installs": [{"path": appex, "platform": "darwin"}],
+                                  "store_meta": sm})["publisher_reputable"]
+    assert any(s["code"] == "manifest-uninspected" for s in sr["risk_signals"]), sr
+    moved = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "T",
+                               "installs": [{"path": "/tmp/1Password.appex", "platform": "darwin"}],
+                               "store_meta": sm})
+    assert not moved["publisher_reputable"] and any(
+        s["code"] == "not-store-install" for s in moved["risk_signals"]), moved
+
     os.unlink(tmp.name)
 
     # Chrome listing RPC: envelopes map by tag, null payload = not served,
@@ -2729,6 +3009,62 @@ def _self_check() -> None:
     assert trust == -sum(s["weight"] for s in tsig) == 38, (trust, tsig)
     utrust, usig = _trust_score({"status": "unlisted"}, {}, reputable=False)
     assert utrust == -sum(s["weight"] for s in usig) == 5, (utrust, usig)
+    # Opera: addons.opera.com first (HTML listing + CRX), then the Chrome Web Store.
+    oid = "k" * 32
+    page = (f'<meta property="aoc:app_id" content="{oid}" /><meta property="aoc:slug" content="ublock" />'
+            '<meta property="og:title" content="uBlock Origin" /><h2 class="h-byline" itemprop="brand">'
+            'by <a href="/en/search/?developer=gorhill" itemprop="name">gorhill</a></h2>'
+            '<span class="rating" id="rating-value">4.8</span>'
+            '<span id="rating-count" itemprop="reviewCount">5,530</span>'
+            '<span class="total" itemprop="reviewCount">319</span>'
+            '<dt>Downloads</dt><dd>15,508,453</dd><dt>Category</dt><dd><a href="/c/">Privacy &amp; '
+            'Security</a></dd><dt>Version</dt><dd>1.75.0</dd><dt>Last update</dt><dd>Sept. 18, 2026</dd>')
+    ocrx = _zip({"manifest.json": json.dumps({"manifest_version": 3, "name": "__MSG_n__",
+                                              "permissions": ["cookies"]})})
+
+    class _Opera:
+        def __init__(self, page, status=200):
+            self.page, self.status, self.urls = page, status, []
+
+        def get(self, url, **_):
+            self.urls.append(url)
+            if "/download/" in url:
+                return 200, {}, ocrx, None
+            return self.status, {}, self.page.encode(), None
+    class _OperaCrxDown(_Opera):
+        def get(self, url, **_):
+            if "/download/" in url:
+                return 0, {}, b"", "Connection reset by peer"
+            return super().get(url)
+    down_o = fetch_opera_metadata(oid, client=_OperaCrxDown(page))
+    assert down_o["status"] == "unknown" and down_o["error"], down_o   # not cached
+    om = fetch_store_metadata("opera", oid, client=_Opera(page))
+    assert (om["store"], om["status"], om["developer"], om["users"], om["rating_count"]) == \
+        ("opera", "public", "gorhill", 15_508_453, 5_530), om
+    assert om["name"] == "uBlock Origin" and om["manifest_version"] == 3 and om["permissions"] == ["cookies"], om
+    assert om["updated_at"].startswith("2026-09-18") and om["category"] == "Privacy & Security", om
+    assert om["url"] == "https://addons.opera.com/en/extensions/details/ublock/", om
+    cached_o = _Opera(page)
+    fetch_opera_metadata(oid, client=cached_o, manifest_for=lambda v: {"manifest_version": 2})
+    assert not any("/download/" in u for u in cached_o.urls), cached_o.urls  # cached version: no CRX
+    wrong = fetch_opera_metadata(oid, client=_Opera(page.replace(oid, "j" * 32)))
+    assert wrong["status"] == "unknown" and "does not match" in wrong["error"], wrong
+    assert not analyze_extension({"store": "opera", "extension_id": oid, "name": "x", "host_count": 1,
+                                  "store_meta": {**om, "developer": "AgileBits"}})["publisher_reputable"]
+
+    class _OperaMiss(_Opera):
+        def post(self, url, form, **_):
+            return 200, {}, _rpc_body(("1", _cws_payload(oid))), None
+    ovia = fetch_store_metadata("opera", oid, client=_OperaMiss("", status=404))
+    assert ovia["store"] == "chrome" and ovia["resolved_from"] == "opera", ovia
+    class _Unknown(_NoUpdate):
+        def get(self, url, **_):
+            if "update2" in url:
+                return 200, {}, (b'<gupdate xmlns="http://www.google.com/update2/response"><app>'
+                                 b'<updatecheck status="error-unknownApplication"/></app></gupdate>'), None
+            return 404, {}, b"", None
+    onone = fetch_store_metadata("opera", oid, client=_Unknown())
+    assert onone["store"] == "opera" and onone["status"] == "not_found", onone
     print("extension_intel self-check: OK")
 
 

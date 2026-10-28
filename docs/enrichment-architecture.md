@@ -166,8 +166,8 @@ The fingerprint (`webviz/extension_worker.py:342-354`) is a hash of the scoring 
 
 | Store | Listing cache TTL | Where |
 |---|---|---|
-| chrome, brave, opera, vivaldi, chromium | 7 d | `webviz/extension_worker.py:89` |
-| edge, firefox | 21 d plus a per-ID jitter of up to 7 d | `webviz/extension_worker.py:90-91`, `:263-268` |
+| chrome, brave, vivaldi, chromium | 7 d | `webviz/extension_worker.py:89` |
+| edge, firefox, opera, safari | 21 d plus a per-ID jitter of up to 7 d | `webviz/extension_worker.py:90-91`, `:263-268` |
 | manifest (per store, ID and version) | never expires | `webviz/extension_worker.py:499` |
 | threat feeds, Mozilla blocklist | 6 h, then a conditional GET (see 1.9) | `webviz/extension_worker.py:92` |
 
@@ -216,6 +216,8 @@ All store adapters use `HttpClient` (`src/extension_intel.py:1148`). The client 
 | Edge hosts | microsoftedge.microsoft.com | `src/extension_intel.py:1131` |
 | AMO hosts | addons.mozilla.org | `src/extension_intel.py:1132` |
 | Mozilla hosts | firefox.settings.services.mozilla.com | `src/extension_intel.py:1133` |
+| Opera hosts | addons.opera.com | `_OPERA_HOSTS` |
+| Apple hosts | itunes.apple.com | `_APPLE_HOSTS` |
 | Rate-limit mark | HTTP 429, or HTTP 503 with a `Retry-After` header, sets `meta["rate_limited"] = True` | `src/extension_intel.py:1211-1221` |
 
 CAUTION: An HTTP 4xx or 5xx response returns `error = None` (`:1187`). Every caller must test the status code itself.
@@ -290,18 +292,51 @@ CAUTION: An HTTP 4xx or 5xx response returns `error = None` (`:1187`). Every cal
 | Failure behaviour | HTTP 401: status `unlisted`. HTTP 404: status `not_found`. XPI `sha256:` hash mismatch: `manifest_error` and no parse. Unknown AMO status strings default to `public` (`:1720-1721`). |
 | Limitation | A 401 returns no fields except the status (`:1690-1693`), so unlisted Firefox add-ons have no permissions or publisher. `users` mixes `average_daily_users` and `weekly_downloads` (`:1749`). |
 
+### 1.7a Store adapter: Opera add-ons
+
+`fetch_opera_metadata` (`src/extension_intel.py`). addons.opera.com has no public API, so the adapter reads the listing page.
+
+| Field | Value |
+|---|---|
+| URL | `https://addons.opera.com/en/extensions/details/app_id/{extension_id}/` (302 to the slug page, 404 when unlisted), then GET `https://addons.opera.com/extensions/download/{slug}/` for the CRX |
+| Method | GET |
+| Request | Path parameter (32-char Chromium ID, validated) |
+| Response fields used | `<meta property="aoc:app_id">` (must equal the requested ID, else the page is rejected), `aoc:slug`, `og:title`, the `h-byline` developer link, `#rating-value`, `#rating-count`, and the About table: Downloads, Category, Version, Last update, Support page. The CRX manifest supplies permissions, host permissions, content scripts and manifest version. |
+| Auth | none |
+| Byte cap | page 2,000,000 B; CRX 50 MiB |
+| Cache TTL | 21 to 28 d; manifest never expires |
+| Failure behaviour | Any non-public, non-rate-limited Opera answer (404, transport error, page drift) asks the Chrome Web Store (Opera installs CWS items too); a CWS answer other than `not_found`/`unknown` is returned with `resolved_from: "opera"`, else Opera's own answer stands. HTTP 404: `not_found`. Page drift: `error`, not cached. CRX transport error or 5xx: status `unknown`, not cached. Other CRX failure: `manifest_error`. A cached CWS-only answer from before this adapter is refetched once. |
+| Limitation | `users` is total downloads, not active users. Opera shows only a developer username, so Opera gets no publisher trust. The CRX has no published hash to verify. |
+
+### 1.7b Store adapter: Mac App Store (Safari)
+
+`fetch_safari_metadata` (`src/extension_intel.py`). Fleet reports Safari extensions with an empty `extension_id`; osquery only finds them inside a top-level `/Applications/<App>.app/Contents/PlugIns/*.appex`. Ingestion maps that path to the containing app and reads the same host's Fleet `apps` row at that app path (`with_safari_app`, `src/ingestion.py`). When found, the identity becomes `ext:safari:<app bundle ID>/<appex name>`, so extensions of different apps never share a node, and the node gets `app_bundle_id` and `app_team_id` (the app's code-signing team from `signature_information`). Without an `apps` row the old name/path key stays and no lookup runs. The worker asks the App Store about that bundle ID (`_lookup_id`, `webviz/extension_worker.py`).
+
+| Field | Value |
+|---|---|
+| URL | `https://itunes.apple.com/lookup?entity=macSoftware&bundleId={app_bundle_id}` |
+| Method | GET |
+| Request | Query parameter (bundle ID, validated as dotted `[A-Za-z0-9-]` segments, at most 255 chars) |
+| Response fields used | `results[].bundleId` (must equal the request), `trackName`, `version`, `sellerName`/`artistName`, `averageUserRating` and `userRatingCount` (only when the count is above 0), `primaryGenreName`, `currentVersionReleaseDate`, `releaseDate`, `trackViewUrl`, `sellerUrl` |
+| Auth | none |
+| Byte cap | 1,000,000 B |
+| Cache TTL | 21 to 28 d (one listing per containing app) |
+| Failure behaviour | No matching result: status `off_store` (Developer ID or sideloaded app): no threat points, an informational `not-in-app-store` signal. Non-200: `error`, not cached. Every listed result sets `manifest_unavailable` because the App Store serves no package. |
+| Trust | Seller name against `match_names` in `config/known_publishers.json`, only when the containing app is signed with an Apple team ID and every install path is an `.appex` inside a top-level `/Applications` app. |
+| Limitation | The bundle ID is host-reported (the app's `Info.plist`): a Developer-ID-signed app that claims a listed app's bundle ID inherits that listing; the team ID is not yet matched to the publisher. The lookup uses the US storefront, so an app sold only elsewhere reads as `not_found`. An extension whose app has no Fleet `apps` row gets no lookup. |
+
 ### 1.8 Store dispatch
 
 `fetch_store_metadata` (`src/extension_intel.py:1813`) routes by store name.
 
 | Store | Adapter |
 |---|---|
-| chrome, brave, opera, vivaldi, chromium | `fetch_chrome_metadata` (`:1824`) |
-| edge | `fetch_edge_metadata`, then Chrome on `not_found` (`:1830`) |
+| chrome, brave, vivaldi, chromium | `fetch_chrome_metadata` |
+| opera | `fetch_opera_metadata`, then Chrome on `not_found` |
+| edge | `fetch_edge_metadata`, then Chrome on `not_found` |
 | firefox | `fetch_amo_metadata` |
-| safari and any other value | No adapter. Result `{"status": "unknown", "error": "no anonymous metadata adapter for store '<store>'"}` (`:1841-1842`) |
-
-NOTE: Safari has no store lookup. Fleet reports no bundle ID that the App Store can resolve.
+| safari | `fetch_safari_metadata`, called with the containing app's bundle ID |
+| any other value | No adapter. Result `{"status": "unknown", "error": "no anonymous metadata adapter for store '<store>'"}` |
 
 ### 1.9 Mozilla blocklist
 
@@ -754,7 +789,7 @@ NOTE: The enrichment taxonomy emits `Remote Access`, `Cloud Storage`, `Communica
 | L25 | Edge interpolates the ID into the URL without the `[a-p]{32}` check. | `src/extension_intel.py:1632` | An invalid ID reaches the Edge API. |
 | L26 | Edge falls back to Chrome only on `not_found`. | `src/extension_intel.py:1830` | An Edge error or rate limit does not fall back. |
 | L27 | AMO 401 returns status only. | `src/extension_intel.py:1690-1693` | Unlisted Firefox add-ons have no permissions, publisher or package. |
-| L28 | Safari has no adapter. Opera, Brave and Vivaldi route to the Chrome Web Store only. | `src/extension_intel.py:1824`, `:1841-1842` | Opera's own add-on site is never queried. Safari trust comes only from name matching. |
+| L28 | Brave and Vivaldi route to the Chrome Web Store only. Safari is looked up by the containing app's host-reported bundle ID. | `fetch_store_metadata`, `fetch_safari_metadata` | A spoofed bundle ID inherits another app's App Store listing. Safari trust comes only from seller-name matching. |
 | L30 | A missing blocklist with no cached copy aborts the whole cycle. | `webviz/extension_worker.py:719` | Chrome and Edge scoring also stop, although the blocklist covers Firefox GUIDs. |
 | L31 | Only one threat feed exists, chromium only. | `config/extension_threat_feeds.json:14-27` | Firefox has no feed coverage. |
 | L33 | The code cuts JSON scalars at 20,000 characters after `json.dumps`. | `src/extension_intel.py:2166`, `:2171` | A long payload can become invalid JSON in the graph. `vulnerability_count` counts all entries while the JSON holds at most 50. |
