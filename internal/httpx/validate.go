@@ -53,6 +53,11 @@ func ValidateUserRegex(pattern string) (string, bool) {
 			return "regex pattern rejected for safety (potential ReDoS)", false
 		}
 	}
+	if leadingBracketClass(pattern) {
+		// Python reads []a] / [^]a] as one class; Memgraph's ECMAScript engine
+		// reads [] as empty and [^] as any-char. Reject so both parsers agree.
+		return "regex pattern rejected: '[]' or '[^]' at the start of a class is ambiguous; escape it as '\\]'", false
+	}
 	if repeatedAmbiguousGroup(pattern) {
 		return "regex pattern rejected for safety (potential ReDoS)", false
 	}
@@ -109,6 +114,26 @@ func repeatedAmbiguousGroup(p string) bool {
 }
 
 // classEnd returns the index of the ']' closing the class opened at p[i].
+// leadingBracketClass reports an unescaped class opening as "[]" or "[^]".
+func leadingBracketClass(p string) bool {
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '\\':
+			i++
+		case '[':
+			j := i + 1
+			if j < len(p) && p[j] == '^' {
+				j++
+			}
+			if j < len(p) && p[j] == ']' {
+				return true
+			}
+			i = classEnd(p, i)
+		}
+	}
+	return false
+}
+
 func classEnd(p string, i int) int {
 	j := i + 1
 	if j < len(p) && p[j] == '^' {
