@@ -85,7 +85,8 @@ STATUS_PATH_DEFAULT = "/app/config/extension_status.json"
 CACHE_DIR_DEFAULT = "/app/config/extension_cache"
 
 # Chrome-family listings come from one batched RPC, so a weekly refresh is
-# cheap and doubles as the takedown check. Edge/AMO are one call per item.
+# cheap and doubles as the takedown check. Edge/AMO/Opera/App Store are one
+# call per item.
 LISTING_TTL_CHROME_SEC = 7 * 24 * 60 * 60
 LISTING_TTL_MIN_SEC = 21 * 24 * 60 * 60
 LISTING_TTL_JITTER_SEC = 7 * 24 * 60 * 60
@@ -94,8 +95,10 @@ REFRESH_INTERVAL_SEC = 6 * 60 * 60
 
 _EXT_WHERE = "(s.kind = 'browser_extension' OR s.extension_key STARTS WITH 'ext:')"
 
-_CHROME_FAMILY = CHROMIUM_STORES - {"edge"}
-_ADAPTER_STORES = CHROMIUM_STORES | {"firefox"}
+# Stores answered by the batched Chrome Web Store RPC. Edge and Opera have
+# their own store first (fetch_store_metadata falls back to the CWS).
+_CHROME_FAMILY = CHROMIUM_STORES - {"edge", "opera"}
+_ADAPTER_STORES = CHROMIUM_STORES | {"firefox", "safari"}
 # Package-derived fields of one immutable version, cached forever.
 _MANIFEST_FIELDS = ("manifest_version", "permissions", "optional_permissions",
                     "host_permissions", "content_script_matches", "update_url",
@@ -226,6 +229,14 @@ LISTING_KEY_VERSION = "v12"
 MANIFEST_KEY_VERSION = "v11"
 
 
+def _lookup_id(record: dict) -> str:
+    """The ID the store is asked about: Safari lists the containing app (by
+    bundle ID), never the extension; every other store lists the extension."""
+    if str(record.get("store") or "").lower() == "safari":
+        return record.get("app_bundle_id") or ""
+    return record.get("extension_id") or ""
+
+
 def _listing_key(store: str, extension_id: str) -> str:
     return f"{LISTING_KEY_VERSION}:listing:{store}:{extension_id}"
 
@@ -351,14 +362,15 @@ def _fingerprint(record: dict, *, total_hosts: int, threat_digest: str,
                     # Ingestion-owned node fields the scorer reads.
                     record.get("name"), record.get("display_name"), record.get("vendor"),
                     bool(record.get("is_builtin")), record.get("installed_paths"),
-                    record.get("max_cvss"), record.get("vulnerabilities")])
+                    record.get("max_cvss"), record.get("vulnerabilities"),
+                    record.get("app_bundle_id"), record.get("app_team_id")])
 
 
 def _with_listing(fingerprint: str, record: dict, cache_dir: str) -> str:
     """Fold the cached listing in, so a refreshed listing that never reached the
     graph (failed write, restart) still differs from the node next cycle."""
     store = str(record.get("store") or "").lower()
-    extension_id = record.get("extension_id") or ""
+    extension_id = _lookup_id(record)
     cached = (_cache_get(cache_dir, _listing_key(store, extension_id), float("inf"))
               if extension_id and store in _ADAPTER_STORES else None)
     return _digest([fingerprint, cached])
@@ -369,7 +381,7 @@ def _listing_due(record: dict, cache_dir: str, *, new_hit: bool) -> bool:
     a newer version than the listing that was not already seen at the last
     fetch, a new blocklist/feed hit, or TTL expiry."""
     store = str(record.get("store") or "").lower()
-    extension_id = record.get("extension_id") or ""
+    extension_id = _lookup_id(record)
     if record.get("is_builtin") or not extension_id or store not in _ADAPTER_STORES:
         return False
     key = _listing_key(store, extension_id)
@@ -377,6 +389,8 @@ def _listing_due(record: dict, cache_dir: str, *, new_hit: bool) -> bool:
     age = _cache_age(cache_dir, key)
     if cached is None or age is None or new_hit or age > _listing_ttl(store, extension_id):
         return True
+    if store == "opera" and "opera" not in (cached.get("store"), cached.get("resolved_from")):
+        return True  # cached before Opera had its own adapter (CWS-only answer)
     latest = cached.get("version")
     # A store that stays behind (dev build, lagging listing) must not be refetched every cycle.
     seen = set(cached.get("host_versions") or [])
@@ -418,7 +432,7 @@ class _StoreBreaker:
     """
 
     # Chromium-family stores share the Chrome update2 endpoint.
-    _ENDPOINT = {"brave": "chrome", "opera": "chrome", "vivaldi": "chrome", "chromium": "chrome"}
+    _ENDPOINT = {"brave": "chrome", "vivaldi": "chrome", "chromium": "chrome"}
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -459,9 +473,11 @@ def _listing_for(record: dict, cache_dir: str, *, due: bool, breaker: _StoreBrea
     store = str(record.get("store") or "unknown").lower()
     if record.get("is_builtin"):
         return {"store": store, "status": "builtin"}, "local"
-    extension_id = record.get("extension_id")
+    extension_id = _lookup_id(record)
     if not extension_id:
-        return {"store": store, "status": "unknown", "error": "missing extension id"}, "local"
+        error = ("containing app has no bundle ID in Fleet" if store == "safari"
+                 else "missing extension id")
+        return {"store": store, "status": "unknown", "error": error}, "local"
     if store not in _ADAPTER_STORES:
         return {"store": store, "status": "unknown",
                 "error": f"no anonymous metadata adapter for store '{store}'"}, "local"
@@ -492,7 +508,11 @@ def _listing_for(record: dict, cache_dir: str, *, due: bool, breaker: _StoreBrea
         return ({**cached, "error": deferred["error"]}, "stale") if cached is not None \
             else (meta, "deferred")
     if meta.get("status") != "unknown" or not meta.get("error"):
-        _cache_set(cache_dir, key, {**meta, "host_versions": list(record.get("versions") or [])})
+        # Safari extensions of one app share its listing: merge their seen
+        # versions while the listed version is unchanged.
+        seen = set(cached.get("host_versions") or []) \
+            if cached and cached.get("version") == meta.get("version") else set()
+        _cache_set(cache_dir, key, {**meta, "host_versions": sorted(seen | set(record.get("versions") or []))})
         version = _clean_version(meta.get("version"))
         if version and meta.get("manifest_version") and not (
                 meta.get("manifest_error") or meta.get("manifest_unavailable")):
