@@ -116,7 +116,9 @@ def _infer_extension_id(source: str, name: str, display_name: str,
                 return m.group(1).lower()
         if source == "firefox_addons" and _FIREFOX_GUID_RE.match(c):
             return c
-        if source == "safari_extensions" and c.count(".") >= 2 and " " not in c:
+        # "@" is reserved for keys bound to a signing team (with_safari_app):
+        # a host-reported name must never collide with one.
+        if source == "safari_extensions" and c.count(".") >= 2 and " " not in c and "@" not in c:
             return c
     return ""
 
@@ -935,7 +937,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 10
+SCORER_VERSION = 11
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -1017,8 +1019,11 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     elif meta.get("store") == "edge":
         reputable = edge_extension_is_reputable(record.get("extension_id"), meta.get("status"))
     elif meta.get("store") == "safari":
-        # The bundle ID and seller are claimable by any app; the signing team is not.
-        reputable = apple_team_is_reputable(record.get("app_team_id"))
+        # The bundle ID and seller are claimable by any app; the signing team is
+        # not. Fail closed unless the key itself was bound to that team.
+        team = _clean_str(record.get("app_team_id"))
+        reputable = apple_team_is_reputable(team) and \
+            _clean_str(record.get("extension_id")).lower().endswith("@" + team.lower())
     else:
         # Opera exposes only a developer username; names are display-only.
         reputable = False
@@ -2706,7 +2711,15 @@ def _self_check() -> None:
     assert fetch_safari_metadata("../x", client=_Itunes([app]))["error"] == "invalid app bundle id"
     assert fetch_safari_metadata("com.a.b", client=_Itunes([], status=500))["status"] == "unknown"
     appex = "/Applications/1Password for Safari.app/Contents/PlugIns/1Password.appex"
+    forged = derive_extension_identity({"source": "safari_extensions",
+                                        "name": "com.1password.safari/1password.appex@2BUA8C4S2C"})
+    assert "@" not in forged["extension_key"], forged                      # cannot reach a team key
+    assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,  # stale/unbound key
+                                  "app_team_id": "2BUA8C4S2C", "extension_id": "com.1password.safari/1password.appex",
+                                  "installs": [{"path": appex, "platform": "darwin"}],
+                                  "store_meta": sm})["publisher_reputable"]
     sr = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
+                            "extension_id": "com.1password.safari/1password.appex@2BUA8C4S2C",
                             "installs": [{"path": appex, "platform": "darwin"}], "store_meta": sm})
     assert sr["publisher_reputable"] and sr["store_status"] == "public", sr
     assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,   # seller name alone
@@ -2718,6 +2731,7 @@ def _self_check() -> None:
                                   "store_meta": sm})["publisher_reputable"]
     assert any(s["code"] == "manifest-uninspected" for s in sr["risk_signals"]), sr
     moved = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
+                               "extension_id": "com.1password.safari/1password.appex@2BUA8C4S2C",
                                "installs": [{"path": "/tmp/1Password.appex", "platform": "darwin"}],
                                "store_meta": sm})
     assert not moved["publisher_reputable"] and any(
