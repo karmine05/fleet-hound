@@ -321,9 +321,13 @@ CAUTION: An HTTP 4xx or 5xx response returns `error = None` (`:1187`). Every cal
 | Auth | none |
 | Byte cap | 1,000,000 B |
 | Cache TTL | 21 to 28 d (one listing per containing app) |
-| Failure behaviour | No matching result: status `off_store` (Developer ID or sideloaded app): no threat points, an informational `not-in-app-store` signal. Non-200: `error`, not cached. Every listed result sets `manifest_unavailable` because the App Store serves no package. |
+| Failure behaviour | No matching result: status `off_store` (Developer ID or sideloaded app): no threat points, an informational `not-in-app-store` signal. Non-200: `error`, not cached. No package exists anywhere (Apple publishes none), so the result carries a neutral `manifest-not-published` signal (weight 0) instead of the `manifest-uninspected` penalty. |
 | Trust | The containing app's Apple code-signing team ID against `apple_team_ids` in `config/known_publishers.json` (seller names are not trusted), and only when every install path is an `.appex` inside a top-level `/Applications` app. |
 | Limitation | The bundle ID is host-reported (the app's `Info.plist`): an app that claims a listed app's bundle ID inherits that listing's store signals (but not publisher trust, which needs the signing team). The lookup uses the US storefront, so an app sold only elsewhere reads as `not_found`. An extension whose app has no Fleet `apps` row gets no lookup. |
+
+### 1.7c Manifest checks (all stores)
+
+One checker (`_capability`) scores every manifest the pipeline obtains, MV2 or MV3: permission weights (including `declarativeNetRequestWithHostAccess`), broad host access, content scripts, declared data collection, and a `weak-csp` signal (+15) when `content_security_policy` (MV2 string or MV3 `extension_pages`/`sandbox`) allows `'unsafe-eval'` or remote script sources (`script-src`, else `default-src`; MV3 `extension_pages` only, since sandboxed pages may eval). `'wasm-unsafe-eval'` is not counted. Safari name checks use the extension name without the `App ›` prefix. Not checked: declarativeNetRequest rule files (header rewriting), because the Chrome listing RPC returns only the manifest, not the package; the `declarativeNetRequest*` permissions are weighted instead. MV2 is not penalised (Firefox and Safari still support it); MV3 adds trust.
 
 ### 1.8 Store dispatch
 
@@ -736,7 +740,7 @@ NOTE: The enrichment taxonomy emits `Remote Access`, `Cloud Storage`, `Communica
 | Fleet `/hosts` timeout | 120 s | `src/extractor.py:235` |
 | Fleet `_get` retries | 5 | `src/extractor.py:96` |
 | `ETLConfig.enrich_limit` | 250 | `src/etl.py:111` |
-| `ETLConfig.software_reap_age_seconds` | 604800 (7 d) | `src/etl.py:132` |
+| Unattached reap | every ETL cycle: Software, Label, User and Host nodes with no host edge are deleted; lists and the extension worker read only nodes installed on a host | `MemgraphIngestion.reap_unattached` |
 | `/api/extensions` limit | 1000, max 5000 | `webviz/routes/workers.py:261` |
 | `SHADOW_IT_OUTLIER_PCT` | 0.03 | `src/shadow_it_filter.py:287` |
 | `MIN_OUTLIER_HOSTS` | 2 (constant) | `src/shadow_it_filter.py:284` |

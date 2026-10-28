@@ -64,8 +64,7 @@ def get_labels():
         with driver.session() as session:
             result = session.run(
                 f"""
-                MATCH (l:Label)
-                OPTIONAL MATCH (l)<-[r:HAS_LABEL]-(:Host)
+                MATCH (l:Label)<-[r:HAS_LABEL]-(:Host)
                 WITH l, count(r) AS live_host_count
                 RETURN l.fleet_id AS fleet_id,
                        l.name AS name,

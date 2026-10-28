@@ -261,8 +261,8 @@ def get_blast_radius():
         global_totals = session.run("""
             MATCH (h:Host)
             WITH count(h) AS total_hosts, count(DISTINCT h.team_id) AS total_teams
-            MATCH (u:User)
-            RETURN total_hosts, total_teams, count(u) AS total_users
+            MATCH (u:User)-[:USES]->(:Host)
+            RETURN total_hosts, total_teams, count(DISTINCT u) AS total_users
         """).single()
         
         # When normalizing:

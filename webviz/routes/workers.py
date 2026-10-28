@@ -267,7 +267,7 @@ def get_extensions():
     list_query = f"""
         MATCH (s:Software)
         WHERE {where}
-        OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
+        MATCH (s)-[r:INSTALLED_ON]->(h:Host)
         WITH s, count(DISTINCT h) AS host_count,
              collect(DISTINCT r.version) AS versions,
              collect(DISTINCT h.hostname) AS hosts
@@ -277,7 +277,7 @@ def get_extensions():
     """
     band_query = f"""
         MATCH (s:Software)
-        WHERE {where}
+        WHERE {where} AND EXISTS((s)-[:INSTALLED_ON]->(:Host))
         RETURN coalesce(s.risk_band, 'unassessed') AS band,
                count(DISTINCT coalesce(s.extension_key, 'name:' + s.name)) AS n
     """

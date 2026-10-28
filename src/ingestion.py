@@ -19,9 +19,10 @@ from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
 from src.extension_intel import (derive_extension_identity, summarize_vulnerabilities,
                                  with_safari_app)
 
-# Bump when the Fleet-row -> :Software identity rules change (3: Safari
-# extensions keyed by containing-app bundle ID and signing team).
-SOFTWARE_IDENTITY_VERSION = 3
+# Bump when the Fleet-row -> :Software identity or ingested fields change
+# (3: Safari keyed by containing-app bundle ID and signing team; 4: Safari
+# display name prefixed with the containing app).
+SOFTWARE_IDENTITY_VERSION = 4
 
 
 def _version_key(version) -> tuple:
@@ -1955,81 +1956,30 @@ class MemgraphIngestion:
             )
         return {'pairs': pairs, 'extras_removed': extras_removed}
 
-    def reap_orphaned_software(self, now_iso: "str | None" = None,
-                                reap_age_seconds: int = 604800) -> dict:
-        """Age-based DELETE for :Software nodes that have no INSTALLED_ON edge.
+    # Every node exists because of a host: Software via INSTALLED_ON, Label
+    # via HAS_LABEL, User via USES. Hosts go last, once nothing links to them.
+    _UNATTACHED = (
+        ("software", "MATCH (n:Software) WHERE NOT EXISTS((n)-[:INSTALLED_ON]->(:Host))"),
+        ("labels", "MATCH (n:Label) WHERE NOT EXISTS((n)<-[:HAS_LABEL]-(:Host))"),
+        ("users", "MATCH (n:User) WHERE NOT EXISTS((n)-[:USES]->(:Host))"),
+        ("hosts", "MATCH (n:Host) WHERE degree(n) = 0"),
+    )
 
-        Mirrors the label reap pattern. Sweep:
-          1. For Software with ≥1 INSTALLED_ON edge: clear `software_orphaned_since`
-             (re-attached after a prior orphaning — flip the marker off).
-          2. For Software with zero INSTALLED_ON edges AND no marker: stamp
-             `software_orphaned_since = now_iso`. First detection.
-          3. For Software with zero edges AND `software_orphaned_since` older
-             than `reap_age_seconds`: DELETE the node.
+    def reap_unattached(self) -> dict:
+        """DETACH DELETE every node that is not attached to a host.
 
-        Defaulting to 7 days mirrors the label reap horizon. Tunable via
-        ETLConfig.software_reap_age_seconds. Enrichment-bearing Software
-        nodes (Wikidata category, sources) survive any single empty cycle —
-        re-installs within the window restore their edges and clear the
-        marker before they ever expire.
+        A node with no host edge is not in the environment, so it is never
+        kept or shown. Runs at the end of every ETL cycle. Trade-off: a
+        reinstalled app is re-enriched (category lookup) instead of keeping
+        its old enrichment; the extension store cache is on disk and survives.
 
-        Returns: {'marked': int, 'unmarked': int, 'reaped': int}
+        Returns: {'software': int, 'labels': int, 'users': int, 'hosts': int}
         """
-        if now_iso is None:
-            now_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
-        except ValueError:
-            now_dt = datetime.now(timezone.utc)
-        cutoff = (now_dt - timedelta(seconds=reap_age_seconds)).isoformat()
-
-        stats = {'marked': 0, 'unmarked': 0, 'reaped': 0}
+        stats = {}
         with self.driver.session() as session:
-            # (1) Clear marker on Software that regained edges. Runs first so
-            # we don't immediately re-mark them in step (2).
-            rec = session.run(
-                "MATCH (s:Software) "
-                "WHERE s.software_orphaned_since IS NOT NULL "
-                "  AND EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
-                "WITH collect(s) AS matched "
-                "FOREACH (n IN matched | SET n.software_orphaned_since = NULL) "
-                "RETURN size(matched) AS n"
-            ).single()
-            stats['unmarked'] = int(rec['n']) if rec else 0
-
-            # (2) Stamp marker on freshly-orphaned Software (no edges, no marker yet).
-            rec = session.run(
-                "MATCH (s:Software) "
-                "WHERE s.software_orphaned_since IS NULL "
-                "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
-                "WITH collect(s) AS matched "
-                "FOREACH (n IN matched | SET n.software_orphaned_since = $now) "
-                "RETURN size(matched) AS n",
-                now=now_iso,
-            ).single()
-            stats['marked'] = int(rec['n']) if rec else 0
-
-            # (3) Reap Software still orphaned past the cutoff. Count then
-            # delete so the stat is accurate without a Cypher 5 subquery.
-            rec = session.run(
-                "MATCH (s:Software) "
-                "WHERE s.software_orphaned_since IS NOT NULL "
-                "  AND s.software_orphaned_since < $cutoff "
-                "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
-                "RETURN count(s) AS n",
-                cutoff=cutoff,
-            ).single()
-            reaped = int(rec['n']) if rec else 0
-            if reaped > 0:
-                session.run(
-                    "MATCH (s:Software) "
-                    "WHERE s.software_orphaned_since IS NOT NULL "
-                    "  AND s.software_orphaned_since < $cutoff "
-                    "  AND NOT EXISTS((s)-[:INSTALLED_ON]->(:Host)) "
-                    "DETACH DELETE s",
-                    cutoff=cutoff,
-                )
-            stats['reaped'] = reaped
+            for kind, match in self._UNATTACHED:
+                rec = session.run(match + " DETACH DELETE n RETURN count(n) AS n").single()
+                stats[kind] = int(rec['n']) if rec else 0
         return stats
 
     def reap_stale_hosts(self, now_iso: "str | None" = None,

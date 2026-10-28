@@ -56,9 +56,8 @@ def get_software():
     with driver.session() as session:
         # Sorted by install count so a defaulted `limit` returns the most
         # widespread software first (an unordered LIMIT is arbitrary).
-        # OPTIONAL MATCH keeps orphan Software nodes that have no INSTALLED_ON
-        # edge — they surface with host_count = 0 at the end of the list
-        # instead of vanishing (a plain MATCH would silently drop them).
+        # Plain MATCH: software on no host is not in the environment, so it
+        # is not listed (the ETL also deletes such nodes).
         # `versions` is capped at 25 entries per software: it's the largest
         # field in the response (a single browser node can carry dozens of
         # historical versions) and the list view only needs a sample of the
@@ -67,8 +66,7 @@ def get_software():
         # to render any realistic "N versions" badge.
         result = session.run(
             """
-            MATCH (s:Software)
-            OPTIONAL MATCH (s)-[:INSTALLED_ON]->(h:Host)
+            MATCH (s:Software)-[:INSTALLED_ON]->(h:Host)
             WITH s, count(DISTINCT h) AS host_count
             ORDER BY host_count DESC, s.name ASC
             RETURN s.name AS name,

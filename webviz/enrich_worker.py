@@ -74,7 +74,7 @@ def _pick_uncategorized(driver, batch_size: int):
                   AND coalesce(s.kind, '') <> 'browser_extension'
                   AND (s.last_categorization_attempt_iso IS NULL
                        OR s.last_categorization_attempt_iso < $cutoff_iso)
-                OPTIONAL MATCH (s)-[:INSTALLED_ON]->(h:Host)
+                MATCH (s)-[:INSTALLED_ON]->(h:Host)
                 WITH s.name AS name, COUNT(DISTINCT h) AS host_count
                 RETURN name
                 ORDER BY host_count ASC
