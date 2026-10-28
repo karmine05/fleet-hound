@@ -951,7 +951,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 13
+SCORER_VERSION = 14
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -1087,8 +1087,13 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         and store_install_verified(store, extension_id, record.get("installs")))
     # Safari display names carry an "App › " prefix for people; the name
     # checks (typosquat, affixes) must see the extension's own name.
-    if store == "safari" and " \u203a " in display_name:
-        display_name = display_name.split(" \u203a ", 1)[1]
+    # Strip only the exact prefix with_safari_app adds, derived from the
+    # install path: a name that merely contains " › " is checked whole.
+    app_path = next(filter(None, map(safari_containing_app, installed_paths)), None) \
+        if store == "safari" else None
+    prefix = app_path.rsplit("/", 1)[-1][:-len(".app")] + " \u203a " if app_path else None
+    if prefix and display_name.startswith(prefix):
+        display_name = display_name[len(prefix):]
     name_signals, name_penalty = name_anomaly_signals(
         name, display_name, store=store, vouched=vouched
     )
@@ -1385,15 +1390,21 @@ _CSP_DIRECTIVE_RE = re.compile(r"(?:^|;)\s*(script-src(?:-elem)?|default-src)\s+
 def _weak_csp(csp) -> str | None:
     """Why a CSP weakens script isolation, else None. 'wasm-unsafe-eval' is
     the MV3-sanctioned WebAssembly switch and is not counted."""
-    directives = {d.lower(): v.split() for d, v in _CSP_DIRECTIVE_RE.findall(_clean_str(csp))}
-    # default-src applies only when no script directive is set.
-    sources = (directives.get("script-src") or directives.get("script-src-elem")
-               or directives.get("default-src") or [])
-    if "'unsafe-eval'" in (s.lower() for s in sources):
+    directives: dict = {}
+    for name, value in _CSP_DIRECTIVE_RE.findall(_clean_str(csp)):
+        directives.setdefault(name.lower(), value.split())  # browsers honour the first
+
+    def effective(*names):  # CSP fallback chain: first directive present wins
+        return next((directives[n] for n in names if n in directives), [])
+
+    # eval is governed by script-src; <script> loads by script-src-elem.
+    if "'unsafe-eval'" in (x.lower() for x in effective("script-src", "default-src")):
         return "'unsafe-eval' lets it run code built from strings"
-    remote = [s for s in sources if re.match(r"(?:https?:|\*)", s, re.IGNORECASE)]
+    remote = [x for x in effective("script-src-elem", "script-src", "default-src")
+              + effective("script-src", "default-src")
+              if re.match(r"(?:https?:|\*)", x, re.IGNORECASE)]
     if remote:
-        return "loads scripts from " + ", ".join(remote[:3])
+        return "loads scripts from " + ", ".join(list(dict.fromkeys(remote))[:3])
     return None
 
 
@@ -3169,9 +3180,19 @@ def _self_check() -> None:
                                 "extension_pages": "script-src 'self'"})) is None
     assert _weak_csp("default-src 'self' 'unsafe-eval'")                     # fallback directive
     assert _weak_csp("default-src 'self' 'unsafe-eval'; script-src 'self'") is None
+    bw = ["/Applications/Bitwardn.app/Contents/PlugIns/B.appex"]
     typo = analyze_extension({"store": "safari", "name": "ext:safari:x", "display_name": "Bitwardn \u203a Bitwardn",
-                              "host_count": 2, "store_meta": {"status": "public"}})
+                              "installed_paths": bw, "host_count": 2, "store_meta": {"status": "public"}})
     assert any(s["code"] == "typosquat-brand" for s in typo["risk_signals"]), typo
+    # An app name that itself contains " › " must not shift the split point.
+    fake = analyze_extension({"store": "safari", "name": "ext:safari:y",
+                              "display_name": "Foo \u203a Bar \u203a Bitwardn",
+                              "installed_paths": ["/Applications/Foo \u203a Bar.app/Contents/PlugIns/B.appex"],
+                              "host_count": 2, "store_meta": {"status": "public"}})
+    assert any(s["code"] == "typosquat-brand" for s in fake["risk_signals"]), fake
+    # Duplicate directive: the first one is what browsers enforce.
+    assert _weak_csp("script-src 'self' 'unsafe-eval'; script-src 'self'")
+    assert _weak_csp("script-src 'self'; script-src-elem 'self' https://evil.example")
     weak = analyze_extension({"store": "firefox", "extension_id": "w@x", "name": "w", "host_count": 2,
                               "store_meta": {"status": "public",
                                              "content_security_policy": "script-src 'self' 'unsafe-eval'"}})
