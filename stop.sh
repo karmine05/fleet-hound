@@ -119,5 +119,5 @@ if [[ "$PURGE" -eq 1 ]]; then
 else
     info "Volumes preserved."
     info "  Restart:        ./start.sh"
-    info "  Wipe data:      ./stop.sh --purge   (or: docker compose exec -T webviz python clear_db.py --yes while running)"
+    info "  Wipe data:      ./stop.sh --purge   (or: docker compose exec -T webviz fleethound clear-db --yes while running)"
 fi

@@ -1,64 +1,51 @@
-# Pinned by digest so a rebuild is reproducible; bump tag + digest together
-# (`docker pull python:<tag>` then `docker image inspect --format '{{index .RepoDigests 0}}'`).
-# Debian 13 (trixie): 19 fewer HIGH/CRITICAL OS findings than bookworm at 3.11.17.
-FROM python:3.11.18-slim-trixie@sha256:82209229d3fda30d71e603ec95bb4bea0476635ba6df3df2e32284e036654f51
+# Multi-stage build: a static Go binary on distroless. Both bases are pinned by
+# digest so a rebuild is reproducible; bump tag + digest together
+# (`docker pull <image>:<tag>` then `docker image inspect --format '{{index .RepoDigests 0}}'`).
+# Toolchain matches go.mod `toolchain`; Go 1.24 is EOL with unfixed stdlib CVEs.
+FROM golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS build
+
+WORKDIR /src
+
+# Module download first (better layer caching).
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o /out/fleethound ./cmd/fleethound
+
+# distroless has no shell: pre-create the writable config tree here.
+RUN mkdir -p /out/config/snapshots
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 WORKDIR /app
 
-# Install dependencies first (for better caching).
-COPY requirements.txt .
-# pip, setuptools and wheel are build tools: removing them after the install
-# drops their CVEs (setuptools' vendored jaraco.context, wheel) from the runtime.
-RUN pip install --no-cache-dir --no-compile -r requirements.txt \
- && pip uninstall -y setuptools wheel \
- && python -m pip uninstall -y pip \
- && useradd --uid 10001 --create-home --home-dir /home/webviz --shell /sbin/nologin webviz
+COPY --from=build /out/fleethound /usr/local/bin/fleethound
+COPY webviz/static/ /app/webviz/static/
 
-# Copy application code.
-COPY webviz/ ./webviz/
-# snapshot.diff API + enrich_worker import these from /app at runtime.
-COPY src/ ./src/
-COPY categorize_software.py ./categorize_software.py
-COPY clear_db.py ./clear_db.py
-COPY main.py ./main.py
+# Config dir is mounted as a volume in docker-compose. uid 10001 matches the
+# previous python image ('webviz'), so existing bind-mounted config files
+# (whitelist.json, audit.log, snapshots, state) stay writable.
+# Default known-publisher list and threat feeds for deployments that don't
+# bind-mount config/ (compose mounts ./config over /app/config).
+COPY --from=build --chown=10001:10001 /out/config/ /app/config/
+COPY --chown=10001:10001 config/known_publishers.json config/extension_threat_feeds.json /app/config/
 
-# Config dir is mounted as a volume in docker-compose; pre-create + own it so
-# the non-root user can write whitelist.json / audit.log without chmod gymnastics.
-# Default known-publisher list for deployments that don't bind-mount config/
-# (compose mounts ./config over /app/config, so the repo copy is what is used).
-COPY config/known_publishers.json /app/config/known_publishers.json
-COPY config/extension_threat_feeds.json /app/config/extension_threat_feeds.json
-RUN mkdir -p /app/config /app/config/snapshots \
- && chown -R webviz:webviz /app
-
-USER webviz
+USER 10001:10001
 
 # Fail-closed default for prod image: refuse to start unless WEBVIZ_API_TOKEN
-# is supplied (via env or *_FILE secret mount). Operators running this image
-# must explicitly opt out by setting WEBVIZ_REQUIRE_AUTH=false in their
-# compose/k8s spec — there is no silent-anonymous-read path in a production
-# container. Dev (`python webviz/app.py` outside Docker) keeps the permissive
-# default from the code path.
+# is supplied (via env or *_FILE secret mount). Operators must explicitly opt
+# out by setting WEBVIZ_REQUIRE_AUTH=false in their compose/k8s spec.
 ENV WEBVIZ_REQUIRE_AUTH=true
+# Container network: listen on all interfaces (compose publishes loopback only).
+ENV WEBVIZ_BIND_HOST=0.0.0.0
 
 EXPOSE 8080
 
-# Health check — uses lightweight /api/health (database ping), not /api/graph (heavy query).
+# Lightweight /api/health (database ping), not /api/graph (heavy query).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD python -c "import sys, urllib.request; r = urllib.request.urlopen('http://localhost:8080/api/health', timeout=5); sys.exit(0 if r.status == 200 else 1)" || exit 1
+  CMD ["/usr/local/bin/fleethound", "healthcheck"]
 
-# Gunicorn: bind 0.0.0.0 (container network). Two workers x 4 threads: a slow
-# query no longer blocks a whole worker (and /api/health with it), and RAM is
-# still left for the in-process OODA/enricher/extension threads. Timeout is
-# 120s so a blast-radius query doesn't get killed mid-walk.
-CMD ["gunicorn", \
-     "--bind", "0.0.0.0:8080", \
-     "--workers", "2", \
-     "--worker-class", "gthread", \
-     "--threads", "4", \
-     "--timeout", "120", \
-     "--graceful-timeout", "30", \
-     "--no-control-socket", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "webviz.app:app"]
+ENTRYPOINT ["/usr/local/bin/fleethound"]
+CMD ["serve"]

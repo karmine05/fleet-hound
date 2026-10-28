@@ -5,9 +5,9 @@
 [![Platform: Fleet](https://img.shields.io/badge/Platform-Fleet-blue?style=for-the-badge&logo=fleet)](https://fleetdm.com)
 [![Graph: Memgraph](https://img.shields.io/badge/Graph-Memgraph-brightgreen?style=for-the-badge&logo=neo4j)](https://memgraph.com)
 
-Fleet Hound pulls hosts, users, and installed-software inventory from a [Fleet](https://fleetdm.com) MDM/osquery server, builds an `(:User)-[:USES]->(:Host)<-[:INSTALLED_ON]-(:Software)` graph in [Memgraph](https://memgraph.com), enriches software nodes with [Wikipedia](https://www.wikipedia.org) categories, and serves a Flask dashboard for blast-radius queries, Shadow IT detection, extension risk, and per-snapshot graph diffs.
+Fleet Hound pulls hosts, users, and installed-software inventory from a [Fleet](https://fleetdm.com) MDM/osquery server, builds an `(:User)-[:USES]->(:Host)<-[:INSTALLED_ON]-(:Software)` graph in [Memgraph](https://memgraph.com), enriches software nodes with [Wikipedia](https://www.wikipedia.org) categories, and serves a Go web dashboard for blast-radius queries, Shadow IT detection, extension risk, and per-snapshot graph diffs.
 
-Everything ships as two containers. There is no host-side Python install, virtualenv, or dev server in the supported path.
+Everything ships as two containers. There is no host-side Go toolchain or dev server in the supported path: the `webviz` image is a single static `fleethound` binary on distroless.
 
 ![Fleet Hound Command Deck](assets/overview-dark.png)
 
@@ -17,16 +17,16 @@ Everything ships as two containers. There is no host-side Python install, virtua
 
 | Capability | What it does | Backed by |
 |------------|--------------|-----------|
-| **Command Deck** | Landing view: sampled fleet constellation, headline counts, Shadow IT / Extension / fleet-delta cards, and the current OODA cycle. Summaries only — each card deep-links into the view that owns the filters. | `GET /api/graph/full?sample=N`, `webviz/graph_sample.py` |
-| **Universal Security Graph** | Models every host, user, and software install as nodes/edges in a Bolt-protocol graph DB. | `src/ingestion.py` → Memgraph |
-| **Differential ETL** | Tracks `last_run_timestamp` per team in the state file, fetches only `updated_at` deltas on subsequent runs. `--full-scan` overrides. | `main.py`, `src/etl.py`, `src/extractor.py` |
+| **Command Deck** | Landing view: sampled fleet constellation, headline counts, Shadow IT / Extension / fleet-delta cards, and the current OODA cycle. Summaries only — each card deep-links into the view that owns the filters. | `GET /api/graph/full?sample=N`, `internal/api/graphapi/sample.go` |
+| **Universal Security Graph** | Models every host, user, and software install as nodes/edges in a Bolt-protocol graph DB. | `internal/ingest` → Memgraph |
+| **Differential ETL** | Tracks `last_run_timestamp` per team in the state file, fetches only `updated_at` deltas on subsequent runs. `--full-scan` overrides. | `fleethound etl`, `internal/etl`, `internal/fleet` |
 | **Blast Radius & Path Tracing** | Walks the graph from a compromised host, identity, or package to surface host reach, user impact, lateral movement, and platform spread. | `GET /api/blast-radius`, `GET /api/path` |
-| **Shadow IT Detection** | Flags software a user deliberately installed that is rare across the fleet, high-risk by category, or version-sprawled. | `GET /api/shadow-it`, `src/shadow_it_filter.py` |
-| **Extension Threat Intel** | Scores every browser extension (capability, trust, blocklist, rarity, install base) and plots prevalence × risk. | `src/extension_intel.py`, `webviz/extension_worker.py`, `GET /api/extensions` |
-| **Wikipedia Enrichment** | Background worker attaches `category` + `description` to `Software` nodes; single-leader across gunicorn workers via `fcntl` flock. | `webviz/enrich_worker.py`, `categorize_software.py` |
-| **Graph Snapshots & Diff** | Streams the full graph to gzipped JSONL per ETL run; the UI diffs any two snapshots by node, edge, and property. | `src/snapshot.py`, `GET /api/snapshots`, `GET /api/diff` |
+| **Shadow IT Detection** | Flags software a user deliberately installed that is rare across the fleet, high-risk by category, or version-sprawled. | `GET /api/shadow-it`, `internal/catalog/shadow_it_filter.go` |
+| **Extension Threat Intel** | Scores every browser extension (capability, trust, blocklist, rarity, install base) and plots prevalence × risk. | `internal/extintel`, `internal/extworker`, `GET /api/extensions` |
+| **Wikipedia Enrichment** | Background worker attaches `category` + `description` to `Software` nodes; single-leader via a `flock` on the config volume. | `internal/enrich`, `fleethound categorize` |
+| **Graph Snapshots & Diff** | Streams the full graph to gzipped JSONL per ETL run; the UI diffs any two snapshots by node, edge, and property. | `internal/snapshot`, `GET /api/snapshots`, `GET /api/diff` |
 | **Software Authorization** | Operators approve software, mutating Shadow IT scoring on the next read. Persisted atomically. | `POST /api/authorize-software` |
-| **Autonomous OODA loop** | Optional in-container supervisor driving Observe→Orient→Decide→Act cycles on a timer. | `webviz/ooda_worker.py` |
+| **Autonomous OODA loop** | Optional in-container supervisor driving Observe→Orient→Decide→Act cycles on a timer. | `internal/ooda` |
 
 ---
 
@@ -84,19 +84,19 @@ Snapshot timeline, delta ribbon, and a filterable diff. Ids are searchable; each
                             │ Bearer token
                             ▼
                    ┌──────────────────┐
-                   │  webviz container│  main.py: extract → ingest → snapshot
-                   │  (src/etl.py)    │  or the OODA loop on a timer
+                   │  webviz container│  fleethound etl: extract → ingest → snapshot
+                   │ (internal/etl)   │  or the OODA loop on a timer
                    └────────┬─────────┘
                             │ Bolt
                             ▼
                    ┌──────────────────┐    ┌──────────────────┐
-                   │   Memgraph       │◀───│ enrich_worker    │  (Wikipedia REST API)
-                   │   :7687          │    │ extension_worker │  (store metadata)
+                   │   Memgraph       │◀───│ internal/enrich, │  (Wikipedia REST API)
+                   │   :7687          │    │   extworker      │  (store metadata)
                    └────────┬─────────┘    └──────────────────┘
                             │ Bolt
                             ▼
                    ┌──────────────────┐
-                   │   webviz/app.py  │  Flask + Gunicorn (2 workers)
+                   │ fleethound serve │  Go net/http, one process
                    │   :8080          │  bearer-token auth, /api/*
                    └──────────────────┘
 ```
@@ -130,7 +130,7 @@ chmod 600 .env
 **3. Pull the first baseline**
 
 ```bash
-docker compose exec -T webviz python main.py --full-scan
+docker compose exec -T webviz fleethound etl --full-scan
 ```
 
 **4. Open the dashboard**
@@ -155,16 +155,16 @@ docker compose logs -f webviz
 docker compose logs -f memgraph
 
 # One delta sync (or a full rescan, or a team-scoped sync)
-docker compose exec -T webviz python main.py
-docker compose exec -T webviz python main.py --full-scan
-docker compose exec -T webviz python main.py --teams 1,2
+docker compose exec -T webviz fleethound etl
+docker compose exec -T webviz fleethound etl --full-scan
+docker compose exec -T webviz fleethound etl --teams 1,2
 
 # Wikipedia enrichment only
-docker compose exec -T webviz python categorize_software.py --limit 0
+docker compose exec -T webviz fleethound categorize --limit 0
 
 # Wipe the graph + watermarks, then re-baseline
-docker compose exec -T webviz python clear_db.py --yes
-docker compose exec -T webviz python main.py --full-scan
+docker compose exec -T webviz fleethound clear-db --yes
+docker compose exec -T webviz fleethound etl --full-scan
 
 # Stop (keep volumes) / stop and drop volumes (asks to type PURGE; --yes skips)
 ./stop.sh
@@ -179,7 +179,7 @@ docker compose exec -T webviz python main.py --full-scan
 tar czf "config-$(date +%F).tgz" config/
 ```
 
-Restore by extracting the archive into the repository root before `./start.sh`. The Memgraph volume holds only derived data: after a Memgraph tag change or volume loss, rebuild it with `docker compose exec -T webviz python main.py --full-scan`.
+Restore by extracting the archive into the repository root before `./start.sh`. The Memgraph volume holds only derived data: after a Memgraph tag change or volume loss, rebuild it with `docker compose exec -T webviz fleethound etl --full-scan`.
 
 ### Upgrade and rollback
 
@@ -193,7 +193,9 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 
 ---
 
-## CLI reference (`main.py`, run in the container)
+## CLI reference (`fleethound etl`, run in the container)
+
+Other subcommands: `serve` (the dashboard, image default), `clear-db`, `categorize`, `selfcheck`, `healthcheck`. Run `fleethound help` for the list.
 
 | Flag | Purpose |
 |------|---------|
@@ -208,6 +210,7 @@ Snapshots are pruned on every ETL run: `SNAPSHOT_RETAIN_DAYS` (age horizon, defa
 | `--complete-enrichment` | Enrich every uncategorized `Software` node via Wikipedia (slow). |
 | `--enrich-software "Slack,Zoom"` | Force enrichment for specific names. |
 | `--dump-host-sample` | Write the first host object next to the state file and exit. |
+| `--list-teams` | Print the Fleet team table and exit. |
 
 ---
 
@@ -261,7 +264,7 @@ All routes are under `/api/`. Send the token as `Authorization: Bearer <token>` 
 
 ## How Shadow IT detection works
 
-Premise: **ubiquitous software is sanctioned; rare software is suspect.** Three detectors run over the graph, all sharing one eligibility gate (`src/shadow_it_filter.py`).
+Premise: **ubiquitous software is sanctioned; rare software is suspect.** Three detectors run over the graph, all sharing one eligibility gate (`internal/catalog/shadow_it_filter.go`).
 
 **Eligibility gate** — a candidate must be a *deliberate user install*:
 - **In scope:** native apps (`apps`/`programs`/`homebrew_packages`/`chocolatey_packages`) and browser/IDE extensions (`chrome`/`firefox`/`safari`/`ie` extensions, `vscode`/`atom`/`jetbrains` plugins).
@@ -284,7 +287,7 @@ OODA_INTERVAL_SEC=1800        # 30-minute cycle
 OODA_FULL_SCAN_EVERY=24       # refresh per-team watermarks every ~12h
 ```
 
-`docker compose up -d` then runs Observe → Orient → Decide → Act in-process. Cycle state is at `GET /api/ooda/status` and `/api/ooda/cycles`; `POST /api/ooda/trigger` starts an out-of-band cycle (60s cooldown). A lock file (`.etl.lock`) makes a manual `main.py` run and an OODA cycle mutually exclusive — the second one skips with a logged reason instead of corrupting the watermark.
+`docker compose up -d` then runs Observe → Orient → Decide → Act in-process. Cycle state is at `GET /api/ooda/status` and `/api/ooda/cycles`; `POST /api/ooda/trigger` starts an out-of-band cycle (60s cooldown). A lock file (`.etl.lock`) makes a manual `fleethound etl` run and an OODA cycle mutually exclusive — the second one skips with a logged reason instead of corrupting the watermark.
 
 ---
 
@@ -292,19 +295,19 @@ OODA_FULL_SCAN_EVERY=24       # refresh per-team watermarks every ~12h
 
 ```text
 fleet-hound/
-├── main.py                  # CLI ETL entrypoint (thin shim over src/etl.py)
-├── categorize_software.py   # Wikipedia enrichment
-├── clear_db.py              # wipe Memgraph + runtime state
+├── cmd/fleethound/          # single binary: serve, etl, clear-db, categorize, selfcheck, healthcheck
+├── internal/                # Go packages: server, api/*, etl, fleet, ingest, snapshot,
+│                            #   extintel, extworker, enrich, ooda, catalog, hostfilter, graphdb
+├── go.mod / go.sum          # module github.com/karmine05/fleet-hound
 ├── start.sh / stop.sh       # docker compose wrappers
-├── Dockerfile               # production image (non-root, read-only rootfs)
+├── Dockerfile               # multi-stage: static Go build -> distroless, uid 10001, read-only rootfs
 ├── docker-compose.yml       # memgraph + webviz services
-├── src/                     # ETL: etl, extractor, ingestion, snapshot, auth
-├── webviz/                  # Flask app, workers, static UI
+├── webviz/
 │   └── static/              # index.html, app.js, app.css, boot.js, vendored D3, fonts
 ├── config/                  # bind mount: state, snapshots, whitelist, logs
 └── assets/                  # README screenshots
 
-Local-only (git-ignored): `tests/` unit suite and `webviz/static/ping.html`
+Local-only (git-ignored): `*_test.go` unit tests, `tests/` and `webviz/static/ping.html`
 debug page — they never ship to GitHub.
 ```
 

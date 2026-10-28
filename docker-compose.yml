@@ -82,15 +82,15 @@ services:
     security_opt:
       - no-new-privileges:true
     # Secrets (FLEET_API_TOKEN, WEBVIZ_API_TOKEN, MEMGRAPH_PASSWORD) live in
-    # .env (chmod 600). Only WEBVIZ_API_TOKEN also accepts *_FILE, and its path
-    # must be mounted into the container.
+    # .env (chmod 600). Each also accepts a *_FILE variant, whose path must be
+    # mounted into the container.
     env_file:
       - .env
     environment:
       - MEMGRAPH_URI=bolt://memgraph:7687
       - PORT=8080
       # The rootfs is read-only; ETL/ OODA watermarks live on the config mount.
-      # `docker compose exec webviz python main.py` inherits this.
+      # `docker compose exec webviz fleethound etl` inherits this.
       - STATE_FILE=/app/config/.state.json
       # Optional Bolt auth — passes through from host env / .env file.
       - MEMGRAPH_USER
@@ -148,7 +148,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys, urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5); sys.exit(0 if r.status == 200 else 1)"]
+      test: ["CMD", "/usr/local/bin/fleethound", "healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3

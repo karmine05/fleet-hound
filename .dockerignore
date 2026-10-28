@@ -11,10 +11,9 @@ config/*
 tests/
 docs/
 assets/
-**/__pycache__
-*.py[cod]
-.pytest_cache/
-.playwright-mcp/
+memgraph/
+scripts/
+**/*_test.go
 .claude*
 .mcp*
 .planning/

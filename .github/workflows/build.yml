@@ -11,20 +11,27 @@ permissions:
 
 jobs:
   check:
-    name: compile, shellcheck, image build + scan
+    name: vet, build, shellcheck, image build + scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
         with:
-          python-version: '3.11'
+          # Matches go.mod `toolchain` (Go 1.24 is EOL; stdlib fixes land in 1.26).
+          go-version: '1.26.10'
 
-      - name: Byte-compile Python
-        run: python -m compileall -q src webviz main.py categorize_software.py clear_db.py
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/fleethound ./cmd/fleethound
 
       - name: Extension scorer self-check
-        run: python src/extension_intel.py
+        run: go run ./cmd/fleethound selfcheck
 
       - name: ShellCheck
         # Pinned image tag, not a third-party action.
