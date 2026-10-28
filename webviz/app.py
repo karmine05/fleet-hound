@@ -594,7 +594,8 @@ def get_meta():
             result = session.run("""
                 MATCH (h:Host) WITH count(h) AS hosts
                 OPTIONAL MATCH (u:User)-[:USES]->(:Host) WITH hosts, count(DISTINCT u) AS users
-                OPTIONAL MATCH (s:Software) RETURN hosts, users, count(s) AS software
+                OPTIONAL MATCH (s:Software)-[:INSTALLED_ON]->(:Host)
+                RETURN hosts, users, count(DISTINCT s) AS software
             """).single()
         if not result:
             return jsonify({"hosts": 0, "users": 0, "software": 0, "connected": True}), 200

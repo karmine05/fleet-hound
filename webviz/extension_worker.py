@@ -102,7 +102,7 @@ _ADAPTER_STORES = CHROMIUM_STORES | {"firefox", "safari"}
 # Package-derived fields of one immutable version, cached forever.
 _MANIFEST_FIELDS = ("manifest_version", "permissions", "optional_permissions",
                     "host_permissions", "content_script_matches", "update_url",
-                    "homepage_url", "crx_hash_verified")
+                    "homepage_url", "crx_hash_verified", "content_security_policy")
 
 
 def _cache_path(cache_dir: str, key: str) -> str:
@@ -225,8 +225,8 @@ def _cache_age(cache_dir: str, key: str) -> float | None:
 
 # Bump a version when the cached shape changes; prune_cache() deletes the
 # files of every other version. v12: listings carry integer privacy_codes.
-LISTING_KEY_VERSION = "v12"
-MANIFEST_KEY_VERSION = "v11"
+LISTING_KEY_VERSION = "v14"
+MANIFEST_KEY_VERSION = "v13"
 
 
 def _lookup_id(record: dict) -> str:
@@ -305,7 +305,7 @@ def _all_groups(driver) -> list[dict]:
     query = f"""
         MATCH (s:Software)
         WHERE {_EXT_WHERE}
-        OPTIONAL MATCH (s)-[r:INSTALLED_ON]->(h:Host)
+        MATCH (s)-[r:INSTALLED_ON]->(h:Host)
         WITH coalesce(s.extension_key, 'name:' + s.name) AS key,
              collect(DISTINCT s) AS nodes,
              count(DISTINCT h) AS host_count,
@@ -704,6 +704,7 @@ def _coverage(driver) -> list[dict]:
     with driver.session() as session:
         rows = session.run(f"""
             MATCH (s:Software) WHERE {_EXT_WHERE}
+              AND EXISTS((s)-[:INSTALLED_ON]->(:Host))
               AND (NOT coalesce(s.is_builtin, false) OR coalesce(s.risk_score, 0) > 0)
             WITH coalesce(s.store, 'unknown') AS store, s
             RETURN store,
@@ -715,6 +716,7 @@ def _coverage(driver) -> list[dict]:
                    count(s.manifest_version) AS manifest_parsed,
                    count(s.developer_email) AS with_email,
                    sum(CASE WHEN s.risk_signals_json CONTAINS 'manifest-uninspected' THEN 1 ELSE 0 END) AS uninspected,
+                   sum(CASE WHEN s.risk_signals_json CONTAINS 'weak-csp' THEN 1 ELSE 0 END) AS weak_csp,
                    sum(CASE WHEN s.risk_signals_json CONTAINS 'threat-feed:' THEN 1 ELSE 0 END) AS feed_hits,
                    collect(DISTINCT s.intel_error)[..5] AS errors
             ORDER BY total DESC

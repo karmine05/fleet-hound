@@ -142,8 +142,15 @@ def with_safari_app(ext: dict, apps: dict) -> dict:
     different apps never share a node (and its App Store lookup).
     """
     path = ext.get("installed_path") or ""
-    bundle, team = apps.get(safari_containing_app(path)) or (None, None)
-    if ext.get("store") != "safari" or not bundle:
+    app_path = safari_containing_app(path)
+    if ext.get("store") != "safari" or not app_path:
+        return ext
+    # Extensions often share generic names ("Safari", "Extension"): show the app.
+    app_name = app_path.rsplit("/", 1)[-1][:-len(".app")]
+    if ext.get("display_name") and not ext["display_name"].startswith(app_name + " \u203a "):
+        ext = {**ext, "display_name": f"{app_name} \u203a {ext['display_name']}"}
+    bundle, team = apps.get(app_path) or (None, None)
+    if not bundle:
         return ext
     # The signing team is part of the identity: differently signed copies
     # never share a node, so one host cannot lend another its team.
@@ -616,6 +623,7 @@ _PERMISSION_WEIGHTS = {
     "cookies": 15,
     "webRequest": 15,
     "declarativeNetRequest": 15,
+    "declarativeNetRequestWithHostAccess": 15,
     "management": 15,
     "scripting": 12,
     "clipboardRead": 12,
@@ -669,7 +677,7 @@ def _permission_sets(meta: dict, record: dict) -> tuple[set[str], set[str], set[
 
 def _capability(perms: set[str], hosts: set[str], matches: set[str],
                 optional: set[str] = frozenset(),
-                privacy_codes=()) -> tuple[int, list[dict]]:
+                privacy_codes=(), csp=None) -> tuple[int, list[dict]]:
     score = 0
     signals: list[dict] = []
     for perm in sorted(perms):
@@ -736,6 +744,12 @@ def _capability(perms: set[str], hosts: set[str], matches: set[str],
     # Content scripts reach page content too, so only discount when neither exists.
     if not hosts and not matches:
         score = round(score * 0.6)
+    # After the discount: remote or eval'd code is risky whatever it can reach.
+    weak = _weak_csp(csp)
+    if weak:
+        score += 15
+        signals.append({"code": "weak-csp", "weight": 15,
+                        "detail": "content security policy: " + weak})
     return min(100, score), signals
 
 
@@ -937,7 +951,7 @@ def _exposure_score(host_count: int, version_count: int) -> int:
 
 # Bump on any change to analyze_extension() output: the worker fingerprints
 # its inputs with this, and a new value re-scores every extension once.
-SCORER_VERSION = 11
+SCORER_VERSION = 13
 
 
 def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
@@ -1006,8 +1020,15 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
 
     perms, hosts, matches, optional = _permission_sets(meta, record)
     capability, cap_signals = _capability(perms, hosts, matches, optional,
-                                          meta.get("privacy_codes") or ())
+                                          meta.get("privacy_codes") or (),
+                                          csp=meta.get("content_security_policy"))
     signals = list(cap_signals)
+    if store == "safari":
+        # Neutral, not "uninspected": no Safari package is published anywhere,
+        # so the missing manifest says nothing about this extension.
+        signals.append({"code": "manifest-not-published", "weight": 0,
+                        "detail": "Apple publishes no Safari extension package; "
+                                  "permissions are not inspected"})
 
     publisher = _clean_str(
         meta.get("developer") or meta.get("publisher") or record.get("vendor")
@@ -1064,6 +1085,10 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
         (meta.get("developer_verified") is True or meta.get("established_publisher") is True)
         and (_as_int(meta.get("users")) or 0) >= 100_000
         and store_install_verified(store, extension_id, record.get("installs")))
+    # Safari display names carry an "App › " prefix for people; the name
+    # checks (typosquat, affixes) must see the extension's own name.
+    if store == "safari" and " \u203a " in display_name:
+        display_name = display_name.split(" \u203a ", 1)[1]
     name_signals, name_penalty = name_anomaly_signals(
         name, display_name, store=store, vouched=vouched
     )
@@ -1340,7 +1365,36 @@ def _manifest_fields(meta: dict) -> dict:
         "content_script_matches": content_matches,
         "update_url": _clean_str(manifest.get("update_url")) or None,
         "homepage_url": _clean_str(manifest.get("homepage_url")) or None,
+        "content_security_policy": _csp_text(manifest.get("content_security_policy")),
     }
+
+
+def _csp_text(value) -> str | None:
+    """MV2 CSP is a string; MV3 is {extension_pages, sandbox}. Sandboxed pages
+    have no extension API access and may legitimately eval, so only
+    extension_pages counts."""
+    if isinstance(value, dict):
+        value = value.get("extension_pages")
+    return _clean_str(value)[:2000] or None
+
+
+# Script sources that let an extension run code the store never reviewed.
+_CSP_DIRECTIVE_RE = re.compile(r"(?:^|;)\s*(script-src(?:-elem)?|default-src)\s+([^;]*)", re.IGNORECASE)
+
+
+def _weak_csp(csp) -> str | None:
+    """Why a CSP weakens script isolation, else None. 'wasm-unsafe-eval' is
+    the MV3-sanctioned WebAssembly switch and is not counted."""
+    directives = {d.lower(): v.split() for d, v in _CSP_DIRECTIVE_RE.findall(_clean_str(csp))}
+    # default-src applies only when no script directive is set.
+    sources = (directives.get("script-src") or directives.get("script-src-elem")
+               or directives.get("default-src") or [])
+    if "'unsafe-eval'" in (s.lower() for s in sources):
+        return "'unsafe-eval' lets it run code built from strings"
+    remote = [s for s in sources if re.match(r"(?:https?:|\*)", s, re.IGNORECASE)]
+    if remote:
+        return "loads scripts from " + ", ".join(remote[:3])
+    return None
 
 
 _MAX_MANIFEST_BYTES = 1024 * 1024
@@ -2046,7 +2100,6 @@ def fetch_safari_metadata(bundle_id: str, *, client: HttpClient | None = None) -
         "created_at": _clean_str(app.get("releaseDate")) or None,
         "url": _http_url(app.get("trackViewUrl")),
         "developer_website": _http_url(app.get("sellerUrl")),
-        "manifest_unavailable": "the App Store serves no inspectable extension package",
     })
     return meta
 
@@ -2696,7 +2749,7 @@ def _self_check() -> None:
     itunes = _Itunes([app])
     sm = fetch_store_metadata("safari", "com.1password.safari", client=itunes)
     assert sm["status"] == "public" and sm["developer"] == "AgileBits Inc." and sm["rating"] is None, sm
-    assert "bundleId=com.1password.safari" in itunes.urls[0] and sm["manifest_unavailable"], itunes.urls
+    assert "bundleId=com.1password.safari" in itunes.urls[0] and "manifest_unavailable" not in sm, itunes.urls
     other = fetch_safari_metadata("com.evil.app", client=_Itunes([app]))      # answer for another app
     assert other["status"] == "off_store", other
     off = analyze_extension({"store": "safari", "name": "x", "host_count": 2, "store_meta": other})
@@ -2707,7 +2760,9 @@ def _self_check() -> None:
     bound = with_safari_app(ext, apps)
     assert bound["extension_key"] == "ext:safari:site.w/x.appex@team1" and bound["app_team_id"] == "TEAM1", bound
     assert with_safari_app(ext, {"/Applications/W.app": ("site.w", None)})["extension_key"].endswith("@unsigned")
-    assert with_safari_app(ext, {}) == ext
+    assert with_safari_app(ext, {})["extension_key"] == ext["extension_key"]
+    assert bound["display_name"] == "W \u203a Wipr Extra", bound
+    assert with_safari_app(bound, apps)["display_name"] == "W \u203a Wipr Extra"  # idempotent
     assert fetch_safari_metadata("../x", client=_Itunes([app]))["error"] == "invalid app bundle id"
     assert fetch_safari_metadata("com.a.b", client=_Itunes([], status=500))["status"] == "unknown"
     appex = "/Applications/1Password for Safari.app/Contents/PlugIns/1Password.appex"
@@ -2729,7 +2784,8 @@ def _self_check() -> None:
     assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,   # unsigned app
                                   "installs": [{"path": appex, "platform": "darwin"}],
                                   "store_meta": sm})["publisher_reputable"]
-    assert any(s["code"] == "manifest-uninspected" for s in sr["risk_signals"]), sr
+    assert not any(s["code"] == "manifest-uninspected" for s in sr["risk_signals"]), sr
+    assert any(s["code"] == "manifest-not-published" for s in sr["risk_signals"]) and sr["threat_score"] == 0, sr
     moved = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
                                "extension_id": "com.1password.safari/1password.appex@2BUA8C4S2C",
                                "installs": [{"path": "/tmp/1Password.appex", "platform": "darwin"}],
@@ -3104,6 +3160,23 @@ def _self_check() -> None:
             return 404, {}, b"", None
     onone = fetch_store_metadata("opera", oid, client=_Unknown())
     assert onone["store"] == "opera" and onone["status"] == "not_found", onone
+    # Weak CSP: eval or remote scripts, MV2 string or MV3 object; wasm-unsafe-eval is fine.
+    assert _weak_csp("script-src 'self' 'unsafe-eval'; object-src 'self'")
+    assert "evil.example" in _weak_csp("script-src 'self' https://evil.example")
+    assert _weak_csp(_csp_text({"extension_pages": "script-src 'self' 'wasm-unsafe-eval'"})) is None
+    assert _weak_csp(None) is None and _csp_text({"sandbox": 3}) is None
+    assert _weak_csp(_csp_text({"sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval'",
+                                "extension_pages": "script-src 'self'"})) is None
+    assert _weak_csp("default-src 'self' 'unsafe-eval'")                     # fallback directive
+    assert _weak_csp("default-src 'self' 'unsafe-eval'; script-src 'self'") is None
+    typo = analyze_extension({"store": "safari", "name": "ext:safari:x", "display_name": "Bitwardn \u203a Bitwardn",
+                              "host_count": 2, "store_meta": {"status": "public"}})
+    assert any(s["code"] == "typosquat-brand" for s in typo["risk_signals"]), typo
+    weak = analyze_extension({"store": "firefox", "extension_id": "w@x", "name": "w", "host_count": 2,
+                              "store_meta": {"status": "public",
+                                             "content_security_policy": "script-src 'self' 'unsafe-eval'"}})
+    assert any(s["code"] == "weak-csp" for s in weak["risk_signals"]) and weak["capability_score"] >= 15, weak
+    assert _capability({"declarativeNetRequestWithHostAccess"}, set(), set())[0] > 0
     print("extension_intel self-check: OK")
 
 

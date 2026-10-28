@@ -170,10 +170,12 @@ def _decide_phase(driver) -> tuple[dict, dict]:
                 return int(rec["c"]) if rec and rec.get("c") is not None else 0
 
             hosts = _count("MATCH (h:Host) RETURN count(h) AS c")
-            users = _count("MATCH (u:User) RETURN count(u) AS c")
-            software = _count("MATCH (s:Software) RETURN count(s) AS c")
+            # Only nodes attached to a host are in the environment.
+            users = _count("MATCH (u:User)-[:USES]->(:Host) RETURN count(DISTINCT u) AS c")
+            software = _count("MATCH (s:Software)-[:INSTALLED_ON]->(:Host) RETURN count(DISTINCT s) AS c")
             uncat = _count(
-                "MATCH (s:Software) WHERE s.category IS NULL RETURN count(s) AS c"
+                "MATCH (s:Software)-[:INSTALLED_ON]->(:Host) WHERE s.category IS NULL "
+                "RETURN count(DISTINCT s) AS c"
             )
             findings["totals"] = {
                 "hosts": hosts,
