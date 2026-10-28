@@ -98,11 +98,13 @@ info "Building images..."
 # ./config is bind-mounted over /app/config, hiding the image's chown. Docker
 # Desktop (macOS) remaps ownership; a Linux host does not, so give the mount
 # to the container user (uid 10001). Plain `docker run`, because compose's
-# cap_drop: ALL removes CAP_CHOWN.
+# cap_drop: ALL removes CAP_CHOWN. busybox, because the distroless app image
+# ships no chown.
 if [[ "$(uname -s)" == "Linux" ]]; then
     info "Giving ./config to the container user (uid 10001)..."
-    docker run --rm --user 0 --entrypoint chown -v "$PWD/config:/app/config" \
-        fleet-hound-webviz -R 10001:10001 /app/config
+    docker run --rm --user 0 -v "$PWD/config:/app/config" \
+        busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 \
+        chown -R 10001:10001 /app/config
 fi
 
 info "Starting containers..."

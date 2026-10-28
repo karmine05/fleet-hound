@@ -62,19 +62,6 @@ func Int(name string, def int) int {
 	return v
 }
 
-// Float is Int for float64 (float(os.environ.get(...)) with fallback).
-func Float(name string, def float64) float64 {
-	raw, ok := os.LookupEnv(name)
-	if !ok {
-		return def
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil {
-		return def
-	}
-	return v
-}
-
 // ResolveSecret replaces webviz/app.py _resolve_secret: <NAME>_FILE first
 // (file content trimmed; used only when non-empty), then <NAME>, trimmed.
 // An unreadable *_FILE is logged and falls through to the env var.

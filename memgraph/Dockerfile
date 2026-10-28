@@ -8,6 +8,9 @@ FROM memgraph/memgraph:3.14.0@sha256:a732421217951066e42f5749111bc3d0c7b51b12c75
 # compromised (GHSA-6q48-6c7w-9gw2, CRITICAL). 2026.10.23 matches the webviz
 # lock. --break-system-packages: Ubuntu 24.04 (PEP 668) refuses --user
 # installs without it; this touches only the memgraph user's site-packages.
-RUN python3 -m pip install --user --no-cache-dir --no-deps --break-system-packages \
-        certifi==2026.10.23 \
+# Hash-pinned (wheel + sdist from PyPI) so a swapped artifact fails the build.
+RUN printf '%s\n' 'certifi==2026.10.23 --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1 --hash=sha256:a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd' > /tmp/req.txt \
+ && python3 -m pip install --user --no-cache-dir --no-deps --break-system-packages \
+        --require-hashes -r /tmp/req.txt \
+ && rm /tmp/req.txt \
  && python3 -c "import certifi; assert certifi.__version__ == '2026.10.23', certifi.__version__"

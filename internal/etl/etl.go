@@ -119,58 +119,7 @@ type Result struct {
 	FailedHostCount       int
 }
 
-func strOrNil(p *string) any {
-	if p == nil {
-		return nil
-	}
-	return *p
-}
-
-func mapOrNil(m map[string]any) any {
-	if m == nil {
-		return nil
-	}
-	return m
-}
-
 func ptr(s string) *string { return &s }
-
-// AsDict replaces ETLResult.as_dict(): same keys, duration rounded to 3dp,
-// nil pointers/maps as JSON null, TeamsSynced never null ([]).
-func (r *Result) AsDict() map[string]any {
-	teams := r.TeamsSynced
-	if teams == nil {
-		teams = []int{}
-	}
-	return map[string]any{
-		"started_iso":             r.StartedISO,
-		"finished_iso":            r.FinishedISO,
-		"duration_sec":            math.RoundToEven(r.DurationSec*1000) / 1000,
-		"hosts_extracted":         r.HostsExtracted,
-		"users_extracted":         r.UsersExtracted,
-		"teams_synced":            teams,
-		"full_scan":               r.FullScan,
-		"snapshot_path":           strOrNil(r.SnapshotPath),
-		"enrichment_attempted":    r.EnrichmentAttempted,
-		"enrichment_error":        strOrNil(r.EnrichmentError),
-		"snapshot_error":          strOrNil(r.SnapshotError),
-		"error":                   strOrNil(r.Error),
-		"label_sync_attempted":    r.LabelSyncAttempted,
-		"label_sync_error":        strOrNil(r.LabelSyncError),
-		"last_label_sync_iso":     strOrNil(r.LastLabelSyncISO),
-		"label_sync_stats":        mapOrNil(r.LabelSyncStats),
-		"skipped_due_to_lock":     r.SkippedDueToLock,
-		"label_orphan_count":      r.LabelOrphanCount,
-		"label_orphans_fetched":   r.LabelOrphansFetched,
-		"software_reap_attempted": r.SoftwareReapAttempted,
-		"software_reap_stats":     mapOrNil(r.SoftwareReapStats),
-		"software_reap_error":     strOrNil(r.SoftwareReapError),
-		"host_reap_attempted":     r.HostReapAttempted,
-		"host_reap_stats":         mapOrNil(r.HostReapStats),
-		"host_reap_error":         strOrNil(r.HostReapError),
-		"failed_host_count":       r.FailedHostCount,
-	}
-}
 
 // LoadState replaces load_state(path): parsed .state.json or {} (never fails).
 func LoadState(path string) map[string]any {

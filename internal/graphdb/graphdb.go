@@ -58,9 +58,6 @@ func WithInitRetry(attempts int, backoff time.Duration) Option {
 	}
 }
 
-// WithLogger sets the logger (default slog.Default()).
-func WithLogger(l *slog.Logger) Option { return func(db *DB) { db.log = l } }
-
 // New returns a lazy handle; nothing connects until first use. Empty user or
 // password means no auth (python auth=None).
 func New(uri, user, password string, opts ...Option) *DB {

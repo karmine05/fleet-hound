@@ -43,9 +43,6 @@ type HTTPClient struct {
 	fake       *fakeTransport // self-check/tests only
 }
 
-// NewHTTPClient returns an HTTPClient with python's default 12s timeout.
-func NewHTTPClient() *HTTPClient { return &HTTPClient{TimeoutSec: 12} }
-
 // ManifestFor replaces the `manifest_for(version)` callback: cached manifest
 // fields for an immutable version, or nil (a hit skips the package download).
 type ManifestFor func(version string) map[string]any

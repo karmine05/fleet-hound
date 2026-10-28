@@ -19,12 +19,6 @@ import (
 	"github.com/karmine05/fleet-hound/internal/workerutil"
 )
 
-// Python defaults (LOCK_PATH_DEFAULT etc.); the server passes config values.
-const (
-	LockPathDefault    = "/tmp/fleet-hound-enricher.lock"
-	TriggerPathDefault = "/tmp/fleet-hound-enricher.trigger"
-)
-
 // Options are start_worker's keyword arguments.
 type Options struct {
 	IntervalSec int // 300
@@ -44,10 +38,10 @@ func (o *Options) defaults() {
 		o.BatchSize = 25
 	}
 	if o.LockPath == "" {
-		o.LockPath = LockPathDefault
+		o.LockPath = config.ConfigPath(".enricher.lock")
 	}
 	if o.TriggerPath == "" {
-		o.TriggerPath = TriggerPathDefault
+		o.TriggerPath = config.ConfigPath(".enricher.trigger")
 	}
 	if o.StatusPath == "" {
 		o.StatusPath = config.ConfigPath("enricher_status.json")

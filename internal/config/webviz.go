@@ -38,24 +38,24 @@ type Webviz struct {
 	EnricherIntervalSec int    // ENRICHER_INTERVAL_SEC (300)
 	EnricherBatchSize   int    // ENRICHER_BATCH_SIZE (25)
 	EnricherParallelism int    // ENRICHER_PARALLELISM (4)
-	EnricherLockPath    string // ENRICHER_LOCK_PATH (/tmp/fleet-hound-enricher.lock)
-	EnricherTriggerPath string // ENRICHER_TRIGGER_PATH (/tmp/fleet-hound-enricher.trigger)
+	EnricherLockPath    string // ENRICHER_LOCK_PATH (<ConfigDir>/.enricher.lock)
+	EnricherTriggerPath string // ENRICHER_TRIGGER_PATH (<ConfigDir>/.enricher.trigger)
 	EnricherStatusPath  string // ENRICHER_STATUS_PATH (<ConfigDir>/enricher_status.json)
 
 	ExtensionWorkerEnabled     bool   // EXTENSION_WORKER_ENABLED (default true)
 	ExtensionWorkerIntervalSec int    // EXTENSION_WORKER_INTERVAL_SEC (21600)
 	ExtensionWorkerBatchSize   int    // EXTENSION_WORKER_BATCH_SIZE (50)
 	ExtensionWorkerParallelism int    // EXTENSION_WORKER_PARALLELISM (4)
-	ExtensionWorkerLockPath    string // EXTENSION_WORKER_LOCK_PATH (/tmp/fleet-hound-extensions.lock)
-	ExtensionWorkerTriggerPath string // EXTENSION_WORKER_TRIGGER_PATH (/tmp/fleet-hound-extensions.trigger)
+	ExtensionWorkerLockPath    string // EXTENSION_WORKER_LOCK_PATH (<ConfigDir>/.extensions.lock)
+	ExtensionWorkerTriggerPath string // EXTENSION_WORKER_TRIGGER_PATH (<ConfigDir>/.extensions.trigger)
 	ExtensionWorkerStatusPath  string // EXTENSION_WORKER_STATUS_PATH (<ConfigDir>/extension_status.json)
 	ExtensionCacheDir          string // EXTENSION_CACHE_DIR (<ConfigDir>/extension_cache)
 
 	OODAEnabled       bool   // OODA_ENABLED (default false)
 	OODAIntervalSec   int    // OODA_INTERVAL_SEC (1800)
 	OODAFullScanEvery int    // OODA_FULL_SCAN_EVERY (24; 0 disables)
-	OODALockPath      string // OODA_LOCK_PATH (/tmp/fleet-hound-ooda.lock)
-	OODATriggerPath   string // OODA_TRIGGER_PATH (/tmp/fleet-hound-ooda.trigger)
+	OODALockPath      string // OODA_LOCK_PATH (<ConfigDir>/.ooda.lock)
+	OODATriggerPath   string // OODA_TRIGGER_PATH (<ConfigDir>/.ooda.trigger)
 	OODAStatusPath    string // OODA_STATUS_PATH (<ConfigDir>/ooda_status.json)
 	OODACyclesPath    string // OODA_CYCLES_PATH (<ConfigDir>/ooda_cycles.jsonl)
 	OODAFindingsPath  string // OODA_FINDINGS_PATH (<ConfigDir>/ooda_findings.json)
@@ -103,24 +103,24 @@ func LoadWebviz() *Webviz {
 		EnricherIntervalSec: Int("ENRICHER_INTERVAL_SEC", 300),
 		EnricherBatchSize:   Int("ENRICHER_BATCH_SIZE", 25),
 		EnricherParallelism: Int("ENRICHER_PARALLELISM", 4),
-		EnricherLockPath:    Str("ENRICHER_LOCK_PATH", "/tmp/fleet-hound-enricher.lock"),
-		EnricherTriggerPath: Str("ENRICHER_TRIGGER_PATH", "/tmp/fleet-hound-enricher.trigger"),
+		EnricherLockPath:    Str("ENRICHER_LOCK_PATH", in(".enricher.lock")),
+		EnricherTriggerPath: Str("ENRICHER_TRIGGER_PATH", in(".enricher.trigger")),
 		EnricherStatusPath:  Str("ENRICHER_STATUS_PATH", in("enricher_status.json")),
 
 		ExtensionWorkerEnabled:     Bool("EXTENSION_WORKER_ENABLED", true),
 		ExtensionWorkerIntervalSec: Int("EXTENSION_WORKER_INTERVAL_SEC", 21600),
 		ExtensionWorkerBatchSize:   Int("EXTENSION_WORKER_BATCH_SIZE", 50),
 		ExtensionWorkerParallelism: Int("EXTENSION_WORKER_PARALLELISM", 4),
-		ExtensionWorkerLockPath:    Str("EXTENSION_WORKER_LOCK_PATH", "/tmp/fleet-hound-extensions.lock"),
-		ExtensionWorkerTriggerPath: Str("EXTENSION_WORKER_TRIGGER_PATH", "/tmp/fleet-hound-extensions.trigger"),
+		ExtensionWorkerLockPath:    Str("EXTENSION_WORKER_LOCK_PATH", in(".extensions.lock")),
+		ExtensionWorkerTriggerPath: Str("EXTENSION_WORKER_TRIGGER_PATH", in(".extensions.trigger")),
 		ExtensionWorkerStatusPath:  Str("EXTENSION_WORKER_STATUS_PATH", in("extension_status.json")),
 		ExtensionCacheDir:          Str("EXTENSION_CACHE_DIR", in("extension_cache")),
 
 		OODAEnabled:       Bool("OODA_ENABLED", false),
 		OODAIntervalSec:   Int("OODA_INTERVAL_SEC", 1800),
 		OODAFullScanEvery: Int("OODA_FULL_SCAN_EVERY", 24),
-		OODALockPath:      Str("OODA_LOCK_PATH", "/tmp/fleet-hound-ooda.lock"),
-		OODATriggerPath:   Str("OODA_TRIGGER_PATH", "/tmp/fleet-hound-ooda.trigger"),
+		OODALockPath:      Str("OODA_LOCK_PATH", in(".ooda.lock")),
+		OODATriggerPath:   Str("OODA_TRIGGER_PATH", in(".ooda.trigger")),
 		OODAStatusPath:    Str("OODA_STATUS_PATH", in("ooda_status.json")),
 		OODACyclesPath:    Str("OODA_CYCLES_PATH", in("ooda_cycles.jsonl")),
 		OODAFindingsPath:  Str("OODA_FINDINGS_PATH", in("ooda_findings.json")),

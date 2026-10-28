@@ -152,16 +152,6 @@ func IsNonAppSource(sources []string) bool {
 	return len(s) > 0 && subset(s, DevLanguageSources)
 }
 
-// HasUserAppSource replaces has_user_app_source.
-func HasUserAppSource(sources []string) bool {
-	return intersects(normSources(sources), UserAppSources)
-}
-
-// HasShadowITSource replaces has_shadow_it_source.
-func HasShadowITSource(sources []string) bool {
-	return intersects(normSources(sources), ShadowITSources)
-}
-
 // IsLinuxPackageOnly replaces is_linux_package_only.
 func IsLinuxPackageOnly(sources []string) bool {
 	s := normSources(sources)

@@ -26,16 +26,9 @@ import (
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 
-	"github.com/karmine05/fleet-hound/internal/config"
 	"github.com/karmine05/fleet-hound/internal/graphdb"
 	"github.com/karmine05/fleet-hound/internal/pyjson"
 )
-
-// RetainDaysDefault is _RETAIN_DAYS_DEFAULT (env SNAPSHOT_RETAIN_DAYS, 30).
-func RetainDaysDefault() int { return config.Int("SNAPSHOT_RETAIN_DAYS", 30) }
-
-// RetainMaxDefault is _RETAIN_DEFAULT (env SNAPSHOT_RETAIN_MAX, 5000).
-func RetainMaxDefault() int { return config.Int("SNAPSHOT_RETAIN_MAX", 5000) }
 
 // noisyProps is _NOISY_PROPS: excluded from the node hash and the property
 // drift diff because they churn every cycle.

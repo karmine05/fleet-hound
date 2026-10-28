@@ -208,9 +208,6 @@ type Ingestion struct {
 // New replaces MemgraphIngestion(uri, auth).
 func New(db *graphdb.DB) *Ingestion { return &Ingestion{DB: db} }
 
-// Close replaces close()/__exit__: closes the DB handle.
-func (in *Ingestion) Close(ctx context.Context) { in.DB.Close(ctx) }
-
 // swParallelism is _SOFTWARE_REL_PARALLELISM (env INGEST_SW_PARALLELISM,
 // default 4, min 1); 1 forces serial chunk execution.
 func swParallelism() int { return max(1, config.Int("INGEST_SW_PARALLELISM", 4)) }

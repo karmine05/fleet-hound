@@ -107,7 +107,7 @@ func ReadJSONMap(path string) map[string]any {
 // it (or the lock cannot be taken, which is logged). Keep the file open for
 // the lifetime of leadership; closing it releases the lock.
 func TryAcquireLock(lockPath, name string) *os.File {
-	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- path from operator env/config, not request input
+	f, err := openOwned(lockPath, os.O_RDWR)
 	if err != nil {
 		slog.Warn(name+": cannot open lock file", "path", lockPath, "err", err)
 		return nil
@@ -172,15 +172,34 @@ func FireTrigger(triggerPath string, cooldownSec float64, name string) (bool, fl
 }
 
 func touch(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600) // #nosec G304 -- path from operator env/config, not request input
+	f, err := openOwned(path, os.O_WRONLY)
 	if err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return err
+	defer f.Close()
+	now := syscall.NsecToTimeval(time.Now().UnixNano())
+	return syscall.Futimes(int(f.Fd()), []syscall.Timeval{now, now})
+}
+
+// openOwned opens or creates path (0600) without following a final symlink,
+// and refuses anything but a regular file owned by this process's uid, so a
+// file another local user planted cannot be clobbered or held.
+func openOwned(path string, flag int) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|os.O_CREATE|syscall.O_NOFOLLOW, 0o600) // #nosec G304 -- path from operator env/config, not request input
+	if err != nil {
+		return nil, err
 	}
-	now := time.Now()
-	return os.Chtimes(path, now, now)
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !st.Mode().IsRegular() || !ok || int(sys.Uid) != os.Getuid() {
+		f.Close()
+		return nil, fmt.Errorf("%s: not a regular file owned by uid %d", path, os.Getuid())
+	}
+	return f, nil
 }
 
 // Handle is what a worker Start returns in place of python's
@@ -205,19 +224,6 @@ func Go(parent context.Context, lock *os.File, loop func(ctx context.Context)) *
 		loop(ctx)
 	}()
 	return h
-}
-
-// Running reports whether this Handle owns a live loop.
-func (h *Handle) Running() bool {
-	if h == nil || h.done == nil {
-		return false
-	}
-	select {
-	case <-h.done:
-		return false
-	default:
-		return true
-	}
 }
 
 // Stop requests the loop to exit (python stop_event.set()).

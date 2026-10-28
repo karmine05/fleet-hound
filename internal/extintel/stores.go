@@ -704,6 +704,10 @@ func FetchChromeMetadata(ctx context.Context, extensionID string, client *HTTPCl
 
 func fetchEdgeMetadata(ctx context.Context, extensionID string, client *HTTPClient) map[string]any {
 	client = clientOr(client, 12)
+	// Host-reported ID: Edge uses the Chromium ID format; nothing else may reach a store URL.
+	if !chromeExtIDRe.MatchString(extensionID) {
+		return map[string]any{"store": "edge", "status": "unknown", "error": "invalid edge extension id"}
+	}
 	meta := map[string]any{"store": "edge", "status": "unknown",
 		"url": "https://microsoftedge.microsoft.com/addons/detail/" + extensionID}
 	resp := client.Get(ctx, "https://microsoftedge.microsoft.com/addons/getproductdetailsbycrxid/"+extensionID,

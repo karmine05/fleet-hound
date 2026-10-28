@@ -123,30 +123,6 @@ func ApplyLabelFilter(args url.Values, hostVar string) (string, map[string]any, 
 	return ApplyHostFilters(args, hostVar, true)
 }
 
-// MergeFilterParams replaces merge_filter_params: a merged copy (filter
-// params win). A caller key using the reserved "_flt_" prefix is a
-// *ValidationError, so callers cannot shadow filter bindings.
-func MergeFilterParams(callerParams, filterParams map[string]any) (map[string]any, error) {
-	keys := make([]string, 0, len(callerParams))
-	for k := range callerParams {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // deterministic error when several keys collide
-	for _, k := range keys {
-		if strings.HasPrefix(k, "_flt_") {
-			return nil, verr("Caller param '%s' uses the reserved _flt_ prefix", k)
-		}
-	}
-	out := make(map[string]any, len(callerParams)+len(filterParams))
-	for k, v := range callerParams {
-		out[k] = v
-	}
-	for k, v := range filterParams {
-		out[k] = v
-	}
-	return out, nil
-}
-
 // Composite scoping: a JSON boolean expression (not a string DSL) over
 // team / platform / label leaves. Every leaf value lands in Cypher params.
 //
@@ -154,6 +130,10 @@ func MergeFilterParams(callerParams, filterParams map[string]any) (map[string]an
 //	{"op": "NOT", "child": <expr>}
 //	{"team": "<id>"} | {"platform": "<name>"} | {"label": "<name>"}
 const compositeMaxDepth = 6
+
+// compositeMaxLeaves bounds breadth: each leaf adds a Cypher clause and a
+// param, so an unbounded OR list builds a multi-MB query for Memgraph.
+const compositeMaxLeaves = 64
 
 var (
 	compositeOpsList    = "['AND', 'NOT', 'OR']"
@@ -254,6 +234,9 @@ func compositeNode(node any, hostVar string, params map[string]any, counter *int
 	}
 
 	*counter++
+	if *counter > compositeMaxLeaves {
+		return "", verr("expr exceeds max %d leaves", compositeMaxLeaves)
+	}
 	key := fmt.Sprintf("_flt_%s_%d", field, *counter)
 	switch field {
 	case "team":

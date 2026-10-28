@@ -53,11 +53,114 @@ func ValidateUserRegex(pattern string) (string, bool) {
 			return "regex pattern rejected for safety (potential ReDoS)", false
 		}
 	}
+	if repeatedAmbiguousGroup(pattern) {
+		return "regex pattern rejected for safety (potential ReDoS)", false
+	}
 	if _, err := regexp.Compile(pattern); err != nil && !pythonOnlySyntax(err) {
 		return "invalid regex: " + err.Error(), false
 	}
 	return "", true
 }
+
+// repeatedAmbiguousGroup reports a group repeated by *, +, {n,} or {n,m}
+// (m >= 2) whose body holds an alternation or a quantifier: (a|aa)+,
+// (.|.)+, (.*a){12}, (a?)+. Memgraph's =~ backtracks, so these cost
+// exponential time per value; the blocklist above only spots fixed shapes.
+// It scans text rather than an RE2 parse tree so that python-only syntax
+// (lookarounds, backreferences) cannot hide a group from the check.
+func repeatedAmbiguousGroup(p string) bool {
+	risky := []bool{false} // per open group: body has | or a quantifier
+	for i := 0; i < len(p); i++ {
+		top := len(risky) - 1
+		switch p[i] {
+		case '\\':
+			i++
+		case '[':
+			i = classEnd(p, i)
+		case '(':
+			risky = append(risky, false)
+			if i+1 < len(p) && p[i+1] == '?' {
+				i++ // (?: (?= (?<name> ... : group syntax, not a quantifier
+			}
+		case ')':
+			if top == 0 {
+				continue // unbalanced; left to the compile check / Memgraph
+			}
+			body := risky[top]
+			risky = risky[:top]
+			n, repeats, isQuant := quantifierAt(p, i+1)
+			if isQuant && repeats && body {
+				return true
+			}
+			if isQuant || body {
+				risky[top-1] = true
+			}
+			i += n
+		case '|', '*', '+', '?':
+			risky[top] = true
+		case '{':
+			if n, _, ok := quantifierAt(p, i); ok {
+				risky[top] = true
+				i += n - 1
+			}
+		}
+	}
+	return false
+}
+
+// classEnd returns the index of the ']' closing the class opened at p[i].
+func classEnd(p string, i int) int {
+	j := i + 1
+	if j < len(p) && p[j] == '^' {
+		j++
+	}
+	if j < len(p) && p[j] == ']' {
+		j++ // leading ] is a literal
+	}
+	for ; j < len(p); j++ {
+		switch p[j] {
+		case '\\':
+			j++
+		case ']':
+			return j
+		}
+	}
+	return len(p)
+}
+
+// quantifierAt reports whether p[i:] starts with a quantifier, its length
+// (including a lazy/possessive suffix) and whether it can repeat more than
+// once.
+func quantifierAt(p string, i int) (n int, repeats, ok bool) {
+	if i >= len(p) {
+		return 0, false, false
+	}
+	switch p[i] {
+	case '*', '+':
+		n, repeats = 1, true
+	case '?':
+		n = 1
+	case '{':
+		m := braceQuant.FindStringSubmatch(p[i:])
+		if m == nil {
+			return 0, false, false
+		}
+		n = len(m[0])
+		hi := m[1]
+		if m[2] != "" {
+			hi = m[3]
+		}
+		repeats = hi == "" || len(hi) > 1 || hi[0] >= '2'
+	default:
+		return 0, false, false
+	}
+	if i+n < len(p) && (p[i+n] == '?' || p[i+n] == '+') {
+		n++
+	}
+	return n, repeats, true
+}
+
+var braceQuant = regexp.MustCompile(`^\{([0-9]+)(,)?([0-9]*)\}`)
 
 // pythonOnlySyntax reports whether RE2 failed on syntax that python re (the
 // validator being ported) accepts. shortcut: only the first RE2 error is

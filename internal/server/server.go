@@ -85,9 +85,6 @@ func New(cfg *config.Webviz, db *graphdb.DB, log *slog.Logger) *Server {
 	return s
 }
 
-// Deps exposes the dependency bundle (tests, cmd).
-func (s *Server) Deps() *app.Deps { return s.deps }
-
 func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /api/meta", s.handleMeta)

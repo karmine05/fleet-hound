@@ -382,11 +382,13 @@ func selfCheckPublishers(ctx context.Context) {
 
 	// Adapters: Edge 404 is not_found; 429 / 503+Retry-After flag the breaker;
 	// blocklist follows the Next-Page header.
-	edge404 := fetchEdgeMetadata(ctx, rep("x", 32), fakeSeq(resp(404, nil, `{"name":"x"}`, "")))
+	edge404 := fetchEdgeMetadata(ctx, rep("a", 32), fakeSeq(resp(404, nil, `{"name":"x"}`, "")))
 	check(edge404["status"] == "not_found", "edge_404 %v", edge404)
-	edgeOK := fetchEdgeMetadata(ctx, rep("x", 32), fakeSeq(resp(200, nil, `{"name":"x"}`, "")))
+	edgeBad := fetchEdgeMetadata(ctx, "../addons/x?y", fakeSeq())
+	check(edgeBad["error"] == "invalid edge extension id", "edge_invalid_id %v", edgeBad)
+	edgeOK := fetchEdgeMetadata(ctx, rep("a", 32), fakeSeq(resp(200, nil, `{"name":"x"}`, "")))
 	check(edgeOK["status"] == "public" && !truthy(edgeOK["error"]), "edge_ok %v", edgeOK)
-	edge500 := fetchEdgeMetadata(ctx, rep("x", 32), fakeSeq(resp(500, nil, `{"name":"x"}`, "")))
+	edge500 := fetchEdgeMetadata(ctx, rep("a", 32), fakeSeq(resp(500, nil, `{"name":"x"}`, "")))
 	check(edge500["status"] == "unknown" && truthy(edge500["error"]), "edge_500 %v", edge500)
 	amo429 := fetchAMOMetadata(ctx, "a@b", fakeSeq(resp(429, nil, "", "")), nil)
 	check(truthy(amo429["rate_limited"]) && truthy(amo429["error"]), "amo_429 %v", amo429)

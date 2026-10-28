@@ -59,15 +59,6 @@ func DebugMsg(debug bool, err error) any {
 	return nil
 }
 
-// DebugMsgOr is DebugMsg with a fallback string instead of nil
-// (`str(exc) if DEBUG_ERROR_DETAILS else "internal error"`).
-func DebugMsgOr(debug bool, err error, fallback string) string {
-	if debug && err != nil {
-		return err.Error()
-	}
-	return fallback
-}
-
 // NotFound writes the Flask 404 handler body: {"error": "Not found"}.
 func NotFound(w http.ResponseWriter) { Error(w, http.StatusNotFound, "Not found") }
 
