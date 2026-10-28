@@ -185,12 +185,15 @@
         "AgileBits"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; AMO author ID verified on dogfood 2026-10-26",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; AMO author ID verified on dogfood 2026-10-26; Apple team ID: codesign team of /Applications/1Password for Safari.app on dogfood hosts 2026-10-28, matches appcatalog.cloud Developer ID",
       "chrome_publisher_ids": [
         "udb847e9815e2e1626d9ddb346d722811"
       ],
       "amo_author_ids": [
         19257918
+      ],
+      "apple_team_ids": [
+        "2BUA8C4S2C"
       ]
     },
     {
@@ -356,9 +359,12 @@
         "AdGuard"
       ],
       "added_at": "2026-10-26T16:00:00Z",
-      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26",
+      "note": "migrated from the hard-coded list in src/extension_intel.py; Chrome Web Store publisher ID verified on dogfood 2026-10-26; Apple team ID: codesign team of AdGuard for Safari on dogfood 2026-10-28, matches AdGuard KB group container prefix TC3Q7MAJXF.com.adguard.mac",
       "chrome_publisher_ids": [
         "u63f06aecfdc45d32c13ccc24f56c3d2d"
+      ],
+      "apple_team_ids": [
+        "TC3Q7MAJXF"
       ]
     },
     {
