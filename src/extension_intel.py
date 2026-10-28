@@ -143,7 +143,9 @@ def with_safari_app(ext: dict, apps: dict) -> dict:
     bundle, team = apps.get(safari_containing_app(path)) or (None, None)
     if ext.get("store") != "safari" or not bundle:
         return ext
-    ext_id = f"{bundle}/{path.rstrip('/').rsplit('/', 1)[-1]}"
+    # The signing team is part of the identity: differently signed copies
+    # never share a node, so one host cannot lend another its team.
+    ext_id = f"{bundle}/{path.rstrip('/').rsplit('/', 1)[-1]}@{team or 'unsigned'}"
     return {**ext, "extension_id": ext_id, "extension_key": f"ext:safari:{ext_id}".lower(),
             "app_bundle_id": bundle, "app_team_id": team or None}
 
@@ -390,8 +392,10 @@ _KNOWN_PUBLISHERS_CANDIDATES = (
                  "config", "known_publishers.json"),
 )
 _CWS_PUBLISHER_ID_RE = re.compile(r"u[0-9a-f]{32}")
+_APPLE_TEAM_ID_RE = re.compile(r"[A-Z0-9]{10}")
 _known_publishers_cache: dict = {"key": None, "names": frozenset(), "chrome_ids": frozenset(),
-                                 "amo_ids": frozenset(), "edge_ext_ids": frozenset()}
+                                 "amo_ids": frozenset(), "edge_ext_ids": frozenset(),
+                                 "apple_team_ids": frozenset()}
 _known_publishers_lock = threading.Lock()
 
 
@@ -402,8 +406,8 @@ def _known_publishers_path() -> str | None:
     return next((p for p in _KNOWN_PUBLISHERS_CANDIDATES if os.path.exists(p)), None)
 
 
-def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset, frozenset]:
-    names, chrome_ids, amo_ids, edge_ext_ids = set(), set(), set(), set()
+def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset, frozenset, frozenset]:
+    names, chrome_ids, amo_ids, edge_ext_ids, team_ids = set(), set(), set(), set(), set()
     entries = doc.get("publishers") if isinstance(doc, dict) else None
     if not isinstance(entries, list):
         raise ValueError("expected an object with a 'publishers' list")
@@ -425,6 +429,10 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset, froze
                    if not (isinstance(i, str) and _CHROME_EXTENSION_ID_RE.fullmatch(i))]
             if bad:
                 raise ValueError(f"invalid edge_extension_ids {bad}")
+            teams = entry.get("apple_team_ids") or []
+            bad = [i for i in teams if not (isinstance(i, str) and _APPLE_TEAM_ID_RE.fullmatch(i))]
+            if bad:
+                raise ValueError(f"invalid apple_team_ids {bad}")
         except (ValueError, TypeError) as exc:
             logger.warning("known_publishers: skipping entry %d (%s): %s",
                            idx, (entry or {}).get("name") if isinstance(entry, dict) else entry, exc)
@@ -437,11 +445,14 @@ def _parse_known_publishers(doc) -> tuple[frozenset, frozenset, frozenset, froze
         chrome_ids.update(ids)
         amo_ids.update(authors)
         edge_ext_ids.update(edge_exts)
-    return frozenset(names), frozenset(chrome_ids), frozenset(amo_ids), frozenset(edge_ext_ids)
+        team_ids.update(teams)
+    return (frozenset(names), frozenset(chrome_ids), frozenset(amo_ids), frozenset(edge_ext_ids),
+            frozenset(team_ids))
 
 
-def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset]:
-    """(normalized names, Chrome publisher IDs, AMO author IDs, Edge extension IDs).
+def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset, frozenset]:
+    """(normalized names, Chrome publisher IDs, AMO author IDs, Edge extension IDs,
+    Apple team IDs).
 
     Reloaded when the file changes.
 
@@ -455,24 +466,26 @@ def known_publishers() -> tuple[frozenset, frozenset, frozenset, frozenset]:
     with _known_publishers_lock:
         c = _known_publishers_cache
         if key is not None and key == c["key"]:
-            return c["names"], c["chrome_ids"], c["amo_ids"], c["edge_ext_ids"]
-        names, chrome_ids, amo_ids, edge_ext_ids = (frozenset(),) * 4
+            return c["names"], c["chrome_ids"], c["amo_ids"], c["edge_ext_ids"], c["apple_team_ids"]
+        names, chrome_ids, amo_ids, edge_ext_ids, team_ids = (frozenset(),) * 5
         if key is None:
             logger.warning("known_publishers: file not found (%s); no publisher is trusted",
                            path or "config/known_publishers.json")
         else:
             try:
                 with open(path, encoding="utf-8") as fh:
-                    names, chrome_ids, amo_ids, edge_ext_ids = _parse_known_publishers(json.load(fh))
+                    names, chrome_ids, amo_ids, edge_ext_ids, team_ids = \
+                        _parse_known_publishers(json.load(fh))
                 logger.info("known_publishers: loaded %d names, %d Chrome publisher IDs, "
-                            "%d AMO author IDs, %d Edge extension IDs from %s",
-                            len(names), len(chrome_ids), len(amo_ids), len(edge_ext_ids), path)
+                            "%d AMO author IDs, %d Edge extension IDs, %d Apple team IDs from %s",
+                            len(names), len(chrome_ids), len(amo_ids), len(edge_ext_ids),
+                            len(team_ids), path)
             except (OSError, ValueError) as exc:
                 logger.warning("known_publishers: cannot load %s (%s); no publisher is trusted",
                                path, exc)
         c.update(key=key, names=names, chrome_ids=chrome_ids, amo_ids=amo_ids,
-                 edge_ext_ids=edge_ext_ids)
-        return names, chrome_ids, amo_ids, edge_ext_ids
+                 edge_ext_ids=edge_ext_ids, apple_team_ids=team_ids)
+        return names, chrome_ids, amo_ids, edge_ext_ids, team_ids
 
 
 # Browser-managed store directories, anchored at the user's home. Paths are
@@ -551,26 +564,33 @@ def store_install_verified(store, extension_id, installs) -> bool:
 def publisher_is_reputable(*values) -> bool:
     """True when a store-sourced developer/publisher NAME is a known publisher.
 
-    Safari only (App Store seller name); Chrome-family, Firefox and Edge trust is by store ID
-    (chrome_publisher_is_reputable / amo_author_is_reputable /
-    edge_extension_is_reputable). Callers pass store fields only: Fleet's
+    Not used for store trust: Chrome-family, Firefox, Edge and Safari trust is
+    by ID (chrome_publisher_is_reputable / amo_author_is_reputable /
+    edge_extension_is_reputable / apple_team_is_reputable). Callers pass store fields only: Fleet's
     host-reported `vendor` is attacker-influenced. Normalized equality, not a
     word search, so "Box Hill Scams" / "Meta Tools" do not match "box" / "meta".
     """
-    names, _, _, _ = known_publishers()
+    names = known_publishers()[0]
     return any(_normalise_publisher(v) in names for v in values if v)
 
 
 def chrome_publisher_is_reputable(publisher_id) -> bool:
     """Chrome Web Store trust is by immutable publisher ID, never display name."""
-    _, chrome_ids, _, _ = known_publishers()
+    chrome_ids = known_publishers()[1]
     return bool(publisher_id) and publisher_id in chrome_ids
 
 
 def amo_author_is_reputable(author_ids) -> bool:
     """Firefox trust is by immutable AMO author user ID, never display name."""
-    _, _, amo_ids, _ = known_publishers()
+    amo_ids = known_publishers()[2]
     return any(isinstance(i, int) and i in amo_ids for i in author_ids or [])
+
+
+def apple_team_is_reputable(team_id) -> bool:
+    """Safari trust is by the containing app's Apple code-signing team ID
+    (osquery reads it from the signature on the host; nobody else can sign
+    with it), never the App Store seller name."""
+    return bool(team_id) and team_id in known_publishers()[4]
 
 
 def edge_extension_is_reputable(extension_id, store_status) -> bool:
@@ -578,7 +598,7 @@ def edge_extension_is_reputable(extension_id, store_status) -> bool:
     only while the Edge store reports that ID as a public listing. Whether the
     installed copy came from the store is checked separately
     (store_install_verified)."""
-    _, _, _, edge_ext_ids = known_publishers()
+    edge_ext_ids = known_publishers()[3]
     return store_status == "public" and bool(extension_id) and extension_id in edge_ext_ids
 
 
@@ -997,9 +1017,8 @@ def analyze_extension(record: dict, *, blocklist_entry: dict | None = None,
     elif meta.get("store") == "edge":
         reputable = edge_extension_is_reputable(record.get("extension_id"), meta.get("status"))
     elif meta.get("store") == "safari":
-        # The bundle ID is host-reported; an unsigned app can claim any. Seller
-        # trust needs the containing app signed with an Apple team ID.
-        reputable = publisher_is_reputable(meta.get("developer")) and bool(record.get("app_team_id"))
+        # The bundle ID and seller are claimable by any app; the signing team is not.
+        reputable = apple_team_is_reputable(record.get("app_team_id"))
     else:
         # Opera exposes only a developer username; names are display-only.
         reputable = False
@@ -2423,7 +2442,8 @@ def _self_check() -> None:
          "edge_extension_ids": ["jmjflgjpcpepeafmmgdpfkogkghcpiha"]},
         {"name": "AdGuard", "match_names": ["AdGuard"], "added_at": "2026-10-26T00:00:00Z"},
         {"name": "1Password", "match_names": ["1Password", "AgileBits"], "added_at": "2026-10-26T00:00:00Z",
-         "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"]},
+         "chrome_publisher_ids": ["udb847e9815e2e1626d9ddb346d722811"], "apple_team_ids": ["2BUA8C4S2C"]},
+        {"name": "Bad Team", "added_at": "2026-10-26T00:00:00Z", "apple_team_ids": ["2bua8c4s2c"]},  # skipped
         {"name": "DuckDuckGo", "match_names": ["DuckDuckGo", "Duck Duck Go"], "added_at": "2026-10-26T00:00:00Z"},
         {"name": "No Timestamp"},                                                   # skipped
         {"name": "Bad Id", "added_at": "2026-10-26T00:00:00Z", "chrome_publisher_ids": ["x"]},  # skipped
@@ -2680,7 +2700,8 @@ def _self_check() -> None:
     ext = derive_extension_identity({"source": "safari_extensions", "name": "Wipr Extra",
                                      "installed_paths": ["/Applications/W.app/Contents/PlugIns/X.appex"]})
     bound = with_safari_app(ext, apps)
-    assert bound["extension_key"] == "ext:safari:site.w/x.appex" and bound["app_team_id"] == "TEAM1", bound
+    assert bound["extension_key"] == "ext:safari:site.w/x.appex@team1" and bound["app_team_id"] == "TEAM1", bound
+    assert with_safari_app(ext, {"/Applications/W.app": ("site.w", None)})["extension_key"].endswith("@unsigned")
     assert with_safari_app(ext, {}) == ext
     assert fetch_safari_metadata("../x", client=_Itunes([app]))["error"] == "invalid app bundle id"
     assert fetch_safari_metadata("com.a.b", client=_Itunes([], status=500))["status"] == "unknown"
@@ -2688,11 +2709,15 @@ def _self_check() -> None:
     sr = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
                             "installs": [{"path": appex, "platform": "darwin"}], "store_meta": sm})
     assert sr["publisher_reputable"] and sr["store_status"] == "public", sr
+    assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,   # seller name alone
+                                  "app_team_id": "ZZZZZZZZZZ",
+                                  "installs": [{"path": appex, "platform": "darwin"}],
+                                  "store_meta": sm})["publisher_reputable"]
     assert not analyze_extension({"store": "safari", "name": "1Password", "host_count": 3,   # unsigned app
                                   "installs": [{"path": appex, "platform": "darwin"}],
                                   "store_meta": sm})["publisher_reputable"]
     assert any(s["code"] == "manifest-uninspected" for s in sr["risk_signals"]), sr
-    moved = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "T",
+    moved = analyze_extension({"store": "safari", "name": "1Password", "host_count": 3, "app_team_id": "2BUA8C4S2C",
                                "installs": [{"path": "/tmp/1Password.appex", "platform": "darwin"}],
                                "store_meta": sm})
     assert not moved["publisher_reputable"] and any(

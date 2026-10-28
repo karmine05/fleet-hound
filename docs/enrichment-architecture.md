@@ -310,7 +310,7 @@ CAUTION: An HTTP 4xx or 5xx response returns `error = None` (`:1187`). Every cal
 
 ### 1.7b Store adapter: Mac App Store (Safari)
 
-`fetch_safari_metadata` (`src/extension_intel.py`). Fleet reports Safari extensions with an empty `extension_id`; osquery only finds them inside a top-level `/Applications/<App>.app/Contents/PlugIns/*.appex`. Ingestion maps that path to the containing app and reads the same host's Fleet `apps` row at that app path (`with_safari_app`, `src/ingestion.py`). When found, the identity becomes `ext:safari:<app bundle ID>/<appex name>`, so extensions of different apps never share a node, and the node gets `app_bundle_id` and `app_team_id` (the app's code-signing team from `signature_information`). Without an `apps` row the old name/path key stays and no lookup runs. The worker asks the App Store about that bundle ID (`_lookup_id`, `webviz/extension_worker.py`).
+`fetch_safari_metadata` (`src/extension_intel.py`). Fleet reports Safari extensions with an empty `extension_id`; osquery only finds them inside a top-level `/Applications/<App>.app/Contents/PlugIns/*.appex`. Ingestion maps that path to the containing app and reads the same host's Fleet `apps` row at that app path (`with_safari_app`, `src/ingestion.py`). When found, the identity becomes `ext:safari:<app bundle ID>/<appex name>@<team ID or unsigned>`, so extensions of different apps, or differently signed copies, never share a node, and the node gets `app_bundle_id` and `app_team_id` (the app's code-signing team from `signature_information`). Without an `apps` row the old name/path key stays and no lookup runs. The worker asks the App Store about that bundle ID (`_lookup_id`, `webviz/extension_worker.py`).
 
 | Field | Value |
 |---|---|
@@ -322,8 +322,8 @@ CAUTION: An HTTP 4xx or 5xx response returns `error = None` (`:1187`). Every cal
 | Byte cap | 1,000,000 B |
 | Cache TTL | 21 to 28 d (one listing per containing app) |
 | Failure behaviour | No matching result: status `off_store` (Developer ID or sideloaded app): no threat points, an informational `not-in-app-store` signal. Non-200: `error`, not cached. Every listed result sets `manifest_unavailable` because the App Store serves no package. |
-| Trust | Seller name against `match_names` in `config/known_publishers.json`, only when the containing app is signed with an Apple team ID and every install path is an `.appex` inside a top-level `/Applications` app. |
-| Limitation | The bundle ID is host-reported (the app's `Info.plist`): a Developer-ID-signed app that claims a listed app's bundle ID inherits that listing; the team ID is not yet matched to the publisher. The lookup uses the US storefront, so an app sold only elsewhere reads as `not_found`. An extension whose app has no Fleet `apps` row gets no lookup. |
+| Trust | The containing app's Apple code-signing team ID against `apple_team_ids` in `config/known_publishers.json` (seller names are not trusted), and only when every install path is an `.appex` inside a top-level `/Applications` app. |
+| Limitation | The bundle ID is host-reported (the app's `Info.plist`): an app that claims a listed app's bundle ID inherits that listing's store signals (but not publisher trust, which needs the signing team). The lookup uses the US storefront, so an app sold only elsewhere reads as `not_found`. An extension whose app has no Fleet `apps` row gets no lookup. |
 
 ### 1.8 Store dispatch
 
@@ -789,7 +789,7 @@ NOTE: The enrichment taxonomy emits `Remote Access`, `Cloud Storage`, `Communica
 | L25 | Edge interpolates the ID into the URL without the `[a-p]{32}` check. | `src/extension_intel.py:1632` | An invalid ID reaches the Edge API. |
 | L26 | Edge falls back to Chrome only on `not_found`. | `src/extension_intel.py:1830` | An Edge error or rate limit does not fall back. |
 | L27 | AMO 401 returns status only. | `src/extension_intel.py:1690-1693` | Unlisted Firefox add-ons have no permissions, publisher or package. |
-| L28 | Brave and Vivaldi route to the Chrome Web Store only. Safari is looked up by the containing app's host-reported bundle ID. | `fetch_store_metadata`, `fetch_safari_metadata` | A spoofed bundle ID inherits another app's App Store listing. Safari trust comes only from seller-name matching. |
+| L28 | Brave and Vivaldi route to the Chrome Web Store only. Safari is looked up by the containing app's host-reported bundle ID. | `fetch_store_metadata`, `fetch_safari_metadata` | A spoofed bundle ID inherits another app's App Store store signals. Publisher trust needs the signing team ID (`apple_team_ids`), which only 2 publishers carry. |
 | L30 | A missing blocklist with no cached copy aborts the whole cycle. | `webviz/extension_worker.py:719` | Chrome and Edge scoring also stop, although the blocklist covers Firefox GUIDs. |
 | L31 | Only one threat feed exists, chromium only. | `config/extension_threat_feeds.json:14-27` | Firefox has no feed coverage. |
 | L33 | The code cuts JSON scalars at 20,000 characters after `json.dumps`. | `src/extension_intel.py:2166`, `:2171` | A long payload can become invalid JSON in the graph. `vulnerability_count` counts all entries while the JSON holds at most 50. |

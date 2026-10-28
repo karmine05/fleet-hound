@@ -19,9 +19,9 @@ from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
 from src.extension_intel import (derive_extension_identity, summarize_vulnerabilities,
                                  with_safari_app)
 
-# Bump when the Fleet-row -> :Software identity rules change (2: Safari
-# extensions keyed by containing-app bundle ID).
-SOFTWARE_IDENTITY_VERSION = 2
+# Bump when the Fleet-row -> :Software identity rules change (3: Safari
+# extensions keyed by containing-app bundle ID and signing team).
+SOFTWARE_IDENTITY_VERSION = 3
 
 
 def _version_key(version) -> tuple:
@@ -1112,7 +1112,7 @@ class MemgraphIngestion:
                 s.max_cvss = CASE WHEN sw.max_cvss IS NOT NULL THEN sw.max_cvss ELSE s.max_cvss END,
                 s.is_builtin = CASE WHEN sw.kind IS NOT NULL THEN sw.is_builtin ELSE s.is_builtin END,
                 s.app_bundle_id = CASE WHEN sw.app_bundle_id IS NOT NULL THEN sw.app_bundle_id ELSE s.app_bundle_id END,
-                s.app_team_id = CASE WHEN sw.kind IS NOT NULL THEN sw.app_team_id ELSE s.app_team_id END
+                s.app_team_id = CASE WHEN sw.app_team_id IS NOT NULL THEN sw.app_team_id ELSE s.app_team_id END
         """
         # Chunked like the rel writes: one oversized UNWIND can exceed the
         # query timeout and then fail the same flush on every cycle.
