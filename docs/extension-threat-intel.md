@@ -215,33 +215,19 @@ Rollback: keep `name` and `extension_id` on every node. Take a snapshot before m
 
 ### 4.2 Threat intel (Tier 2)
 
-| Source | Gives | Auth | Free quota | Use |
-|---|---|---|---|---|
-| VirusTotal v3 | file/URL/domain reputation | API key | 4 req/min, 500/day | CRX hash, manifest domains |
-| Google Safe Browsing v4 | URL reputation | API key | daily quota | manifest URLs/domains |
-| URLhaus | malware URLs | Auth-Key | free Auth-Key | network endpoints |
-| ThreatFox | IOCs | Auth-Key | free | domains/IPs |
-| MalwareBazaar | malware hashes | Auth-Key | free | CRX hash |
-| PhishTank / OpenPhish | phishing URLs | none | free | manifest URLs |
-| AlienVault OTX | pulses by domain/hash | API key | free | reputation |
-| URLScan.io | scan/search by domain/hash | API key | 100 scans/day | endpoints |
-| Pulsedive | threat intel | API key | free tier | domains |
-| crt.sh | certificate transparency | none | polite | publisher domain age/history |
-| Tranco | top 1M domains | none | free download | domain popularity |
-| RDAP | domain registration | none | rate-limited | domain age (`.md` unsupported by rdap.org) |
-| EasyList / EasyPrivacy / Disconnect | tracker lists | none | free | classify endpoints |
-| NVD | CVEs | optional key | 5 req/30s | bundled libs |
-| OSV | CVEs for packages | none | free | bundled JS libs |
-| GitHub Advisory | CVEs | none | free | bundled libs |
-| FIRST EPSS | exploit probability | none | free | prioritize |
-| CISA KEV | known exploited | none | free | prioritize |
-| OpenSSF Scorecard | repo health | none | free | publisher trust |
-| deps.dev | dependency graph | none | free | bundled libs |
-| retire.js | vulnerable JS libs | none | free | static scan |
+Only sources keyed by extension ID or package hash are listed (checked against API docs 2026-10-28). URL, domain and CVE services (Safe Browsing, URLhaus, ThreatFox, OTX, Tranco, RDAP, NVD, OSV, EPSS, KEV, etc.) are out: none knows about extensions, and Fleet Hound does not extract endpoints or bundled libraries from extension code.
+
+| Source | Lookup key | Gives | Auth | Free quota | Status |
+|---|---|---|---|---|---|
+| MalExt Sentry | extension ID | ~8k malicious / taken-down Chromium extension IDs with reason, source, date | none | free (CC BY 4.0) | shipped: `config/extension_threat_feeds.json` |
+| VirusTotal v3 | CRX/XPI SHA-256 (`GET /api/v3/files/{hash}`) | per-engine AV verdicts, crowdsourced YARA, first/last seen | API key | 4 req/min, 500/day | TODO. No extension-ID lookup; hits only if the package was submitted. Uploading a CRX on a miss shares it with VT's community |
+| MalwareBazaar | CRX/XPI SHA-256 (`query=get_info`) | family, tags, YARA hits, vendor intel | Auth-Key | free | TODO. Low hit rate: extension samples are mostly stored as `.zip`, not store CRX bytes |
+
+The Mozilla blocklist (§4.1) covers Firefox and is built in.
 
 **Terms check:** VirusTotal's free API is rate-limited and intended for non-commercial use. If Fleet Hound is commercial, stay within terms or rely on the other sources. The design must not depend on VT.
 
-### 4.3 Static analysis (Tier 3, local)
+### 4.3 Static analysis (Tier 3, local) — TODO (Phase 3)
 
 | Tool | Use |
 |---|---|
@@ -252,6 +238,7 @@ Rollback: keep `name` and `extension_id` on every node. Take a snapshot before m
 | Semgrep | custom exfil/obfuscation rules |
 | YARA | malware family rules |
 | gitleaks | secrets in bundles |
+| retire.js | vulnerable bundled JS libs |
 | `crx3` / `crx` | unpack CRX |
 
 Run in a sandbox: no network, CPU/memory/time limits, zip-bomb caps, no code execution.
@@ -278,26 +265,27 @@ Fleet API ──> extractor ──> ingestion ──> Memgraph
                               │                        │
                               │        ┌───────────────┼───────────────┐
                               │        │               │               │
-                              │   store adapters   threat feeds   static scan
-                              │   (Chrome/Edge/    (VT/SB/abuse/   (linter/
-                              │    AMO/Safari)      OTX/OSV)        Semgrep/YARA)
+                              │   store adapters   threat feeds   static scan (TODO)
+                              │   (Chrome/Edge/    (MalExt Sentry, (linter/
+                              │    AMO/Safari)      Mozilla;        Semgrep/YARA)
+                              │                     VT/MB TODO)
                               │        │               │               │
                               └────────┴───────┬───────┴───────────────┘
                                                │
-                                     config/extension_policy.json
+                                     config/extension_policy.json (TODO)
                                                │
-                                     MDM / Fleet profiles
+                                     MDM / Fleet profiles (TODO)
 ```
 
 ### 5.1 Modules
 
 | File | Responsibility |
 |---|---|
-| `internal/extintel` | Pure logic: store adapters, manifest analyzer, scoring, policy export. No HTTP server, no DB. Testable. |
+| `internal/extintel` | Pure logic: store adapters (Chrome/Edge/Opera/AMO/Safari), threat feeds, manifest analyzer, scoring. No HTTP server, no DB. TODO: policy export. |
 | `internal/extworker` | Leader-elected background worker: fingerprint every extension, fetch only due listings, re-score changed ones, batch-write graph, cache/status. |
-| `internal/api/workersapi` | APIs: list/detail/decision/status/policy. |
+| `internal/api/workersapi` | APIs: `/api/extensions`, `/detail`, `/status`, `/refresh`. TODO: decision, policy. |
 | `webviz/static/index.html` | "Extensions" tab. |
-| `config/extension_policy.json` | Generated policy + decisions. |
+| `config/extension_policy.json` | TODO: generated policy + decisions. |
 | `config/extension_cache/` | Raw manifests + metadata (versioned). |
 | `config/extension_status.json` | Worker status for UI. |
 
@@ -324,29 +312,29 @@ Why not inline in ingestion:
 8. Write status: `queue_remaining` (work items left), and `last_cycle` with `due`, `scored`, `fetched` and `refresh_failed` per store, `cache_hits`, `unchanged_skipped`, `deferred`, `rate_limited_stores`. `/api/extensions*` reads `queue_remaining` from this file, not from a live query.
 9. Sleep; respect `EXTENSION_WORKER_INTERVAL_SEC` (default 6h).
 
-Cache tiers (JSON files under `EXTENSION_CACHE_DIR`, key prefix `v14` for listings, `v13` for manifests):
+Cache tiers (JSON files under `EXTENSION_CACHE_DIR`; key prefix `listingKeyVersion` / `manifestKeyVersion` in `internal/extworker/extworker.go`):
 
 | Data | Key | TTL |
 |---|---|---|
 | Store listing, Chrome family | `listing:{store}:{id}` | 7 days (batched RPC; doubles as the takedown check) |
-| Store listing, Edge / Firefox | `listing:{store}:{id}` | 21 to 28 days, jittered by a stable hash of the ID |
+| Store listing, Edge / Opera / Firefox / Safari | `listing:{store}:{id}` | 21 to 28 days, jittered by a stable hash of the ID |
 | Package manifest | `manifest:{store}:{id}:{version}` | never (a version's package is immutable); a hit skips the XPI or unlisted-CRX download |
 | Blocklist / threat feeds | `mozilla:blocklist`, `feed:{name}` | 6h |
-| VT/URL reputation (planned) | | 24h per hash/domain |
-| Static scan (planned) | | until version change |
+| VirusTotal / MalwareBazaar (TODO) | | 24h per hash |
+| Static scan (TODO) | | until version change |
 | Exposure score | none | every cycle (graph query is cheap) |
 
 A refetch that fails falls back to the last good listing, with the failure in `intel_error`, so being offline never drops data. A rate-limited item whose other inputs changed is scored from its last good listing (or locally, for a new blocklist or feed hit with no listing) so a known-bad verdict is never held back; its listing refresh stays due. A rate-limited item with nothing else new is not written and is retried next cycle.
 
 ### 5.3 Failure handling
 
-- Per-source circuit breaker: 3 consecutive failures → skip source for 1h; status shows degraded.
-- Backoff with jitter on 429/5xx.
+- TODO: per-source circuit breaker across cycles (3 consecutive failures → skip source for 1h; status shows degraded).
+- TODO: backoff with jitter on 429/5xx.
 - Implemented today: a per-store, per-cycle breaker. A 429 (or 503 with `Retry-After`) from a store trips it; that store's remaining items are not fetched or cached, and are written only when another input changed (see above), so their listing refresh retries next cycle. A 429 from the batched Chrome listing RPC marks the rest of that batch without further requests. `last_cycle` reports `deferred` and `rate_limited_stores`.
 - One extension failure does not abort the batch.
-- Manifest parse failure → `risk_signals += "manifest-unparseable"`, risk ≥ 60.
+- Manifest parse failure → `manifest-unparseable`, threat ≥ 30. Package not inspectable → `manifest-uninspected`, threat ≥ 15.
 - Never follow arbitrary redirects (SSRF); allowlist store domains.
-- Cap CRX download at 50 MB, extracted files at 10k / 200 MB.
+- Package (CRX/XPI) download capped at 50 MB and 5,000 archive entries; only `manifest.json` is decompressed, capped at 1 MB.
 
 ---
 
@@ -363,7 +351,7 @@ A refetch that fails falls back to the last good listing, with the failure in `i
 | `proxy` | +20 |
 | `userScripts` | +15 |
 | `cookies` | +15 |
-| `webRequest` / `declarativeNetRequest` | +15 |
+| `webRequest` / `declarativeNetRequest` / `declarativeNetRequestWithHostAccess` | +15 |
 | `management` | +15 |
 | `scripting` | +12 |
 | `clipboardRead` | +12 |
@@ -374,73 +362,93 @@ A refetch that fails falls back to the last good listing, with the failure in `i
 | `offscreen` | +6 |
 | `activeTab` | +2 |
 | `storage`, `contextMenus`, `alarms`, `notifications`, `sidePanel` | +1 each |
-| Host `<all_urls>` / `*://*/*` | +20 |
+| Host `<all_urls>`, `*://*/*`, `http://*/*` or `https://*/*` | +20 |
+| Other host patterns | +2 each, max +10 |
 | Content script on `<all_urls>` | +10 |
+| Content script on other patterns | +5 |
+| Chrome Web Store data-collection disclosure | up to +8 |
 | Optional permission | ×0.5 of its weight; optional total capped at the required-permission total |
 | No host permissions and no content-script matches | ×0.6 |
+| Weak CSP (`unsafe-eval` or remote scripts), added after the ×0.6 | +15 |
 
 **Trust (0-100, higher = better):**
 
 | Signal | Weight |
 |---|---|
 | Public store listing | +25 |
+| Store status unknown (metadata unavailable) | +8 |
 | Unlisted | +5 |
-| Removed / not found | 0 |
-| Sideloaded | 0 |
-| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.) — store developer/publisher field only (never Fleet `vendor`), normalized exact match after dropping suffixes like Inc/LLC/Ltd/GmbH. The list is data, not code: `config/known_publishers.json` (one entry per publisher with `added_at`; reloaded on change, no rebuild). Chrome-family trust is by Chrome Web Store publisher ID only (`chrome_publisher_ids`, from the listing RPC's publisher ID; a payload for a different extension ID is rejected whole). Firefox trust is by AMO author user ID only (`amo_author_ids`). Edge exposes no publisher ID, so Edge trust is per extension (`edge_extension_ids`) and only while the store lists the ID as public. Safari trust is by the containing app's Apple code-signing team ID (`apple_team_ids`), read by osquery from the signature on the host. Names are display-only on every store because anyone can register a lookalike. Store-ID trust also needs a store install on every host: each install path must fully match a known browser profile root under the user's home (Chrome/Chromium/Edge/Brave/Vivaldi/Opera/Arc/Comet/Dia `<root>/<profile>/Extensions/<id>/<version>`, Firefox `<root>/<profile>/extensions/<id>.xpi`, macOS/Linux/Windows). A missing path fails closed, except on ChromeOS hosts whose agent never reports one. An unpacked copy claiming the ID (manifest `key`) drops the trust and adds a `not-store-install` signal. Residual: a local user who copies an unpacked extension into the real profile directory still passes; osquery `from_webstore` would close that, but Fleet's software inventory does not expose it. | +15 |
-| MV3 | +10 |
-| Updated < 12 months | +15 |
-| Updated 12-24 months | +5 |
-| Users (log scale) | up to +15 |
-| Rating ≥ 4 with ≥ 100 ratings | +10 |
-| CRX hash matches update2 | +10 |
-| Open-source repo / Scorecard ≥ 7 | +5 |
+| Removed / not found / sideloaded | 0 |
+| Known publisher (Google, Microsoft, Mozilla, Adobe, etc.), matched by store ID only, never by name or Fleet `vendor`. Opera gets no publisher trust (it exposes only a developer username). The list is data, not code: `config/known_publishers.json` (one entry per publisher with `added_at`; reloaded on change, no rebuild). Chrome-family trust is by Chrome Web Store publisher ID only (`chrome_publisher_ids`, from the listing RPC's publisher ID; a payload for a different extension ID is rejected whole). Firefox trust is by AMO author user ID only (`amo_author_ids`). Edge exposes no publisher ID, so Edge trust is per extension (`edge_extension_ids`) and only while the store lists the ID as public. Safari trust is by the containing app's Apple code-signing team ID (`apple_team_ids`), read by osquery from the signature on the host. Names are display-only on every store because anyone can register a lookalike. Store-ID trust also needs a store install on every host: each install path must fully match a known browser profile root under the user's home (Chrome/Chromium/Edge/Brave/Vivaldi/Opera/Arc/Comet/Dia `<root>/<profile>/Extensions/<id>/<version>`, Firefox `<root>/<profile>/extensions/<id>.xpi`, macOS/Linux/Windows). A missing path fails closed, except on ChromeOS hosts whose agent never reports one. An unpacked copy claiming the ID (manifest `key`) drops the trust and adds a `not-store-install` signal. Residual: a local user who copies an unpacked extension into the real profile directory still passes; osquery `from_webstore` would close that, but Fleet's software inventory does not expose it. | +20 |
+| Store-verified developer, or established publisher | +10 |
+| Featured / recommended by the store | +5 |
+| MV3 | +8 |
+| Updated ≤ 12 months | +10 |
+| Updated 12-24 months | +4 |
+| Users | `min(12, 4·log10(users+1))` |
+| Rating ≥ 4 with ≥ 100 ratings | +5 |
+| CRX hash matches update2 | +5 |
 
-**Threat (0-100):**
+**Threat (0-100):** the highest matching signal, not a sum.
 
-| Signal | Weight |
+| Signal | Score |
 |---|---|
 | Mozilla blocklist hit | 100 |
-| VT malicious ≥ 3 | 90 |
-| VT malicious 1-2 | 60 |
-| Safe Browsing hit | 80 |
-| URLhaus/ThreatFox IOC | 80 |
-| Obfuscated code / `eval` / remote script load | +25 |
-| Vulnerable bundled JS (retire.js) | +20 |
-| CVE CVSS ≥ 7 in Fleet `vulnerabilities` | +25 |
-| CISA KEV | +30 |
-| Publisher domain < 90 days | +30 |
-| Domain not in Tranco top 1M | +10 |
+| Threat-feed hit, malware-class reason (malware, spyware, phishing, stealer, …) | 100 |
+| Threat-feed hit, unwanted-class reason (adware, hijacking, bundling, …) | 70 |
+| Removed from store | 45 |
+| Threat-feed hit, other reason (policy takedown) | 45 |
+| Fleet CVE, CVSS ≥ 9 / ≥ 7 / > 0 | 35 / 25 / 10 |
+| Manifest unparseable | 30 |
+| Not found in store / sideloaded | 20 |
+| Package not inspectable (store serves none, or over the download cap) | 15 |
+| Rating < 2.5 with ≥ 50 ratings | 15 |
+| Unlisted | 10 |
+| TODO: VirusTotal, ≥ 3 engines malicious / 1-2 | 90 / 60 |
+| TODO: MalwareBazaar hash hit | TBD |
+| TODO: static scan, obfuscation or remote script load | TBD |
+| TODO: retire.js vulnerable bundled library | TBD |
 
 **Exposure (0-100):**
 
 | Signal | Weight |
 |---|---|
-| Hosts (log scale) | 5-60 |
-| Users (log scale) | up to 20 |
-| Privileged teams (IT/finance/eng) | +20 |
-| Version spread > 2 | +10 |
-| Installed on servers | +20 |
+| Hosts | `min(60, round(15·log10(hosts+1)))` |
+| More than 2 versions in the fleet | +10 |
+| TODO: privileged teams (IT/finance/eng) | +20 |
+| TODO: installed on servers | +20 |
 
 **Composite:**
 
 ```go
-risk := round(0.35*cap + 0.25*(100-trust) + 0.25*threat + 0.15*exposure)
-if threat >= 80 {
-	risk = max(risk, 85)
-}
+risk := round(0.35*cap + 0.25*(100-trust) + 0.25*threat + 0.15*exposure +
+	namePenalty + rarityPenalty)
 ```
+
+- `namePenalty`: malformed or brand-lookalike name, 0-35.
+- `rarityPenalty`: < 100 store installs +8, < 1,000 +4 (both skipped for a known publisher); one host +4; < 3% of a fleet of ≥ 10 hosts +3.
+
+Floors, applied after the sum:
+
+| Condition | Minimum risk |
+|---|---|
+| Known-bad (Mozilla blocklist or malware-class feed hit) | 85; 92 at ≥ 10k users; 96 at ≥ 100k |
+| Unwanted-class feed hit | 70 |
+| Other feed hit, or removed from store | 60 |
+| Not found in store with `namePenalty` ≥ 18 | 55 |
+
+Built-in browser extensions score 0 unless the Mozilla blocklist or a threat feed lists them.
 
 Bands:
 
-| Band | Score | Default decision |
+| Band | Score | Default decision (TODO, Phase 2) |
 |---|---|---|
-| Good | 0-24 | Allow |
-| Watch | 25-49 | Allow + monitor |
-| Review | 50-74 | Review / restrict |
-| Block | 75-100 | Block |
+| `low` | 0-24 | Allow |
+| `medium` | 25-49 | Allow + monitor |
+| `high` | 50-74 | Review / restrict |
+| `critical` | 75-100 | Block |
 
-**Never auto-block:** browser built-ins/component extensions, vendor-signed browser components. Maintain an ID allowlist + path heuristic (`.../Application/<Browser>.app/.../Extensions/`, `.../Microsoft/Edge/Application/...`).
+**Built-ins:** matched by ID (`CHROMIUM_BUILTIN_IDS`, Firefox built-in ID suffixes) or by install root (`_BUILTIN_PATH_RES`: Chrome/Edge/Brave/Vivaldi `...\Application\`, Firefox `browser\features\`, Safari.app and `/System`). They score 0 (see above). TODO (Phase 2): exclude them from auto-block.
 
 ### 6.2 Explainability
 
@@ -596,8 +604,9 @@ Reuse the existing Shadow IT table/filter patterns in `webviz/static/index.html`
 
 ### Phase 3 — Threat feeds + static analysis (4-6 days)
 
-- VT/Safe Browsing/URLhaus/OTX adapters with quotas and caching.
-- Domain intel: Tranco, crt.sh, RDAP, EasyList.
+Shipped: open threat feeds (MalExt Sentry) and Mozilla blocklist matching. Remaining (TODO):
+
+- VirusTotal and MalwareBazaar hash lookups with quotas and caching.
 - Static scan: addons-linter, Tarnish, Semgrep/YARA, retire.js.
 - Alerts: new extension, version change, permission expansion, store removal, blocklist hit.
 - MDM push automation.
@@ -616,15 +625,15 @@ Total: ~3-4 weeks for one engineer. Phase 0 is independent and safe.
 
 ## 10. Operational guardrails
 
-- **SSRF:** allowlist store domains; no arbitrary redirects; timeout 15s; max 50 MB.
-- **Zip bombs:** cap file count (10k) and uncompressed size (200 MB).
-- **No code execution:** static analysis only; sandbox with no network.
-- **Privacy:** send only public artifacts (extension ID, hash, manifest domains) to third parties; never hostnames/users.
-- **Secrets:** API keys in env (`VT_API_KEY`, `SAFE_BROWSING_KEY`, `ABUSECH_AUTH_KEY`), not in `config/`.
-- **Audit:** every decision logged to `config/audit.log` with actor, time, note.
-- **Retention:** raw manifests 90 days; scores/decisions indefinite; cache pruned by age.
-- **Rate limits:** per-source token bucket; jitter; circuit breaker.
-- **Idempotency:** manifest cache keyed by `(store, id, version, sha256)`.
+- **SSRF:** allowlist store domains; no arbitrary redirects; timeout 12s (30s for threat feeds); responses capped at 8 MB, package downloads at 50 MB.
+- **Zip bombs:** at most 5,000 archive entries; only `manifest.json` is decompressed, capped at 1 MB.
+- **No code execution:** packages are only unzipped to read `manifest.json`. TODO (Phase 3): static scan in a sandbox with no network.
+- **Privacy:** send only public artifacts (extension ID, package hash) to third parties; never hostnames/users.
+- **Secrets:** API keys in env (`VT_API_KEY`, `ABUSECH_AUTH_KEY`; both TODO), not in `config/`.
+- **Audit:** TODO (Phase 2): log every decision to `config/audit.log` with actor, time, note.
+- **Retention:** manifests cached per immutable version; `prune_cache()` deletes files of retired key versions. TODO: age-based retention.
+- **Rate limits:** per-store, per-cycle breaker on 429 / 503 + `Retry-After`; listing TTL jittered per ID. TODO: per-source token bucket, cross-cycle breaker.
+- **Idempotency:** manifest cache keyed by `(store, id, version)`.
 
 ---
 
