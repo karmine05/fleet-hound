@@ -49,7 +49,7 @@ Generate one with `openssl rand -hex 32`.
 | **Graph** | Force-directed network: type-coloured nodes, risk halo, degree sizing, zoom/pan, label declutter, selection inspector, Pathfinder. |
 | **Blast Radius** | Impact cascade (seed → hosts → identities → platforms) with the four-axis radar behind a `Cascade / Radar` toggle. |
 | **Shadow IT** | Severity ring + detection-mix ribbon over the filterable detection table. |
-| **Extensions** | Prevalence × risk matrix over the scored extension inventory. |
+| **Extensions** | Prevalence × risk matrix over the scored extension inventory. The detail panel can remove an extension from selected hosts when `EXTENSION_UNINSTALL_ENABLED=true`. |
 | **Changes** | Snapshot timeline, delta ribbon, and a filterable node/edge/property diff. |
 
 UI guarantees:
@@ -103,6 +103,9 @@ All routes are under `/api/` and require the token except `/api/health`.
 | `POST /api/authorize-software` | Approve/deny a title; takes effect on the next read. |
 | `GET /api/extensions` | Scored inventory; filters: `risk`, `store`, `search`, `known_bad`, `include_builtin`. |
 | `GET /api/extensions/status`, `POST /api/extensions/refresh`, `GET /api/extensions/detail` | Worker state and per-extension detail. |
+| `GET /api/extensions/uninstall/preflight?key=…` | Fleet token role, plus per-host status, eligibility and reason. |
+| `POST /api/extensions/uninstall` | Queue a one-off Fleet script per host. Body: `extension_key`, `host_ids` (max 50), `block_reinstall`. `403` when the feature is off. |
+| `GET /api/extensions/uninstall/jobs?key=…`, `GET /api/extensions/uninstall/script?key=…&os=…&block=…` | Latest run per host; the exact script for review. |
 | `GET /api/snapshots?limit=N` | Newest-first snapshot metadata (all by default; `limit` caps at 500). |
 | `GET /api/diff?from=<ts>&to=<ts>` | Added/removed/changed nodes, edges, and properties. |
 | `GET /api/enricher/status`, `POST /api/enricher/trigger` | Wikipedia worker. |
@@ -127,6 +130,8 @@ Read from the container environment (supplied by `.env` through Compose):
 | `SNAPSHOT_RETAIN_DAYS` / `SNAPSHOT_RETAIN_MAX` | `30` / `5000` | Pruned after each ETL run. |
 | `ENRICHER_ENABLED`, `ENRICHER_INTERVAL_SEC`, `ENRICHER_BATCH_SIZE` | `true` / worker defaults | Wikipedia categorization. |
 | `EXTENSION_WORKER_ENABLED`, `_INTERVAL_SEC`, `_BATCH_SIZE`, `_PARALLELISM` | `true` / worker defaults | Extension intel. |
+| `EXTENSION_UNINSTALL_ENABLED` | `false` | Extension removal through Fleet scripts. Needs `FLEET_URL` and a `FLEET_API_TOKEN` with a maintainer or admin role. See the root README. |
+| `EXTENSION_UNINSTALL_WINDOWS` | `false` | Second opt-in for Windows hosts. |
 | `OODA_ENABLED`, `OODA_INTERVAL_SEC`, `OODA_FULL_SCAN_EVERY` | `false` | Autonomous ETL. |
 | `OODA_TEAMS` | *(required)* | Fleet team IDs to scan, comma-separated. ETL and OODA refuse to run without it; `./start.sh` prompts once and saves it. |
 | `SHADOW_IT_OUTLIER_PCT` | `0.03` | Rarity threshold per platform. |

@@ -55,8 +55,12 @@ type Webviz struct {
 	// holder of the dashboard token run a root script on hosts.
 	ExtensionUninstallEnabled  bool   // EXTENSION_UNINSTALL_ENABLED (default false)
 	ExtensionUninstallJobsPath string // EXTENSION_UNINSTALL_JOBS_PATH (<ConfigDir>/extension_uninstall_jobs.json)
-	FleetURL                   string // FLEET_URL, trimmed
-	FleetAPIToken              string // FLEET_API_TOKEN(_FILE)
+	// Windows hosts need their own opt-in: the PowerShell script runs as
+	// SYSTEM and cannot drop to the profile owner, so a local user who swaps
+	// a folder for a junction mid-run could redirect a delete.
+	ExtensionUninstallWindows bool   // EXTENSION_UNINSTALL_WINDOWS (default false)
+	FleetURL                  string // FLEET_URL, trimmed
+	FleetAPIToken             string // FLEET_API_TOKEN(_FILE)
 
 	OODAEnabled       bool   // OODA_ENABLED (default false)
 	OODAIntervalSec   int    // OODA_INTERVAL_SEC (1800)
@@ -125,6 +129,7 @@ func LoadWebviz() *Webviz {
 
 		ExtensionUninstallEnabled:  Bool("EXTENSION_UNINSTALL_ENABLED", false),
 		ExtensionUninstallJobsPath: Str("EXTENSION_UNINSTALL_JOBS_PATH", in("extension_uninstall_jobs.json")),
+		ExtensionUninstallWindows:  Bool("EXTENSION_UNINSTALL_WINDOWS", false),
 		FleetURL:                   StrTrim("FLEET_URL", ""),
 		FleetAPIToken:              ResolveSecret("FLEET_API_TOKEN", ""),
 

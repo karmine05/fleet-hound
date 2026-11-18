@@ -119,6 +119,8 @@ services:
       # holder of WEBVIZ_API_TOKEN run a root script on hosts. Needs a Fleet
       # API token with a maintainer or admin role.
       - EXTENSION_UNINSTALL_ENABLED
+      # Windows hosts need this second opt-in (see .env.example).
+      - EXTENSION_UNINSTALL_WINDOWS
       # Shadow IT outlier threshold (fraction of platform hosts; default 0.03).
       # Drives /api/shadow-it detection AND enrichment-candidate selection.
       - SHADOW_IT_OUTLIER_PCT

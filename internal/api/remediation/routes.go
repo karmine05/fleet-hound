@@ -57,6 +57,14 @@ func (rt *routes) enabled() bool {
 	return rt.d.Cfg != nil && rt.d.Cfg.ExtensionUninstallEnabled
 }
 
+// osBlocked is why removal is off for a script OS, or "".
+func (rt *routes) osBlocked(osName string) string {
+	if osName == remediate.OSWindows && (rt.d.Cfg == nil || !rt.d.Cfg.ExtensionUninstallWindows) {
+		return "Removal on Windows is turned off. Set EXTENSION_UNINSTALL_WINDOWS=true to turn it on."
+	}
+	return ""
+}
+
 // extHost is one host that has the extension, from the graph.
 type extHost struct {
 	FleetHostID int64
@@ -303,6 +311,8 @@ func (rt *routes) preflight(w http.ResponseWriter, r *http.Request) {
 			reason = blocker
 		case !osOK:
 			reason = "Fleet cannot run scripts on this platform."
+		case rt.osBlocked(osName) != "":
+			reason = rt.osBlocked(osName)
 		case !me.CanRunOn(h.TeamID):
 			reason = "The Fleet API token has no maintainer or admin role on this host's team."
 		case states[i] != nil && states[i].ScriptsEnabled != nil && !*states[i].ScriptsEnabled:
@@ -560,6 +570,8 @@ func (rt *routes) uninstall(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case !osOK:
 			job.Detail = "Fleet cannot run scripts on this platform."
+		case rt.osBlocked(osName) != "":
+			job.Detail = rt.osBlocked(osName)
 		case pending[id]:
 			job.Detail = "A removal is already queued for this host."
 			duplicate[i] = true
