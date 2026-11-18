@@ -51,10 +51,47 @@ function Get-UserHomes {
             Where-Object { $skip -notcontains $_.Name } | ForEach-Object { $_.FullName })
 }
 
-function Remove-Target([string]$path) {
-    if (-not (Test-Path -LiteralPath $path)) { return }
+function Test-Link($item) {
+    return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+
+# These folders belong to users and this script runs as SYSTEM, so a planted
+# junction or symlink must never steer a delete. True when no directory
+# between the user home and the target is a reparse point.
+function Test-NoLinkParents([string]$userHome, [string]$path) {
+    $p = Split-Path -Parent $path
+    while ($p -and ($p.TrimEnd('\', '/') -ne $userHome.TrimEnd('\', '/'))) {
+        $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if (-not $item -or (Test-Link $item)) { return $false }
+        $p = Split-Path -Parent $p
+    }
+    return [bool]$p
+}
+
+# Deletes a tree without following links: a reparse point is unlinked, never
+# entered. Remove-Item -Recurse is not used because Windows PowerShell 5.1
+# follows junctions with it.
+function Remove-Tree([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer) {
+        if (-not (Test-Link $item)) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $path -Force)) { Remove-Tree $child.FullName }
+        }
+        [IO.Directory]::Delete($path, $false)
+    } else {
+        $item.Attributes = [IO.FileAttributes]::Normal
+        [IO.File]::Delete($path)
+    }
+}
+
+function Remove-Target([string]$userHome, [string]$path) {
+    if (-not (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue)) { return }
+    if (-not (Test-NoLinkParents $userHome $path)) {
+        Write-Output "skipped (link in path): $path"
+        return
+    }
     try {
-        Remove-Item -LiteralPath $path -Recurse -Force
+        Remove-Tree $path
         $script:removed++
         Write-Output "removed: $path"
     } catch {
@@ -70,9 +107,9 @@ function Remove-Chromium {
             if (-not (Test-Path -LiteralPath $base)) { continue }
             # Every profile (Default, Profile 1, ...) plus a profile-less root.
             foreach ($profileDir in @(Get-ChildItem -LiteralPath $base -Directory -Force)) {
-                Remove-Target (Join-Path (Join-Path $profileDir.FullName 'Extensions') $ExtId)
+                Remove-Target $userHome (Join-Path (Join-Path $profileDir.FullName 'Extensions') $ExtId)
             }
-            Remove-Target (Join-Path (Join-Path $base 'Extensions') $ExtId)
+            Remove-Target $userHome (Join-Path (Join-Path $base 'Extensions') $ExtId)
         }
     }
 }
@@ -83,8 +120,8 @@ function Remove-Firefox {
         if (-not (Test-Path -LiteralPath $profiles)) { continue }
         foreach ($profileDir in @(Get-ChildItem -LiteralPath $profiles -Directory -Force)) {
             $ext = Join-Path $profileDir.FullName 'extensions'
-            Remove-Target (Join-Path $ext "$ExtId.xpi")
-            Remove-Target (Join-Path $ext $ExtId)
+            Remove-Target $userHome (Join-Path $ext "$ExtId.xpi")
+            Remove-Target $userHome (Join-Path $ext $ExtId)
         }
     }
 }

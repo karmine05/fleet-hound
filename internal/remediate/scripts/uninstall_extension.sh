@@ -65,8 +65,33 @@ firefox_roots() {
     fi
 }
 
+# These folders belong to users and this script runs as root, so a planted
+# link must never steer a delete. True when no directory between home ($1) and
+# the target ($2) is a symbolic link.
+no_link_parents() {
+    p=$(dirname "$2")
+    while [ "$p" != "$1" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
+        [ -L "$p" ] && return 1
+        p=$(dirname "$p")
+    done
+    return 0
+}
+
+# remove_path HOME TARGET. A target that is itself a link is unlinked, never
+# followed; rm -rf does not follow links inside the tree.
 remove_path() {
-    [ -e "$1" ] || [ -L "$1" ] || return 0
+    [ -e "$2" ] || [ -L "$2" ] || return 0
+    if ! no_link_parents "$1" "$2"; then
+        echo "skipped (symbolic link in path): $2"
+        return 0
+    fi
+    set -- "$2"
+    if [ -L "$1" ]; then
+        rm -f -- "$1" && printf '%s\n' "$1" >>"$LOG" && echo "removed link: $1" && return 0
+        printf '%s\n' "$1" >>"$ERR"
+        echo "FAILED to remove: $1"
+        return 0
+    fi
     if rm -rf -- "$1"; then
         printf '%s\n' "$1" >>"$LOG"
         echo "removed: $1"
@@ -80,10 +105,10 @@ remove_chromium() {
     homes | while IFS= read -r home; do
         chromium_roots | while IFS= read -r rel; do
             base="$home/$rel"
-            [ -d "$base" ] || continue
+            [ -d "$base" ] && [ ! -L "$base" ] || continue
             # Every profile (Default, Profile 1, ...) plus a profile-less root.
             for dir in "$base"/*/Extensions/"$EXT_ID" "$base"/Extensions/"$EXT_ID"; do
-                remove_path "$dir"
+                remove_path "$home" "$dir"
             done
         done
     done
@@ -94,8 +119,8 @@ remove_firefox() {
         firefox_roots | while IFS= read -r rel; do
             for prof in "$home/$rel"/*; do
                 [ -d "$prof/extensions" ] || continue
-                remove_path "$prof/extensions/$EXT_ID.xpi"
-                remove_path "$prof/extensions/$EXT_ID"
+                remove_path "$home" "$prof/extensions/$EXT_ID.xpi"
+                remove_path "$home" "$prof/extensions/$EXT_ID"
             done
         done
     done
