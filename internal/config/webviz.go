@@ -51,6 +51,13 @@ type Webviz struct {
 	ExtensionWorkerStatusPath  string // EXTENSION_WORKER_STATUS_PATH (<ConfigDir>/extension_status.json)
 	ExtensionCacheDir          string // EXTENSION_CACHE_DIR (<ConfigDir>/extension_cache)
 
+	// Extension removal through Fleet scripts. Off by default: it lets a
+	// holder of the dashboard token run a root script on hosts.
+	ExtensionUninstallEnabled  bool   // EXTENSION_UNINSTALL_ENABLED (default false)
+	ExtensionUninstallJobsPath string // EXTENSION_UNINSTALL_JOBS_PATH (<ConfigDir>/extension_uninstall_jobs.json)
+	FleetURL                   string // FLEET_URL, trimmed
+	FleetAPIToken              string // FLEET_API_TOKEN(_FILE)
+
 	OODAEnabled       bool   // OODA_ENABLED (default false)
 	OODAIntervalSec   int    // OODA_INTERVAL_SEC (1800)
 	OODAFullScanEvery int    // OODA_FULL_SCAN_EVERY (24; 0 disables)
@@ -115,6 +122,11 @@ func LoadWebviz() *Webviz {
 		ExtensionWorkerTriggerPath: Str("EXTENSION_WORKER_TRIGGER_PATH", in(".extensions.trigger")),
 		ExtensionWorkerStatusPath:  Str("EXTENSION_WORKER_STATUS_PATH", in("extension_status.json")),
 		ExtensionCacheDir:          Str("EXTENSION_CACHE_DIR", in("extension_cache")),
+
+		ExtensionUninstallEnabled:  Bool("EXTENSION_UNINSTALL_ENABLED", false),
+		ExtensionUninstallJobsPath: Str("EXTENSION_UNINSTALL_JOBS_PATH", in("extension_uninstall_jobs.json")),
+		FleetURL:                   StrTrim("FLEET_URL", ""),
+		FleetAPIToken:              ResolveSecret("FLEET_API_TOKEN", ""),
 
 		OODAEnabled:       Bool("OODA_ENABLED", false),
 		OODAIntervalSec:   Int("OODA_INTERVAL_SEC", 1800),
