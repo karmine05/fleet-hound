@@ -23,6 +23,7 @@ Everything ships as two containers. There is no host-side Go toolchain or dev se
 | **Blast Radius & Path Tracing** | Walks the graph from a compromised host, identity, or package to surface host reach, user impact, lateral movement, and platform spread. | `GET /api/blast-radius`, `GET /api/path` |
 | **Shadow IT Detection** | Flags software a user deliberately installed that is rare across the fleet, high-risk by category, or version-sprawled. | `GET /api/shadow-it`, `internal/catalog/shadow_it_filter.go` |
 | **Extension Threat Intel** | Scores every browser extension (capability, trust, blocklist, rarity, install base) and plots prevalence × risk. | `internal/extintel`, `internal/extworker`, `GET /api/extensions` |
+| **Extension Removal** | Removes a browser extension from selected hosts with a one-off Fleet script, and can block reinstall. Off by default. | `internal/remediate`, `internal/api/remediation`, `POST /api/extensions/uninstall` |
 | **Wikipedia Enrichment** | Background worker attaches `category` + `description` to `Software` nodes; single-leader via a `flock` on the config volume. | `internal/enrich`, `fleethound categorize` |
 | **Graph Snapshots & Diff** | Streams the full graph to gzipped JSONL per ETL run; the UI diffs any two snapshots by node, edge, and property. | `internal/snapshot`, `GET /api/snapshots`, `GET /api/diff` |
 | **Software Authorization** | Operators approve software, mutating Shadow IT scoring on the next read. Persisted atomically. | `POST /api/authorize-software` |
@@ -64,6 +65,8 @@ Severity ring, detection-mix ribbon, and the filterable detection table. Approvi
 ### Extensions
 
 Prevalence × risk matrix over the scored extension inventory, with known-bad, unassessed, and per-store filters.
+
+Open an extension to see its signals and hosts. When [extension removal](#removing-extensions) is on, the same panel removes it from the hosts you select.
 
 ![Extensions](assets/extensions.png)
 
@@ -232,6 +235,8 @@ Other subcommands: `serve` (the dashboard, image default), `clear-db`, `categori
 | `KNOWN_PUBLISHERS_FILE` | no | Override path of the known-good extension publisher list (default `config/known_publishers.json`). Edit that file to trust a publisher: add an entry with `name`, `added_at` (ISO 8601 UTC) and, for Chrome/Brave/Vivaldi/Opera, `chrome_publisher_ids` (the `u…` ID from the listing's publisher link). For Firefox, add `amo_author_ids` (integer `authors[].id` from `https://addons.mozilla.org/api/v5/addons/addon/<guid>/`). For Edge (no publisher ID in its store), list individual extensions in `edge_extension_ids`; they count only while the Edge store lists them as public. For Safari, add `apple_team_ids` (the 10-character code-signing team of the extension's containing app, e.g. `codesign -dv /Applications/X.app` → `TeamIdentifier`). Every store trusts only these IDs; `match_names` are display-only. Applied on the next scoring cycle; no rebuild. |
 | `EXTENSION_THREAT_FEEDS_FILE` | no | Override path of the open threat-feed list (default `config/extension_threat_feeds.json`). Every fleet extension is matched against every feed each cycle. Add a feed with `name`, `url` (https), `format` (`csv`), `platform` (`chromium` or `firefox`), `id_field`, optional `reason_field`/`source_field`/`date_field`, and `added_at`. Ships with MalExt Sentry (CC BY 4.0). Feed health and per-store enrichment coverage appear in `GET /api/extensions/status` (`threat_feeds`, `coverage`) and on the Extensions tab status line. |
 | `EXTENSION_WORKER_ENABLED` / `_INTERVAL_SEC` / `_BATCH_SIZE` / `_PARALLELISM` | no | Extension intel worker tuning. |
+| `EXTENSION_UNINSTALL_ENABLED` | no | **Default OFF.** Turns on [extension removal](#removing-extensions). It lets a holder of `WEBVIZ_API_TOKEN` run a root/SYSTEM script on hosts, and needs a `FLEET_API_TOKEN` with a maintainer or admin role. |
+| `EXTENSION_UNINSTALL_WINDOWS` | no | **Default OFF.** Second opt-in for Windows hosts; see [Removing extensions](#removing-extensions) for the reason. |
 | `OODA_ENABLED` / `_INTERVAL_SEC` / `_FULL_SCAN_EVERY` / `_TEAMS` | no | Autonomous supervisor (below). |
 | `SHADOW_IT_OUTLIER_PCT` | no | Outlier threshold as a fraction of a platform's hosts. Default `0.03`. |
 | `SHADOW_IT_INCLUDE_LINUX_PACKAGES` | no | Include `deb`/`rpm` packages. **Default OFF** — osquery can't distinguish a deliberate `apt install` from a transitive dependency. |
@@ -255,6 +260,10 @@ All routes are under `/api/`. Send the token as `Authorization: Bearer <token>` 
 | `GET /api/shadow-it` | Outlier-software ranking with whitelist suppression. |
 | `POST /api/authorize-software` | Mark software as approved. |
 | `GET /api/extensions?risk=…&store=…&search=…` | Scored extension inventory. |
+| `GET /api/extensions/uninstall/preflight?key=…` | Whether removal is possible: the Fleet token's role, and per host its status, eligibility and the reason when not eligible. |
+| `POST /api/extensions/uninstall` | Queue removal. Body: `{"extension_key": "…", "host_ids": [1, 2], "block_reinstall": true}`. At most 50 hosts per request. |
+| `GET /api/extensions/uninstall/jobs?key=…` | Latest removal run per host, refreshed from Fleet. |
+| `GET /api/extensions/uninstall/script?key=…&os=macos\|linux\|windows&block=0\|1` | The exact script a removal would send, for review. |
 | `GET /api/snapshots?limit=N` | Snapshot list, newest first (default 100, max 500). |
 | `GET /api/diff?from=<ts>&to=<ts>` | Per-property, node, and edge diff between two snapshots. |
 | `GET /api/ooda/status`, `/findings`, `/cycles`, `POST /trigger` | OODA supervisor introspection. |
@@ -279,6 +288,59 @@ Premise: **ubiquitous software is sanctioned; rare software is suspect.** Three 
 
 ---
 
+## Removing extensions
+
+Off by default. To turn it on, set this in `.env` and restart the dashboard:
+
+```ini
+EXTENSION_UNINSTALL_ENABLED=true
+# EXTENSION_UNINSTALL_WINDOWS=true   # second opt-in for Windows hosts, see below
+```
+
+Then open **Extensions**, click an extension, and use **Remove from N hosts**. Eligible hosts are pre-selected; one confirm queues the removal. Each host row shows `Queued`, then `Removed`, `Not found` or `Failed`, with the script output.
+
+**How it works**
+
+- There are two generic scripts: POSIX `sh` for macOS and Linux, PowerShell for Windows. The server fills in three parameters per run (extension ID, store, block flag). The script finds the users, browsers and profiles on the host. No per-extension script exists and nothing is saved in Fleet.
+- The script is sent with Fleet's one-off script API (`POST /api/v1/fleet/scripts/run`). An online host picks it up within about a minute. An offline host runs it when it next checks in.
+- The extension leaves the inventory after Fleet next refreshes the host's software and Fleet Hound syncs.
+- **View script** shows the exact script before you send it. Every request is written to `config/audit.log`.
+
+**What the script does**
+
+| Host OS | Removes | Can block reinstall | Deletes as |
+|---------|---------|---------------------|------------|
+| Linux | Extension folder in every user and profile (Chrome, Edge, Brave, Chromium, Opera, Vivaldi); Firefox `.xpi` | Yes, with a managed browser policy (not Opera or Vivaldi) | The profile's owner |
+| macOS | Same | No. A mandatory browser policy on macOS needs a configuration profile | The profile's owner |
+| Windows | Same | Yes, with a registry policy (Chromium family only) | SYSTEM |
+
+**Requirements**
+
+- `FLEET_API_TOKEN` with a **maintainer** or **admin** role, global or on the host's team. Observer roles cannot run scripts. The panel shows the token's role and the reason for each host that is not eligible.
+- fleetd with scripts enabled on the host (`fleetctl package --enable-scripts`, or MDM-enrolled macOS).
+
+**Limits**
+
+- The browser drops the extension at its next restart. Firefox stays in the inventory until it next starts.
+- Without a block, the user can install the extension again.
+- The block is skipped, and reported, when the host already has a browser policy that sets `ExtensionSettings`. Add the ID to that policy instead.
+- Safari extensions ship inside an app and are not removed. Unpacked extensions outside the browser profile are reported as not found.
+- Built-in browser extensions cannot be removed.
+
+**Security model**
+
+- The feature turns the dashboard token into the ability to run a root/SYSTEM script on hosts, which is why it is off by default.
+- The extension ID is validated against a strict pattern before it is written into the script, and only hosts that the graph shows with that extension can be targeted.
+- The scripts work inside folders that users can write to. They refuse any path that goes through a symbolic link or junction, and never follow links while deleting. On macOS and Linux the delete also runs as the profile's owner, so a link swapped in mid-run cannot reach anything that user could not already delete.
+- The Windows script cannot drop to the profile's owner. A local user who swaps a folder for a junction while it runs could redirect a delete. That is why Windows needs `EXTENSION_UNINSTALL_WINDOWS=true` as a separate opt-in.
+
+**Verification status**
+
+- Linux: tested end to end against a lab Fleet server (removal, block, offline queue, observer token refused).
+- macOS and Windows: the scripts were tested against fixture folder trees only, not yet through Fleet on real hosts. The Windows registry block has not run on Windows.
+
+---
+
 ## Autonomous mode (OODA)
 
 ```ini
@@ -297,7 +359,8 @@ OODA_FULL_SCAN_EVERY=24       # refresh per-team watermarks every ~12h
 fleet-hound/
 ├── cmd/fleethound/          # single binary: serve, etl, clear-db, categorize, selfcheck, healthcheck
 ├── internal/                # Go packages: server, api/*, etl, fleet, ingest, snapshot,
-│                            #   extintel, extworker, enrich, ooda, catalog, hostfilter, graphdb
+│                            #   extintel, extworker, remediate, enrich, ooda, catalog,
+│                            #   hostfilter, graphdb
 ├── go.mod / go.sum          # module github.com/karmine05/fleet-hound
 ├── start.sh / stop.sh       # docker compose wrappers
 ├── Dockerfile               # multi-stage: static Go build -> distroless, uid 10001, read-only rootfs

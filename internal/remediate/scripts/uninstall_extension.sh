@@ -77,27 +77,43 @@ no_link_parents() {
     return 0
 }
 
-# remove_path HOME TARGET. A target that is itself a link is unlinked, never
-# followed; rm -rf does not follow links inside the tree.
+# Runs a command as uid $1, gid $2. Deleting as the folder's owner closes the
+# check-then-delete race: a link swapped in mid-run can only reach what that
+# user could already delete.
+run_as() {
+    uid=$1
+    gid=$2
+    shift 2
+    if [ "$uid" = "$(id -u)" ]; then
+        "$@"
+    elif [ "$OS" = "Darwin" ]; then
+        sudo -n -u "#$uid" "$@"
+    elif command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
+    elif command -v runuser >/dev/null 2>&1; then
+        runuser -u "$(id -nu "$uid")" -- "$@"
+    else
+        echo "cannot drop privileges to uid $uid"
+        return 126
+    fi
+}
+
+# remove_path HOME TARGET. rm -rf unlinks a target that is itself a link and
+# does not follow links inside the tree.
 remove_path() {
     [ -e "$2" ] || [ -L "$2" ] || return 0
     if ! no_link_parents "$1" "$2"; then
         echo "skipped (symbolic link in path): $2"
         return 0
     fi
-    set -- "$2"
-    if [ -L "$1" ]; then
-        rm -f -- "$1" && printf '%s\n' "$1" >>"$LOG" && echo "removed link: $1" && return 0
-        printf '%s\n' "$1" >>"$ERR"
-        echo "FAILED to remove: $1"
-        return 0
-    fi
-    if rm -rf -- "$1"; then
-        printf '%s\n' "$1" >>"$LOG"
-        echo "removed: $1"
+    if [ "$OS" = "Darwin" ]; then ids=$(stat -f '%u %g' "$1"); else ids=$(stat -c '%u %g' "$1"); fi
+    # shellcheck disable=SC2086 # ids is "uid gid": two words on purpose
+    if [ -n "$ids" ] && run_as $ids rm -rf -- "$2"; then
+        printf '%s\n' "$2" >>"$LOG"
+        echo "removed: $2"
     else
-        printf '%s\n' "$1" >>"$ERR"
-        echo "FAILED to remove: $1"
+        printf '%s\n' "$2" >>"$ERR"
+        echo "FAILED to remove: $2"
     fi
 }
 
