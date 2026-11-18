@@ -18,15 +18,18 @@ import (
 
 	"github.com/karmine05/fleet-hound/internal/api/entities"
 	"github.com/karmine05/fleet-hound/internal/api/graphapi"
+	"github.com/karmine05/fleet-hound/internal/api/remediation"
 	"github.com/karmine05/fleet-hound/internal/api/shadowit"
 	"github.com/karmine05/fleet-hound/internal/api/workersapi"
 	"github.com/karmine05/fleet-hound/internal/app"
 	"github.com/karmine05/fleet-hound/internal/config"
 	"github.com/karmine05/fleet-hound/internal/enrich"
 	"github.com/karmine05/fleet-hound/internal/extworker"
+	"github.com/karmine05/fleet-hound/internal/fleet"
 	"github.com/karmine05/fleet-hound/internal/graphdb"
 	"github.com/karmine05/fleet-hound/internal/httpx"
 	"github.com/karmine05/fleet-hound/internal/ooda"
+	"github.com/karmine05/fleet-hound/internal/remediate"
 	"github.com/karmine05/fleet-hound/internal/workerutil"
 )
 
@@ -77,9 +80,13 @@ func New(cfg *config.Webviz, db *graphdb.DB, log *slog.Logger) *Server {
 		DB:                   db,
 		Log:                  log,
 		Whitelist:            &app.Whitelist{Path: cfg.WhitelistFile},
+		UninstallJobs:        remediate.NewStore(cfg.ExtensionUninstallJobsPath),
 		StartEnricher:        s.ensureEnricherStarted,
 		StartOODA:            s.ensureOODAStarted,
 		StartExtensionWorker: s.ensureExtensionWorkerStarted,
+	}
+	if cfg.FleetURL != "" && cfg.FleetAPIToken != "" {
+		s.deps.Fleet = fleet.NewScriptClient(cfg.FleetURL, cfg.FleetAPIToken, !cfg.Insecure)
 	}
 	s.routes()
 	return s
@@ -97,6 +104,7 @@ func (s *Server) routes() {
 	graphapi.Register(m, s.deps)
 	shadowit.Register(m, s.deps)
 	workersapi.Register(m, s.deps)
+	remediation.Register(m, s.deps)
 }
 
 // Handler returns the full middleware chain:

@@ -16,8 +16,10 @@ import (
 	"time"
 
 	"github.com/karmine05/fleet-hound/internal/config"
+	"github.com/karmine05/fleet-hound/internal/fleet"
 	"github.com/karmine05/fleet-hound/internal/graphdb"
 	"github.com/karmine05/fleet-hound/internal/httpx"
+	"github.com/karmine05/fleet-hound/internal/remediate"
 	"github.com/karmine05/fleet-hound/internal/workerutil"
 )
 
@@ -28,6 +30,11 @@ type Deps struct {
 	Log *slog.Logger   // `logger`
 
 	Whitelist *Whitelist // load_whitelist / save_whitelist / WHITELIST_FILE
+
+	// Extension removal. Fleet is nil when FLEET_URL or FLEET_API_TOKEN is
+	// unset; UninstallJobs is the run history.
+	Fleet         *fleet.ScriptClient
+	UninstallJobs *remediate.Store
 
 	// Idempotent worker boot hooks (_ensure_enricher_started,
 	// _ensure_ooda_started, _ensure_extension_worker_started). Never nil

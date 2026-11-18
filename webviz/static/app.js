@@ -4950,12 +4950,16 @@ async function showExtensionDetail(key) {
             </div>
             <div class="detail-row" style="border-bottom:none;">
                 <div class="detail-label">Hosts (${data.host_count || 0})</div>
-                <div class="detail-value" style="max-height: 200px; overflow-y: auto;">
-                    <table class="detections-table"><thead><tr><th>Host</th><th>Version</th><th>Path / source</th></tr></thead><tbody>${hosts || '<tr><td colspan="3" class="text-sm text-secondary">No hosts</td></tr>'}</tbody></table>
+                <div class="detail-value" id="ext-hosts-cell">
+                    <div style="max-height: 200px; overflow-y: auto;">
+                        <table class="detections-table"><thead><tr><th>Host</th><th>Version</th><th>Path / source</th></tr></thead><tbody>${hosts || '<tr><td colspan="3" class="text-sm text-secondary">No hosts</td></tr>'}</tbody></table>
+                    </div>
                 </div>
             </div>
         `;
         modal.classList.add('visible');
+        // The plain host table above stays if the removal preflight fails.
+        _extRemovalLoad(ext.extension_key || key, data.hosts || []);
     } catch (error) {
         showStatus(`Extension detail failed: ${error.message}`, true);
     }
@@ -4988,9 +4992,299 @@ function closeExtensionDetails(event) {
     const modal = document.getElementById('extension-details-modal');
     if (event && event.target !== modal) return;
     modal.classList.remove('visible');
+    _extRemovalStop();
+}
+
+// ---- extension removal (Fleet script per host) ----
+// One state object for the open detail modal. `pre` is the last
+// /api/extensions/uninstall/preflight reply; everything renders from it.
+const _extRemoval = {
+    key: null, pre: null, paths: {}, selected: new Set(), block: true,
+    confirming: false, busy: false, timer: null, openOutput: new Set(), scripts: null,
+};
+
+const _EXT_JOB_LABEL = {
+    queued: 'Queued', removed: 'Removed', not_found: 'Not found', failed: 'Failed', rejected: 'Rejected',
+};
+const _EXT_JOB_CLASS = { queued: 'warn', removed: 'good', not_found: '', failed: 'bad', rejected: 'bad' };
+const _EXT_OS_LABEL = { macos: 'macOS', linux: 'Linux', windows: 'Windows' };
+
+function _extRemovalStop() {
+    if (_extRemoval.timer) clearInterval(_extRemoval.timer);
+    _extRemoval.timer = null;
+    _extRemoval.key = null;
+}
+
+async function _extRemovalLoad(key, detailHosts) {
+    _extRemovalStop();
+    Object.assign(_extRemoval, {
+        key, pre: null, paths: {}, selected: new Set(), block: true,
+        confirming: false, busy: false, openOutput: new Set(), scripts: null,
+    });
+    (detailHosts || []).forEach(h => { _extRemoval.paths[h.hostname] = h.installed_path || h.source || ''; });
+    await _extRemovalRefresh(true);
+}
+
+// Re-reads the preflight. preselect=true ticks every eligible host, so the
+// common case is one click on Remove plus one on Confirm.
+async function _extRemovalRefresh(preselect) {
+    const key = _extRemoval.key;
+    if (!key) return;
+    try {
+        const resp = await fetch(`/api/extensions/uninstall/preflight?key=${encodeURIComponent(key)}`);
+        const data = await resp.json();
+        if (_extRemoval.key !== key) return;
+        if (!resp.ok) throw new Error(data.error || 'preflight failed');
+        _extRemoval.pre = data;
+        const eligible = (data.hosts || []).filter(h => h.eligible).map(h => h.fleet_host_id);
+        if (preselect) {
+            _extRemoval.selected = new Set(eligible.slice(0, data.max_hosts || 50));
+        } else {
+            _extRemoval.selected = new Set([..._extRemoval.selected].filter(id => eligible.includes(id)));
+        }
+        _extRemovalRender();
+        _extRemovalPollIfPending();
+    } catch (error) {
+        console.error('Extension removal preflight failed:', error);
+    }
+}
+
+function _extRemovalPollIfPending() {
+    const pending = ((_extRemoval.pre || {}).hosts || []).some(h => h.job && h.job.status === 'queued');
+    if (!pending) {
+        if (_extRemoval.timer) clearInterval(_extRemoval.timer);
+        _extRemoval.timer = null;
+        return;
+    }
+    if (_extRemoval.timer) return;
+    _extRemoval.timer = setInterval(async () => {
+        const key = _extRemoval.key;
+        const modal = document.getElementById('extension-details-modal');
+        if (!key || !modal.classList.contains('visible')) { _extRemovalStop(); return; }
+        try {
+            const resp = await fetch(`/api/extensions/uninstall/jobs?key=${encodeURIComponent(key)}`);
+            const data = await resp.json();
+            if (!resp.ok || _extRemoval.key !== key) return;
+            const byHost = new Map((data.jobs || []).map(j => [j.fleet_host_id, j]));
+            let finished = false;
+            (_extRemoval.pre.hosts || []).forEach(h => {
+                const job = byHost.get(h.fleet_host_id);
+                if (!job) return;
+                if (h.job && h.job.status === 'queued' && job.status !== 'queued') finished = true;
+                h.job = job;
+            });
+            // A finished run changes eligibility: read the preflight again.
+            if (finished) await _extRemovalRefresh(false);
+            else _extRemovalRender();
+        } catch (error) {
+            console.error('Extension removal poll failed:', error);
+        }
+    }, 4000);
+}
+
+function _extJobCell(h) {
+    const job = h.job;
+    if (!job) {
+        return h.eligible ? '<span class="text-sm" style="color: var(--text-tertiary);">—</span>'
+            : `<span class="text-sm ext-remove-why">${escapeHtml(h.reason || 'Not available')}</span>`;
+    }
+    const cls = _EXT_JOB_CLASS[job.status] || '';
+    let label = _EXT_JOB_LABEL[job.status] || job.status;
+    if (job.status === 'queued' && h.status === 'offline') label += ' · host offline';
+    if (job.status === 'removed' && job.block_state === 'written') label += ' · reinstall blocked';
+    const notes = [];
+    if (job.detail) notes.push(job.detail);
+    if (job.block_state === 'skipped_existing_policy') {
+        notes.push('Block skipped: a browser policy on this host already sets ExtensionSettings. Add the ID there.');
+    } else if (job.block_state === 'failed') {
+        notes.push('The block policy could not be written.');
+    }
+    const open = _extRemoval.openOutput.has(h.fleet_host_id);
+    const toggle = job.output
+        ? ` <button type="button" class="btn btn-ghost btn-sm" data-ext-act="output" data-host="${h.fleet_host_id}">${open ? 'Hide output' : 'Output'}</button>` : '';
+    return `<span class="extension-signal ${cls}">${escapeHtml(label)}</span>${toggle}`
+        + notes.map(n => `<div class="text-sm ext-remove-why">${escapeHtml(n)}</div>`).join('')
+        + (open && job.output ? `<pre class="ext-remove-pre">${escapeHtml(job.output)}</pre>` : '');
+}
+
+function _extRemovalRender() {
+    const cell = document.getElementById('ext-hosts-cell');
+    const pre = _extRemoval.pre;
+    if (!cell || !pre) return;
+    const hosts = pre.hosts || [];
+    const sel = _extRemoval.selected;
+    const eligible = hosts.filter(h => h.eligible);
+    const chosen = hosts.filter(h => sel.has(h.fleet_host_id));
+    const canBlock = chosen.some(h => h.can_block);
+    const hasMac = chosen.some(h => h.os === 'macos');
+    const n = chosen.length;
+    const plural = n === 1 ? 'host' : 'hosts';
+
+    const rows = hosts.map(h => {
+        const dot = h.status === 'online' ? 'good' : (h.status === 'offline' ? 'warn' : '');
+        const box = pre.ready
+            ? `<td><input type="checkbox" data-ext-act="pick" data-host="${h.fleet_host_id}" aria-label="Select ${escapeHtml(h.hostname || '')}"
+                   ${sel.has(h.fleet_host_id) ? 'checked' : ''} ${h.eligible ? '' : 'disabled'}></td>` : '';
+        return `<tr>
+            ${box}
+            <td class="text-sm" title="${escapeHtml(_extRemoval.paths[h.hostname] || '')}">${escapeHtml(h.hostname || '')}</td>
+            <td class="text-sm">${escapeHtml(_EXT_OS_LABEL[h.os] || h.platform || '—')}</td>
+            <td class="text-sm">${escapeHtml(h.version || '')}</td>
+            <td class="text-sm">${pre.ready ? `<span class="extension-signal ${dot}">${escapeHtml(h.status || 'unknown')}</span>` : '—'}</td>
+            <td>${_extJobCell(h)}</td>
+        </tr>`;
+    }).join('');
+
+    const allPicked = eligible.length > 0 && eligible.every(h => sel.has(h.fleet_host_id));
+    const head = `<tr>
+        ${pre.ready ? `<th><input type="checkbox" data-ext-act="all" aria-label="Select all hosts" ${allPicked ? 'checked' : ''} ${eligible.length ? '' : 'disabled'}></th>` : ''}
+        <th>Host</th><th>OS</th><th>Version</th><th>Fleet</th><th>Removal</th></tr>`;
+
+    let bar = '';
+    if (!pre.ready) {
+        bar = `<div class="ext-remove-note">${escapeHtml(pre.reason || 'Removal is not available.')}</div>`;
+    } else if (_extRemoval.confirming) {
+        // Cancel sits where the Remove button was, so a double click cannot confirm.
+        bar = `<div class="ext-remove-confirm" role="alertdialog" aria-label="Confirm removal">
+            <div><strong>Remove ${escapeHtml(pre.extension.display_name || 'this extension')} from ${n} ${plural}?</strong>
+                <div class="text-sm ext-remove-why">Fleet runs one script on each host as root. Offline hosts run it when they next check in. The browser drops the extension at its next restart.</div>
+                ${hasMac ? '<div class="text-sm ext-remove-why">macOS: the files are deleted, but only a configuration profile stops the user from installing it again.</div>' : ''}
+            </div>
+            <div class="ext-remove-actions">
+                <button type="button" class="btn btn-danger btn-sm" data-ext-act="confirm" ${_extRemoval.busy ? 'disabled' : ''}>${_extRemoval.busy ? 'Sending…' : `Remove from ${n} ${plural}`}</button>
+                <button type="button" class="btn btn-secondary btn-sm" data-ext-act="cancel" ${_extRemoval.busy ? 'disabled' : ''}>Cancel</button>
+            </div>
+        </div>`;
+    } else {
+        bar = `<div class="ext-remove-bar">
+            <label class="text-sm ext-remove-opt" ${canBlock ? '' : 'hidden'} title="Writes a browser policy so the extension cannot be installed again. Linux and Windows only.">
+                <input type="checkbox" data-ext-act="block" ${_extRemoval.block ? 'checked' : ''}> Also block reinstall</label>
+            <span class="ext-remove-actions">
+                <button type="button" class="btn btn-ghost btn-sm" data-ext-act="script" ${n ? '' : 'disabled'}>${_extRemoval.scripts ? 'Hide script' : 'View script'}</button>
+                <button type="button" class="btn btn-danger btn-sm" data-ext-act="remove" ${n ? '' : 'disabled'}>${n ? `Remove from ${n} ${plural}` : 'Select hosts to remove'}</button>
+            </span>
+        </div>`;
+    }
+    const scripts = (_extRemoval.scripts || []).map(sc =>
+        `<div class="text-sm ext-remove-why" style="margin-top:6px;">Script sent to ${escapeHtml(sc.label)} hosts</div><pre class="ext-remove-pre">${escapeHtml(sc.script)}</pre>`).join('');
+    const anyQueued = hosts.some(h => h.job && h.job.status === 'queued');
+    const anyRemoved = hosts.some(h => h.job && h.job.status === 'removed');
+    const after = [
+        anyQueued ? 'Queued: an online host picks the script up within about a minute; an offline host runs it when it next checks in.' : '',
+        anyRemoved ? 'Removed hosts leave this list after Fleet next refreshes their software and Fleet Hound syncs.'
+            + (pre.extension.store === 'firefox' ? ' Firefox finishes the removal when it next starts, so it stays listed until then.' : '') : '',
+    ].filter(Boolean).map(t => `<div class="text-sm ext-remove-why" style="margin-top:6px;">${t}</div>`).join('');
+    const fleetLine = pre.ready && pre.fleet && pre.fleet.role
+        ? `<div class="text-sm ext-remove-why" style="margin-bottom:6px;">Fleet API token role: ${escapeHtml(pre.fleet.role)}</div>` : '';
+
+    cell.innerHTML = `${fleetLine}
+        <div style="max-height: 240px; overflow-y: auto;">
+            <table class="detections-table ext-remove-table"><thead>${head}</thead><tbody>${rows || '<tr><td colspan="6" class="text-sm text-secondary">No hosts</td></tr>'}</tbody></table>
+        </div>${bar}${after}${scripts}`;
+}
+
+async function _extRemovalToggleScript() {
+    if (_extRemoval.scripts) { _extRemoval.scripts = null; _extRemovalRender(); return; }
+    const pre = _extRemoval.pre;
+    const chosen = pre.hosts.filter(h => _extRemoval.selected.has(h.fleet_host_id));
+    // One script per distinct (OS, block) pair among the selected hosts.
+    const wanted = new Map();
+    chosen.forEach(h => {
+        const block = _extRemoval.block && h.can_block;
+        wanted.set(`${h.os}:${block}`, { os: h.os, block });
+    });
+    try {
+        const out = [];
+        for (const w of wanted.values()) {
+            const q = new URLSearchParams({ key: _extRemoval.key, os: w.os, block: w.block ? '1' : '0' });
+            const resp = await fetch(`/api/extensions/uninstall/script?${q}`);
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'script unavailable');
+            out.push({ label: _EXT_OS_LABEL[w.os] || w.os, script: data.script });
+        }
+        _extRemoval.scripts = out;
+        _extRemovalRender();
+    } catch (error) {
+        showStatus(`Script preview failed: ${error.message}`, true);
+    }
+}
+
+async function _extRemovalSubmit() {
+    const key = _extRemoval.key;
+    _extRemoval.busy = true;
+    _extRemovalRender();
+    try {
+        const resp = await fetch('/api/extensions/uninstall', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                extension_key: key,
+                host_ids: [..._extRemoval.selected],
+                block_reinstall: _extRemoval.block,
+            }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'request failed');
+        const plural = data.queued === 1 ? 'host' : 'hosts';
+        if (data.rejected) showStatus(`Removal queued on ${data.queued} ${plural}; ${data.rejected} refused. See the Removal column.`, true);
+        else showStatus(`Removal queued on ${data.queued} ${plural}`);
+    } catch (error) {
+        showStatus(`Removal failed: ${error.message}`, true);
+    }
+    if (_extRemoval.key !== key) return;
+    _extRemoval.busy = false;
+    _extRemoval.confirming = false;
+    _extRemoval.scripts = null;
+    await _extRemovalRefresh(false);
+}
+
+// One delegated listener on the modal body: its rows are re-rendered often.
+function _extRemovalOnEvent(event) {
+    const el = event.target.closest('[data-ext-act]');
+    if (!el || !_extRemoval.pre) return;
+    const act = el.dataset.extAct;
+    const isBox = el.tagName === 'INPUT';
+    if (isBox !== (event.type === 'change')) return;
+    const hostId = Number(el.dataset.host);
+    const max = _extRemoval.pre.max_hosts || 50;
+    if (act === 'pick') {
+        if (el.checked && _extRemoval.selected.size >= max) {
+            showStatus(`At most ${max} hosts per removal`, true);
+        } else if (el.checked) {
+            _extRemoval.selected.add(hostId);
+        } else {
+            _extRemoval.selected.delete(hostId);
+        }
+        _extRemoval.scripts = null;
+    } else if (act === 'all') {
+        const eligible = _extRemoval.pre.hosts.filter(h => h.eligible).map(h => h.fleet_host_id);
+        _extRemoval.selected = new Set(el.checked ? eligible.slice(0, max) : []);
+        _extRemoval.scripts = null;
+    } else if (act === 'block') {
+        _extRemoval.block = el.checked;
+        _extRemoval.scripts = null;
+    } else if (act === 'output') {
+        if (!_extRemoval.openOutput.delete(hostId)) _extRemoval.openOutput.add(hostId);
+    } else if (act === 'remove') {
+        _extRemoval.confirming = true;
+    } else if (act === 'cancel') {
+        _extRemoval.confirming = false;
+    } else if (act === 'script') {
+        _extRemovalToggleScript();
+        return;
+    } else if (act === 'confirm') {
+        _extRemovalSubmit();
+        return;
+    }
+    _extRemovalRender();
 }
 
 function _wireExtensionsUI() {
+    const detailBody = document.getElementById('extension-details-body');
+    if (detailBody) {
+        detailBody.addEventListener('click', _extRemovalOnEvent);
+        detailBody.addEventListener('change', _extRemovalOnEvent);
+    }
     ['ext-risk-filter', 'ext-store-filter'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', loadExtensions);

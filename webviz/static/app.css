@@ -2122,6 +2122,75 @@ input:focus + .slider {
     color: var(--success);
 }
 
+/* Extension removal controls in the detail modal */
+.ext-remove-table td,
+.ext-remove-table th {
+    vertical-align: top;
+}
+
+.ext-remove-why {
+    color: var(--text-secondary);
+}
+
+.ext-remove-note {
+    margin-top: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+}
+
+.ext-remove-bar,
+.ext-remove-confirm {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+}
+
+.ext-remove-confirm {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--danger);
+    border-radius: var(--radius-sm);
+    background: var(--danger-muted);
+}
+
+.ext-remove-actions {
+    display: inline-flex;
+    gap: var(--space-2);
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.ext-remove-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    cursor: pointer;
+}
+
+.ext-remove-pre {
+    margin: var(--space-1) 0 0;
+    padding: var(--space-2);
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .signal-row {
     padding: var(--space-2) 0;
 }
